@@ -1,0 +1,15 @@
+# Xmake cache
+.xmake/
+build/
+
+# MacOS Cache
+.DS_Store
+
+# 用户数据（隐私）
+data/
+
+# IDE / 编译产物
+.vscode/
+compile_commands.json
+
+scripts/
