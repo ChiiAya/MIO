@@ -47,8 +47,8 @@ ExecOutcome executeOne(ToolRegistry& reg, const ToolCall& call,
     std::string result;
 
     // 护栏 1：未知工具名 -> 不中断，把可用名单教给模型让它自纠
-    const ToolDef* def = reg.find(call.name);
-    if (def == nullptr) {
+    const auto def = reg.find(call.name);
+    if (!def.has_value()) {
         auto names = reg.names();
         std::ostringstream msg;
         msg << "error: 工具 '" << call.name << "' 不存在。可用工具: ";
@@ -104,7 +104,7 @@ ExecOutcome executeOne(ToolRegistry& reg, const ToolCall& call,
         ++streakState.second;
     else
         streakState = {key, 1};
-    if (streakState.second >= opt.repeatStreakThreshold && def != nullptr &&
+    if (streakState.second >= opt.repeatStreakThreshold && def.has_value() &&
         result.rfind("error:", 0) != 0) {
         result += "\n\n[SYSTEM NOTICE] 你已经连续 " +
                   std::to_string(streakState.second) +

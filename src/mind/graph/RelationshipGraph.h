@@ -83,6 +83,11 @@ public:
     std::string nameOf(const std::string& internalId) const;
     // Facts 渲染用：按权重降序取前 K（返回的指针在下次写操作前有效）
     std::vector<const PersonNode*> topK(std::size_t k) const;
+    // 获取除 MIO 外所有已记录的认识的人（工具查询等用）
+    std::vector<const PersonNode*> allPersons() const;
+
+    // 辅助工具：从 PersonNode 的 platformIds 提取 QQ 号（无则返回空串）
+    static std::string extractQq(const PersonNode& node);
 
     // ---- 边 ----
     // 亲密熟悉度（时间衰减 + 增量，上限 1.0；无则创建）

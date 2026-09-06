@@ -13,6 +13,7 @@ void printHelp(std::ostream& output) {
     output << "Mio 控制台演示\n"
            << "/msg <private|group> <conversation_id> <sender_id> <text>\n"
            << "/chat <text>             简易私聊：固定发给用户 0d00\n"
+           << "/reload [path]           热重载配置（默认读取 config.json，不存在则回退环境变量）\n"
            << "/state\n"
            << "/help\n"
            << "/quit\n\n";
@@ -62,8 +63,12 @@ bool parseMessage(const std::string& input, IncomingMessage& message) {
         if (text.empty()) {
             return false;
         }
-        message = {ConversationKey::privateChat("0d00"), "0d00", "", text,
-                   "console"};
+        message.conversation = ConversationKey::privateChat("0d00");
+        message.senderId = "0d00";
+        message.senderName = "0d00";
+        message.groupId = "";
+        message.text = text;
+        message.platform = "console";
         return true;
     } else {
         return false;
@@ -88,13 +93,12 @@ bool parseMessage(const std::string& input, IncomingMessage& message) {
         return false;
     }
 
-    message = {
-        conversation,
-        senderId,
-        scope == "group" ? conversationId : "",  // groupId：群聊时填，私聊留空
-        text,
-        "console",
-    };
+    message.conversation = conversation;
+    message.senderId = senderId;
+    message.senderName = senderId;
+    message.groupId = scope == "group" ? conversationId : "";  // groupId：群聊时填，私聊留空
+    message.text = text;
+    message.platform = "console";
     return true;
 }
 
@@ -114,6 +118,19 @@ void runConsole(Runtime& runtime, std::istream& input, std::ostream& output) {
             printHelp(output);
         } else if (line == "/state") {
             printState(runtime, output);
+        } else if (line.rfind("/reload", 0) == 0) {
+            std::istringstream stream(line);
+            std::string cmd;
+            std::string path = "config.json";
+            stream >> cmd;
+            if (stream >> path) {
+                // user provided path
+            }
+            if (runtime.reloadConfig(path)) {
+                output << "[Config] 热重载成功 (配置来源: " << path << ")\n";
+            } else {
+                output << "[Config] 热重载失败，已保持现有配置运行。\n";
+            }
         } else {
             IncomingMessage message;
             if (parseMessage(line, message)) {

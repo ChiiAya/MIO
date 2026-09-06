@@ -7,6 +7,7 @@
 // ============================================================================
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,7 +24,7 @@ struct SummaryOutcome {
 
 class SummaryManager {
 public:
-    SummaryManager(int maxSummaryChars, Llm& llm);
+    SummaryManager(int maxSummaryChars, std::shared_ptr<Llm> llm);
 
     // 摘要产出通知（可选，组合根注入）：每次真正产出摘要后回调一次，
     // 携带结果与私密性判定 —— 记忆系统的写入流程以此咽喉点为唯一入口，
@@ -36,7 +37,7 @@ public:
 
 private:
     int maxSummaryChars_;
-    Llm& llm_;
+    std::shared_ptr<Llm> llm_;
     SummarySink onSummary_;
 };
 

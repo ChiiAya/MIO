@@ -9,8 +9,9 @@
 
 namespace mio {
 
-ContextBuilder::ContextBuilder(ContextBuilderConfig cfg, SummaryManager& summary)
-    : cfg_(cfg), summary_(summary) {}
+ContextBuilder::ContextBuilder(ContextBuilderConfig cfg,
+                               std::shared_ptr<SummaryManager> summary)
+    : cfg_(cfg), summary_(std::move(summary)) {}
 
 BuildResult ContextBuilder::build(const BuildInput& in) {
     if (!in.unit) throw std::runtime_error("ContextBuilder: unit 为空");
@@ -25,9 +26,9 @@ BuildResult ContextBuilder::build(const BuildInput& in) {
     const bool overBudget =
         estimated >
         static_cast<std::int64_t>(cfg_.budgetTokens * cfg_.watermark);
-    if (overBudget && !unit.context().empty()) {
+    if (overBudget && !unit.context().empty() && summary_) {
         // 上下文不够 → 对 unit 重新冷启动（[摘要前20 + 近5原文]）后重建
-        unit.reColdStart(summary_);
+        unit.reColdStart(*summary_);
         msgs = unit.context();
         estimated = estimateTokens(msgs) + estimateTokens(in.systemPrompt);
         r.reColdStarted = true;

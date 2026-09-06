@@ -1,5 +1,7 @@
 #include "runtime/Runtime.h"
 
+#include "config/AppConfig.h"
+#include "config/ConfigManager.h"
 #include "config/embedding/EmbeddingConfig.h"
 #include "config/openai/OpenaiConfig.h"
 #include "llm/openai/OpenAiCompat.h"
@@ -17,17 +19,17 @@ namespace {
 
 constexpr int kMaxPeopleTokens = 1200;
 
-// 工具（set_public / update_topic）需要定位"当前正在处理"的 unit 与其来源；
+// 工具（set_public / update_topic / get_current_user_qq 等）需要定位"当前正在处理"的 unit 与其来源；
 // 并发 ingest 各自线程互不干扰，故用 thread_local
 static thread_local FusionUnit* g_activeUnit = nullptr;
 static thread_local ConversationKey g_activeConv;
 // 记忆归属上下文：私聊 → 对话者 internalId；群聊 → 空串（按会话共享）。
 // 摘要 sink 在 route 内部同步触发，必须先于 route 就位
 static thread_local std::string g_activeMemoryPerson;
-
-std::unique_ptr<Llm> defaultLlm() {
-    return std::make_unique<OpenAiCompat>(OpenAiConfig::fromEnvironment());
-}
+static thread_local std::string g_activeSenderId;
+static thread_local std::string g_activeSenderName;
+static thread_local std::string g_activePlatform;
+static thread_local std::string g_activeGroupId;
 
 std::string hexEncode(const std::string& s) {
     static const char* digits = "0123456789ABCDEF";
@@ -43,7 +45,8 @@ std::string hexEncode(const std::string& s) {
 } // namespace
 
 Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
-                 std::unique_ptr<Llm> llm)
+                 std::shared_ptr<Llm> llm,
+                 std::shared_ptr<ConfigManager> configMgr)
     // 人设与基础事实；character 将来从配置文件来
     : persona_{botName,
                "你说话简短、有点毒舌但其实很关心对方，喜欢在句尾加 \"喵~\"。"},
@@ -51,14 +54,14 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
       diary_{dataDir / "diary.json"},
       achieve_{dataDir / "history"},
       eventLog_{dataDir / "events.jsonl"},
-      llm_(llm ? std::move(llm) : defaultLlm()),
-      embedding_(std::make_unique<OpenAiEmbedding>(
-          EmbeddingConfig::fromEnvironment())),
+      configMgr_(configMgr ? std::move(configMgr) : std::make_shared<ConfigManager>()),
+      llm_(llm ? std::move(llm) : std::make_shared<OpenAiCompat>(configMgr_->get()->openai)),
+      embedding_(std::make_shared<OpenAiEmbedding>(configMgr_->get()->embedding)),
+      summary_(std::make_shared<SummaryManager>(800, llm_)),
+      builder_(std::make_shared<ContextBuilder>(configMgr_->get()->contextBuilder, summary_)),
       memoryStore_(dataDir / "memory.db"),
-      memory_(MemoryConfig{}, *embedding_, memoryStore_),
-      summary_{800, *llm_},
-      router_{graph_, achieve_, summary_, {}, embedding_.get()},
-      builder_{ContextBuilderConfig{}, summary_} {
+      memory_(configMgr_->get()->memory, embedding_, memoryStore_),
+      router_{graph_, achieve_, summary_, configMgr_->get()->fusion, embedding_} {
     log::initFromEnvironment();  // MIO_LOG_LEVEL，重复调用安全
     registerBuiltinTools();
 
@@ -67,12 +70,70 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
 
     // 写入流程接线：三条摘要路径（冷读取/融合重定向/重新冷启动）共用
     // SummaryManager 这一个咽喉点，产出即写入长期记忆
-    summary_.setOnSummary(
+    summary_->setOnSummary(
         [this](const SummaryOutcome& outcome) { onSummaryProduced(outcome); });
 
     systemPrompt_ = rebuildSystemPrompt();
     state_.botName = std::move(botName);
     state_.messageCount = 0;
+}
+
+Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
+                 std::unique_ptr<Llm> llm)
+    : Runtime(std::move(botName), std::move(dataDir),
+              std::shared_ptr<Llm>(std::move(llm))) {}
+
+bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
+    if (!configMgr_) {
+        log::warn("Runtime", "ConfigManager 未初始化");
+        return false;
+    }
+
+    if (!configMgr_->reloadFromFile(configPath)) {
+        log::warn("Runtime", "配置重载失败，保持当前配置运行: " + configPath.string());
+        return false;
+    }
+
+    auto newConfig = configMgr_->get();
+    try {
+        auto newLlm = std::make_shared<OpenAiCompat>(newConfig->openai);
+        auto newEmbedding = std::make_shared<OpenAiEmbedding>(newConfig->embedding);
+        auto newSummary = std::make_shared<SummaryManager>(800, newLlm);
+        newSummary->setOnSummary([this](const SummaryOutcome& o) { onSummaryProduced(o); });
+        auto newBuilder = std::make_shared<ContextBuilder>(newConfig->contextBuilder, newSummary);
+
+        // 重载时清理动态工具
+        registry_.clearDynamicTools();
+
+        // 原子切换服务指针
+        {
+            std::unique_lock<std::shared_mutex> lock(servicesMtx_);
+            llm_ = newLlm;
+            embedding_ = newEmbedding;
+            summary_ = newSummary;
+            builder_ = newBuilder;
+        }
+
+        // 刷新长驻组件配置与依赖
+        router_.update(newConfig->fusion, newSummary, newEmbedding);
+        memory_.update(newConfig->memory, newEmbedding);
+
+        const std::int64_t now = std::time(nullptr);
+        eventLog_.append({0, EventKind::ConfigReloaded, now, "配置热重载: " + configPath.string()});
+        log::info("Runtime", "配置热重载成功: " + configPath.string());
+        return true;
+    } catch (const std::exception& e) {
+        log::warn("Runtime", std::string("组件重建异常，保持原配置: ") + e.what());
+        return false;
+    }
+}
+
+std::shared_ptr<const AppConfig> Runtime::config() const {
+    return configMgr_ ? configMgr_->get() : nullptr;
+}
+
+std::shared_ptr<ConfigManager> Runtime::configManager() const {
+    return configMgr_;
 }
 
 void Runtime::registerBuiltinTools() {
@@ -86,27 +147,37 @@ void Runtime::registerBuiltinTools() {
     registry_.add(std::move(timeDef),
                   [](const nlohmann::json&) -> std::string {
                       return "当前时间: " + nowTimeString();
-                  });
+                  }, ToolLayer::Builtin);
 
-    // write_diary —— 模型基础认知的进步记录（认识新人/事实刷新时写）
-    ToolDef diaryDef;
-    diaryDef.name = "write_diary";
-    diaryDef.description =
-        "把有长期价值的认知写入日记：认识了新的人、人物关系变化、"
-        "用户明确陈述的重要事实。只在值得长期记住时调用。";
-    diaryDef.parametersJsonSchema = {
+    // remember —— 存储具有长期价值的事实或背景到长期记忆库（供后续 recall_memory 检索回忆）
+    ToolDef rememberDef;
+    rememberDef.name = "remember";
+    rememberDef.description =
+        "将具有长期价值的对话事实、用户喜好、重要事件或约定存储到长期记忆库中。后续可通过 recall_memory 检索回忆。";
+    rememberDef.parametersJsonSchema = {
         {"type", "object"},
         {"properties",
-         {{"text", {{"type", "string"}, {"description", "要记录的认知内容"}}}}},
+         {{"text", {{"type", "string"}, {"description", "要存储的事实或记忆内容"}}},
+          {"is_public",
+           {{"type", "boolean"},
+            {"description",
+             "是否对其他会话公开（可选，默认随当前会话私密性）"}}}}},
         {"required", nlohmann::json::array({"text"})}};
-    registry_.add(std::move(diaryDef),
-                  [this](const nlohmann::json& args) -> std::string {
-                      const std::string text = args.value("text", "");
-                      const std::int64_t now = std::time(nullptr);
-                      diary_.add(text, now);
-                      eventLog_.append({0, EventKind::DiaryWritten, now, text});
-                      return "已写入日记。";
-                  });
+    registry_.add(
+        std::move(rememberDef),
+        [this](const nlohmann::json& args) -> std::string {
+            const std::string text = args.value("text", "");
+            if (text.empty()) return "error: 记忆内容不能为空";
+            const std::int64_t now = std::time(nullptr);
+            bool isPublic = g_activeUnit ? g_activeUnit->isPublic() : false;
+            if (args.contains("is_public") && args["is_public"].is_boolean()) {
+                isPublic = args["is_public"].get<bool>();
+            }
+            memory_.remember(g_activeConv, g_activeMemoryPerson, text, isPublic, now);
+            eventLog_.append({0, EventKind::MemoryRemembered, now, text});
+            return "已存入长期记忆库。";
+        },
+        ToolLayer::Builtin);
 
     // set_nickname —— 模型纠正对人的称呼（只改称呼，不改身份映射）
     ToolDef nickDef;
@@ -126,11 +197,10 @@ void Runtime::registerBuiltinTools() {
                           eventLog_.append({0, EventKind::NicknameChanged, now,
                                             args.value("current", "") + " → " +
                                                 args.value("nickname", "")});
-                          //systemPrompt_ = rebuildSystemPrompt();
                           return "已更新昵称。";
                       }
                       return "error: 找不到该昵称对应的人。";
-                  });
+                  }, ToolLayer::Builtin);
 
     // set_notes —— 模型补充对某个人的印象（personal）
     ToolDef notesDef;
@@ -150,11 +220,10 @@ void Runtime::registerBuiltinTools() {
                           eventLog_.append({0, EventKind::NotesChanged, now,
                                             args.value("person", "") + ": " +
                                                 args.value("notes", "")});
-                          //systemPrompt_ = rebuildSystemPrompt();
                           return "已更新印象。";
                       }
                       return "error: 找不到该昵称对应的人。";
-                  });
+                  }, ToolLayer::Builtin);
 
     // set_public —— 模型控制当前上下文是否公开。
     // 直接切换当前 unit 的 isPublic，方便模型表达“这段对话是否适合融合”。
@@ -166,7 +235,7 @@ void Runtime::registerBuiltinTools() {
         {"type", "object"},
         {"properties",
          {{"is_public", {{"type", "boolean"},
-                         {"description", "true=公开，false=私密"}}},
+                          {"description", "true=公开，false=私密"}}},
           {"reason", {{"type", "string"},
                       {"description", "设置公开/私密的原因（调试用）"}}}}},
         {"required", nlohmann::json::array({"is_public"})}};
@@ -195,7 +264,7 @@ void Runtime::registerBuiltinTools() {
                       if (!target) return "error: 无法定位当前上下文";
                       g_activeUnit = target;
                       return isPublic ? "已设为公开。" : "已转为私密。";
-                  });
+                  }, ToolLayer::Builtin);
 
     // update_topic —— 话题变化上报，供 Router 判断融合
     ToolDef topicDef;
@@ -221,7 +290,7 @@ void Runtime::registerBuiltinTools() {
                                     " isPublic=" +
                                     (g_activeUnit->isPublic() ? "true" : "false"));
                       return "已更新话题:" + newTopic + "\n";
-                  });
+                  }, ToolLayer::Builtin);
 
     // recall_memory —— 长期记忆召回由模型自行决定何时调用。
     // 之前是每轮自动把 Top-K 塞进 user 消息，现在改为工具化，
@@ -235,9 +304,9 @@ void Runtime::registerBuiltinTools() {
         {"type", "object"},
         {"properties",
          {{"query", {{"type", "string"},
-                     {"description", "检索关键词或自然语言问题，例如：用户喜欢什么"}}},
+                      {"description", "检索关键词或自然语言问题，例如：用户喜欢什么"}}},
           {"top_k", {{"type", "integer"},
-                     {"description", "返回条数，默认 3，最多 10"}}}}},
+                      {"description", "返回条数，默认 3，最多 10"}}}}},
         {"required", nlohmann::json::array({"query"})}};
     registry_.add(std::move(recallDef),
                   [this](const nlohmann::json& args) -> std::string {
@@ -255,7 +324,105 @@ void Runtime::registerBuiltinTools() {
                           std::time(nullptr), topK);
                       if (recalled.empty()) return "没有找到相关记忆。";
                       return MemoryManager::renderForPrompt(recalled);
-                  });
+                  }, ToolLayer::Builtin);
+
+    // get_current_user_qq —— 获取当前对话/发言人的QQ号及会话信息
+    ToolDef curUserDef;
+    curUserDef.name = "get_current_user_qq";
+    curUserDef.description =
+        "获取当前正在对话/发言用户的QQ号、昵称及会话信息（如私聊或群号）。";
+    curUserDef.parametersJsonSchema = {
+        {"type", "object"},
+        {"properties", nlohmann::json::object()}};
+    registry_.add(std::move(curUserDef),
+                  [this](const nlohmann::json& /*args*/) -> std::string {
+                      if (g_activeSenderId.empty()) {
+                          return "error: 当前无可用的对话上下文";
+                      }
+                      nlohmann::json info;
+                      info["platform"] = g_activePlatform;
+                      info["user_id"] = g_activeSenderId;
+                      info["nickname"] = g_activeSenderName;
+                      std::string qq = (g_activePlatform == "qq" ||
+                                        g_activePlatform == "napcat" ||
+                                        g_activePlatform == "onebot")
+                                           ? g_activeSenderId
+                                           : "";
+                      if (const PersonNode* p = graph_.findByPlatform(
+                              g_activePlatform, g_activeSenderId);
+                          p != nullptr) {
+                          info["graph_name"] = p->name;
+                          if (qq.empty()) {
+                              qq = RelationshipGraph::extractQq(*p);
+                          }
+                      }
+                      info["qq"] = qq.empty() ? "未知" : qq;
+                      info["scope"] = (g_activeConv.scope == ConversationScope::Group)
+                                          ? "group"
+                                          : "private";
+                      if (g_activeConv.scope == ConversationScope::Group) {
+                          info["group_id"] = !g_activeGroupId.empty()
+                                                 ? g_activeGroupId
+                                                 : g_activeConv.id;
+                      }
+                      return info.dump();
+                  },
+                  ToolLayer::Builtin);
+
+    // get_known_person_qq —— 获取认识的人的QQ号
+    ToolDef knownPersonDef;
+    knownPersonDef.name = "get_known_person_qq";
+    knownPersonDef.description =
+        "获取认识的人的QQ号。可输入姓名/昵称查询特定人物；若不提供参数则列出所有已知人物及其QQ号。";
+    knownPersonDef.parametersJsonSchema = {
+        {"type", "object"},
+        {"properties",
+         {{"name",
+           {{"type", "string"},
+            {"description",
+             "要查询的人物姓名或称呼（可选，若为空则列出所有认识的人）"}}}}}};
+    registry_.add(std::move(knownPersonDef),
+                  [this](const nlohmann::json& args) -> std::string {
+                      std::string queryName = args.value("name", "");
+                      if (!queryName.empty()) {
+                          const PersonNode* p = graph_.findByName(queryName);
+                          if (!p) {
+                              auto all = graph_.allPersons();
+                              for (const auto* node : all) {
+                                  if (node && (node->name.find(queryName) != std::string::npos ||
+                                               node->personal.find(queryName) != std::string::npos)) {
+                                      p = node;
+                                      break;
+                                  }
+                              }
+                          }
+                          if (!p) {
+                              return "未找到名为 \"" + queryName + "\" 的人。";
+                          }
+                          std::string qq = RelationshipGraph::extractQq(*p);
+                          nlohmann::json result;
+                          result["name"] = p->name;
+                          result["qq"] = qq.empty() ? "未知" : qq;
+                          result["platform_ids"] = p->platformIds;
+                          if (!p->personal.empty()) result["personal"] = p->personal;
+                          return result.dump();
+                      }
+
+                      auto persons = graph_.allPersons();
+                      nlohmann::json list = nlohmann::json::array();
+                      for (const auto* p : persons) {
+                          if (!p) continue;
+                          std::string qq = RelationshipGraph::extractQq(*p);
+                          nlohmann::json item;
+                          item["name"] = p->name;
+                          item["qq"] = qq.empty() ? "未知" : qq;
+                          item["platform_ids"] = p->platformIds;
+                          if (!p->personal.empty()) item["personal"] = p->personal;
+                          list.push_back(std::move(item));
+                      }
+                      return list.dump();
+                  },
+                  ToolLayer::Builtin);
 }
 
 std::string Runtime::rebuildSystemPrompt(
@@ -299,9 +466,39 @@ void Runtime::onSummaryProduced(const SummaryOutcome& outcome) {
 BotReply Runtime::ingest(IncomingMessage message) {
     const std::int64_t now = std::time(nullptr);
 
-    // 0) 记忆归属上下文先于 route 就位（冷读取摘要的 sink 在 route 内触发）
+    // 捕获当前代际的服务快照（RCU 模式），确保单次调用内部的组件生命周期一致
+    std::shared_ptr<Llm> currentLlm;
+    std::shared_ptr<ContextBuilder> currentBuilder;
+    std::shared_ptr<SummaryManager> currentSummary;
+    {
+        std::shared_lock<std::shared_mutex> lock(servicesMtx_);
+        currentLlm = llm_;
+        currentBuilder = builder_;
+        currentSummary = summary_;
+    }
+    if (!currentLlm || !currentBuilder) {
+        throw std::runtime_error("Runtime 服务未就绪");
+    }
+
+    // 0) 记忆归属与对话上下文先于 route 就位（冷读取摘要的 sink 在 route 内触发）
     g_activeMemoryPerson = resolveMemoryPerson(message);
     g_activeConv = message.conversation;
+    g_activeSenderId = message.senderId;
+    g_activeSenderName = message.senderName;
+    g_activePlatform = message.platform;
+    g_activeGroupId = message.groupId;
+
+    struct ContextGuard {
+        ~ContextGuard() {
+            g_activeUnit = nullptr;
+            g_activeConv = {};
+            g_activeMemoryPerson.clear();
+            g_activeSenderId.clear();
+            g_activeSenderName.clear();
+            g_activePlatform.clear();
+            g_activeGroupId.clear();
+        }
+    } contextGuard;
 
     // 1) 路由：身份映射 → 首次遇见 Achieve 冷读取建 unit → 融合判断（redirect）→ 目标 unit
     FusionUnit* unit = router_.route(message, now);
@@ -334,14 +531,14 @@ BotReply Runtime::ingest(IncomingMessage message) {
         in.systemPrompt = systemPrompt_;
         in.unit = unit;
         in.now = now;
-        auto result = builder_.build(in);
+        auto result = currentBuilder->build(in);
         reColdStarted = result.reColdStarted;
 
         ChatRequest req = result.request;
         req.tools = registry_.defs();
 
         // 5) 工具循环；sink：逐条落档案 + 入 unit 上下文
-        resp = runToolLoop(*llm_, registry_, req, ToolLoopOptions{},
+        resp = runToolLoop(*currentLlm, registry_, req, ToolLoopOptions{},
                            [this, unit, conv = message.conversation](
                                const Msg& m) {
                                achieve_.append(conv, m);
@@ -354,9 +551,6 @@ BotReply Runtime::ingest(IncomingMessage message) {
         eventLog_.append({0, EventKind::SummaryApplied, now, "上下文重新冷启动"});
         systemPrompt_ = rebuildSystemPrompt(diary_.consume());
     }
-    g_activeUnit = nullptr;
-    g_activeConv = {};
-    g_activeMemoryPerson.clear();
 
     return BotReply{message.conversation, resp.text};
 }

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -23,9 +24,11 @@ namespace mio {
 struct IncomingMessage {
     ConversationKey conversation;
     std::string senderId;
+    std::string senderName; // 传入的原始昵称/群名片（NapCat 传入）
     std::string groupId;//私聊时留空
     std::string text;
     std::string platform;  // 平台标识（"qq"/"wechat"/"console"…），上下文身份用
+    std::vector<std::string> atUserIds; // 消息中 @ 提及的用户 ID 列表
 };
 
 enum class EventKind {
@@ -33,6 +36,8 @@ enum class EventKind {
     NicknameChanged,  // 认知：修改昵称
     NotesChanged,     // 认知：修改备注
     SummaryApplied,   // 上下文压缩：摘要已应用
+    ConfigReloaded,   // 配置热重载
+    MemoryRemembered, // 记忆：存入长期记忆库
 };
 
 struct Event {

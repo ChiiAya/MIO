@@ -56,7 +56,12 @@ struct RecalledMemory {
 
 class MemoryManager {
 public:
-    MemoryManager(MemoryConfig cfg, Embedding& embedding, MemoryStore& store);
+    MemoryManager(MemoryConfig cfg, std::shared_ptr<Embedding> embedding, MemoryStore& store);
+
+    // 动态更新配置与依赖（线程安全）
+    void update(MemoryConfig cfg, std::shared_ptr<Embedding> embedding);
+    void updateConfig(MemoryConfig cfg);
+    void updateEmbedding(std::shared_ptr<Embedding> embedding);
 
     // 写入流程：摘要文本 → 向量化 → BLOB → INSERT（幂等：同会话同文本忽略）。
     // 失败只记日志（记忆是锦上添花，不允许影响对话主链路）。
@@ -84,7 +89,7 @@ private:
     void noteEmbedResult(bool ok) const;
 
     MemoryConfig cfg_;
-    Embedding& embedding_;
+    std::shared_ptr<Embedding> embedding_;
     MemoryStore& store_;
 
     mutable std::mutex mtx_;  // 保护以下两员（网络调用在锁外）

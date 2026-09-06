@@ -50,8 +50,15 @@ class FusionRouter {
 public:
     // embedding 为可空依赖：为空 / 失败 / 关闭时话题判断退化为精确匹配
     FusionRouter(RelationshipGraph& graph, Achieve& achieve,
-                 SummaryManager& summary, FusionConfig cfg = {},
-                 const Embedding* embedding = nullptr);
+                 std::shared_ptr<SummaryManager> summary, FusionConfig cfg = {},
+                 std::shared_ptr<Embedding> embedding = nullptr);
+
+    // 动态更新配置与依赖（线程安全）
+    void update(FusionConfig cfg, std::shared_ptr<SummaryManager> summary,
+                std::shared_ptr<Embedding> embedding);
+    void updateConfig(FusionConfig cfg);
+    void updateDependencies(std::shared_ptr<SummaryManager> summary,
+                            std::shared_ptr<Embedding> embedding);
 
     // 路由一条消息：身份映射 → 首次遇见冷读取建 unit → 融合判断（可能 redirect）
     // → 返回目标 unit（调用方随后持 unit->mtx 处理消息）
@@ -102,9 +109,9 @@ private:
 
     RelationshipGraph& graph_;
     Achieve& achieve_;
-    SummaryManager& summary_;
+    std::shared_ptr<SummaryManager> summary_;
     FusionConfig cfg_;
-    const Embedding* embedding_ = nullptr;  // 非拥有；Runtime 组合根注入
+    std::shared_ptr<Embedding> embedding_;
 };
 
 } // namespace mio

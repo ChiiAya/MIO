@@ -14,8 +14,8 @@
 // ============================================================================
 
 #include "adapters/napcat/NapCatAdapter.h"
-
 #include "adapters/napcat/OneBotParser.h"
+#include "runtime/Runtime.h"
 
 #include <ixwebsocket/IXWebSocket.h>
 #include <ixwebsocket/IXWebSocketServer.h>

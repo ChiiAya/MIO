@@ -214,12 +214,14 @@ MIO 提供基础的 Agent 执行闭环与保护护栏：
 | 工具名称 | 参数 | 职责说明 |
 |---|---|---|
 | `get_current_time` | `{}` | 获取当前本地时间（精确到分钟），避免在 System 中写死时间 |
-| `write_diary` | `{"text": string}` | 记录具有长期价值的重要事实或认知变更 |
+| `remember` | `{"text": string, "is_public"?: bool}` | 将具有长期价值的重要事实或约定存入长期记忆库 |
+| `recall_memory` | `{"query": string, "top_k"?: int}` | 面对旧事或历史背景时，主动发起记忆检索 |
 | `set_nickname` | `{"current": string, "nickname": string}` | 更新对某人的称呼（仅修改展示昵称，不改变底层映射） |
 | `set_notes` | `{"person": string, "notes": string}` | 补充对某人的特点、喜好或印象描述 |
 | `set_public` | `{"is_public": bool, "reason": string}` | 模型根据对话敏感程度，标记当前上下文是否允许融合 |
 | `update_topic` | `{"topic": string}` | 上报当前对话主题，为会话融合提供语义判定依据 |
-| `recall_memory` | `{"query": string, "top_k"?: int}` | 面对旧事或历史背景时，主动发起记忆检索 |
+| `get_current_user_qq` | `{}` | 获取当前对话用户的 QQ 号、昵称及会话信息 |
+| `get_known_person_qq` | `{"name"?: string}` | 获取认识的人的 QQ 号（支持按人名检索或列出所有已知人物） |
 
 ---
 

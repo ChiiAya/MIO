@@ -32,8 +32,8 @@ std::string renderHistoryText(const std::vector<Msg>& msgs, int maxChars) {
 
 } // namespace
 
-SummaryManager::SummaryManager(int maxSummaryChars,Llm& llm)
-    : maxSummaryChars_(maxSummaryChars),llm_(llm) {}
+SummaryManager::SummaryManager(int maxSummaryChars, std::shared_ptr<Llm> llm)
+    : maxSummaryChars_(maxSummaryChars), llm_(std::move(llm)) {}
 
 SummaryOutcome SummaryManager::summarizeWithVerdict(const std::vector<Msg>& material) const {
     ChatRequest req;
@@ -57,7 +57,8 @@ SummaryOutcome SummaryManager::summarizeWithVerdict(const std::vector<Msg>& mate
     req.messages.push_back(std::move(m));
 
     SummaryOutcome out;
-    const ChatResponse resp = llm_.chat(req);
+    if (!llm_) return out;
+    const ChatResponse resp = llm_->chat(req);
     const std::string full = cutUtf8(resp.text,
                                      static_cast<std::size_t>(maxSummaryChars_ * 2) + 32);
 

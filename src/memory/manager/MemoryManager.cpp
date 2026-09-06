@@ -44,9 +44,25 @@ std::string formatDate(std::int64_t epochSeconds) {
 
 } // namespace
 
-MemoryManager::MemoryManager(MemoryConfig cfg, Embedding& embedding,
+MemoryManager::MemoryManager(MemoryConfig cfg, std::shared_ptr<Embedding> embedding,
                              MemoryStore& store)
-    : cfg_(cfg), embedding_(embedding), store_(store) {}
+    : cfg_(cfg), embedding_(std::move(embedding)), store_(store) {}
+
+void MemoryManager::update(MemoryConfig cfg, std::shared_ptr<Embedding> embedding) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    cfg_ = cfg;
+    embedding_ = std::move(embedding);
+}
+
+void MemoryManager::updateConfig(MemoryConfig cfg) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    cfg_ = cfg;
+}
+
+void MemoryManager::updateEmbedding(std::shared_ptr<Embedding> embedding) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    embedding_ = std::move(embedding);
+}
 
 bool MemoryManager::embedOnCooldown() const {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -66,12 +82,20 @@ void MemoryManager::noteEmbedResult(bool ok) const {
 std::vector<float> MemoryManager::embedNormalized(
     const std::string& text) const {
     if (embedOnCooldown()) return {};
+    std::shared_ptr<Embedding> emb;
+    std::size_t expectedDim = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        emb = embedding_;
+        expectedDim = cfg_.dim;
+    }
+    if (!emb) return {};
     try {
-        std::vector<float> vec = embedding_.embed(text);
+        std::vector<float> vec = emb->embed(text);
         noteEmbedResult(true);
-        if (vec.size() != cfg_.dim) {
+        if (vec.size() != expectedDim) {
             log::warn("MemoryManager",
-                      "向量维度不符: 期望 " + std::to_string(cfg_.dim) + " 实际 " +
+                      "向量维度不符: 期望 " + std::to_string(expectedDim) + " 实际 " +
                           std::to_string(vec.size()) + "（检查 MIO_EMBED_MODEL）");
             return {};
         }

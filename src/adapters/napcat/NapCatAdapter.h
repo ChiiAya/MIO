@@ -26,11 +26,11 @@
 // 启用方式：MIO_PLATFORM=napcat（其余平台走控制台，见 main.cpp）。
 // ============================================================================
 
-#include "runtime/Runtime.h"
-
 #include <string>
 
 namespace mio {
+
+class Runtime;
 
 struct NapCatConfig {
     std::string listenHost = "127.0.0.1";

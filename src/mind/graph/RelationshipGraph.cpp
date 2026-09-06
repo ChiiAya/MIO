@@ -111,6 +111,9 @@ SeenResult RelationshipGraph::onSeen(const std::string& platform,
         if (!platform.empty())
             for (auto& pid : n->platformIds)
                 if (pid == platformId) pid = tag;
+        if (n->name == platformId && !nameHint.empty() && nameHint != platformId) {
+            n->name = nameHint;
+        }
         const std::int64_t prevLast = n->lastSeenAt;
         bumpWeight(*n, now);
         // MIO↔此人 亲密熟悉度：同公式衰减 + 增量（delta 0.1/条）
@@ -230,6 +233,39 @@ std::vector<const PersonNode*> RelationshipGraph::topK(
               });
     if (people.size() > k) people.resize(k);
     return people;
+}
+
+std::vector<const PersonNode*> RelationshipGraph::allPersons() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<const PersonNode*> out;
+    out.reserve(nodes_.size());
+    for (const auto& n : nodes_) {
+        if (n->internalId != mioId_) {
+            out.push_back(n.get());
+        }
+    }
+    return out;
+}
+
+std::string RelationshipGraph::extractQq(const PersonNode& node) {
+    for (const auto& pid : node.platformIds) {
+        if (pid.rfind("[qq][", 0) == 0 && pid.back() == ']') {
+            return pid.substr(5, pid.size() - 6);
+        }
+        if (pid.rfind("[napcat][", 0) == 0 && pid.back() == ']') {
+            return pid.substr(9, pid.size() - 10);
+        }
+        if (pid.rfind("[onebot][", 0) == 0 && pid.back() == ']') {
+            return pid.substr(9, pid.size() - 10);
+        }
+    }
+    for (const auto& pid : node.platformIds) {
+        if (!pid.empty() && pid.front() != '[' &&
+            std::all_of(pid.begin(), pid.end(), [](unsigned char c) { return std::isdigit(c); })) {
+            return pid;
+        }
+    }
+    return "";
 }
 
 void RelationshipGraph::bumpIntimacy(const std::string& a,

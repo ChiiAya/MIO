@@ -212,8 +212,20 @@ std::optional<IncomingMessage> eventToIncomingMessage(const OneBotEvent& ev) {
     }
 
     msg.senderId = ev.userId;
+    // NapCat 传入的昵称：群名片优先，无群名片则取 QQ 昵称
+    msg.senderName = !ev.sender.card.empty() ? ev.sender.card : ev.sender.nickname;
     msg.text = ev.text;
     msg.platform = "qq";
+
+    // 提取 @ 提及的 QQ 号列表
+    for (const auto& seg : ev.segments) {
+        if (seg.type == "at") {
+            const std::string qq = idToString(seg.data.value("qq", nlohmann::json()));
+            if (!qq.empty() && qq != "all") {
+                msg.atUserIds.push_back(qq);
+            }
+        }
+    }
     return msg;
 }
 
