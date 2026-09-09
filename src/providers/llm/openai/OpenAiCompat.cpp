@@ -14,7 +14,7 @@
 //   网络层失败时 status_code 为 0 且 error.code != OK —— 必须同时判断两者。
 // ============================================================================
 
-#include "llm/openai/OpenAiCompat.h"
+#include "providers/llm/openai/OpenAiCompat.h"
 
 #include <cpr/cpr.h>
 

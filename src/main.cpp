@@ -25,8 +25,8 @@
 #include "adapters/console/ConsoleAdapter.h"
 #include "adapters/napcat/NapCatAdapter.h"
 #include "config/openai/OpenaiConfig.h"
-#include "llm/Llm.h"
-#include "llm/openai/OpenAiCompat.h"
+#include "providers/llm/Llm.h"
+#include "providers/llm/openai/OpenAiCompat.h"
 #include "log/Log.h"
 #include "runtime/Runtime.h"
 

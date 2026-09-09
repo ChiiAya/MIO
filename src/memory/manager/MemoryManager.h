@@ -23,7 +23,7 @@
 // ============================================================================
 
 #include "core/conversation/Conversation.h"
-#include "llm/Embedding.h"
+#include "providers/embedding/Embedding.h"
 #include "memory/store/MemoryStore.h"
 
 #include <chrono>

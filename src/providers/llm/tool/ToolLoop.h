@@ -10,8 +10,8 @@
 
 #include <functional>
 
-#include "llm/Llm.h"
-#include "llm/tool/ToolRegistry.h"
+#include "providers/llm/Llm.h"
+#include "providers/llm/tool/ToolRegistry.h"
 
 namespace mio {
 

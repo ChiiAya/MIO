@@ -11,7 +11,7 @@
 
 #include "context/conversationFusion/FusionContext.h"
 #include "context/summarizor/SummaryManager.h"
-#include "llm/Llm.h"
+#include "providers/llm/Llm.h"
 #include "core/message/Message.h"
 
 namespace mio {

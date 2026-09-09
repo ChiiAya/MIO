@@ -9,7 +9,7 @@
 // ============================================================================
 
 #include "config/embedding/EmbeddingConfig.h"
-#include "llm/Embedding.h"
+#include "providers/embedding/Embedding.h"
 
 namespace mio {
 

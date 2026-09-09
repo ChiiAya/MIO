@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "llm/Llm.h"
+#include "providers/llm/Llm.h"
 #include "core/message/Message.h"
 
 namespace mio {

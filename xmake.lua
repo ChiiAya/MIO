@@ -4,13 +4,17 @@ add_rules("mode.debug", "mode.release")
 
 add_requires("cpr", "nlohmann_json")
 add_requires("ixwebsocket v12.0.1")  -- NapCat 适配器：反向 WebSocket 服务端（收事件/发 API）
-add_requires("sqlite3", {system = true})  -- 记忆系统：BLOB 向量存储 + SQL 元数据预过滤
+if is_arch("arm64") or is_plat("cross") then
+    add_requires("sqlite3")
+else
+    add_requires("sqlite3", {system = true})  -- 记忆系统：BLOB 向量存储 + SQL 元数据预过滤
+end
 
 target("MIO")
     set_kind("binary")
     -- **.cpp 递归匹配所有子目录的源文件（旧的 src/*.cpp 漏掉了子目录）
     add_files("src/**.cpp")
-    -- 统一以 src/ 为 include 根，代码里写 #include "llm/Message.h"
+    -- 统一以 src/ 为 include 根，代码里写 #include "providers/llm/Llm.h"
     add_includedirs("src")
     add_packages("cpr", "nlohmann_json", "ixwebsocket", "sqlite3")
 --

@@ -34,7 +34,7 @@
 #include "context/achieve/Achieve.h"
 #include "context/conversationFusion/FusionContext.h"
 #include "context/summarizor/SummaryManager.h"
-#include "llm/Embedding.h"
+#include "providers/embedding/Embedding.h"
 #include "mind/graph/RelationshipGraph.h"
 
 namespace mio {

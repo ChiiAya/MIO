@@ -4,9 +4,9 @@
 #include "config/ConfigManager.h"
 #include "config/embedding/EmbeddingConfig.h"
 #include "config/openai/OpenaiConfig.h"
-#include "llm/openai/OpenAiCompat.h"
-#include "llm/openai/OpenAiEmbedding.h"
-#include "llm/tool/ToolLoop.h"
+#include "providers/llm/openai/OpenAiCompat.h"
+#include "providers/embedding/openai/OpenAiEmbedding.h"
+#include "providers/llm/tool/ToolLoop.h"
 #include "log/Log.h"
 
 #include <ctime>

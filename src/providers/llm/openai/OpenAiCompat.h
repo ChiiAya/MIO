@@ -11,7 +11,7 @@
 // ============================================================================
 
 #include "config/openai/OpenaiConfig.h"
-#include "llm/Llm.h"
+#include "providers/llm/Llm.h"
 
 namespace mio {
 

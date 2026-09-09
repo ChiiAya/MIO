@@ -10,7 +10,7 @@
 // 降级为"跳过本次写入 / 回退精确匹配"，向量端点不可用不影响聊天主链路。
 // ============================================================================
 
-#include "llm/openai/OpenAiEmbedding.h"
+#include "providers/embedding/openai/OpenAiEmbedding.h"
 
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
