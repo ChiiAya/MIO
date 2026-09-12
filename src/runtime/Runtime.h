@@ -28,6 +28,7 @@
 #include "context/achieve/Achieve.h"
 #include "context/contextBuilder/ContextBuilder.h"
 #include "context/conversationFusion/FusionRouter.h"
+#include "context/inputBuffer/inputBuffer.h"
 #include "context/summarizor/SummaryManager.h"
 #include "core/event/Event.h"
 #include "core/eventlog/EventLog.h"
@@ -94,6 +95,8 @@ public:
     void updateState(const Event& event);
     BotReply ingest(IncomingMessage message);
     RuntimeState state() const;  // 值返回（线程安全快照）
+    InputBufferManager& inputBuffers() { return inputBuffers_; }
+    const InputBufferManager& inputBuffers() const { return inputBuffers_; }
 
 private:
     // Facts 渲染（冷启动/重新冷启动后/图谱变化时重建）
@@ -134,6 +137,7 @@ private:
     std::string systemPrompt_;    // Facts 渲染结果（重建时机由调用方保证）
     RuntimeState state_;
     mutable std::mutex stateMtx_;
+    InputBufferManager inputBuffers_;
 };
 
 } // namespace mio

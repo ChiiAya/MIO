@@ -7,7 +7,6 @@
 #include "providers/llm/openai/OpenAiCompat.h"
 #include "providers/embedding/openai/OpenAiEmbedding.h"
 #include "providers/llm/tool/ToolLoop.h"
-#include "context/inputBuffer/inputBuffer.h"
 #include "log/Log.h"
 
 #include <ctime>
@@ -481,13 +480,32 @@ BotReply Runtime::ingest(IncomingMessage message) {
         throw std::runtime_error("Runtime 服务未就绪");
     }
 
-    // 0) 记忆归属与对话上下文先于 route 就位（冷读取摘要的 sink 在 route 内触发）
-    g_activeMemoryPerson = resolveMemoryPerson(message);
-    g_activeConv = message.conversation;
-    g_activeSenderId = message.senderId;
-    g_activeSenderName = message.senderName;
-    g_activePlatform = message.platform;
-    g_activeGroupId = message.groupId;
+    // 1) 物理通道层防抖：获取当前物理会话专属的 InputBuffer
+    auto buffer = inputBuffers_.getOrCreate(message.conversation);
+    const std::string displayName = router_.displayName(message);
+    const PushResult pushRes = buffer->push(message, displayName, now);
+    if (pushRes == PushResult::Rejected) {
+        return BotReply{message.conversation, ""};
+    }
+    if (pushRes == PushResult::AcceptedFollower) {
+        // 作为跟随消息已合流进当前物理会话等待批次，静默返回，由 Leader 统一处理
+        return BotReply{message.conversation, ""};
+    }
+
+    // 当前线程为该物理会话的 Leader，等待 0.5~1.0s 防抖窗口结束，获取当前批次所有消息
+    BufferedBatch batch = buffer->waitForBatch();
+    if (batch.empty()) {
+        return BotReply{message.conversation, ""};
+    }
+
+    // 2) 设置当前线程的记忆归属与对话上下文（冷读取摘要 sink 在 route 内部同步触发）
+    const auto& targetMsg = batch.rawMessages.back();
+    g_activeMemoryPerson = resolveMemoryPerson(targetMsg);
+    g_activeConv = targetMsg.conversation;
+    g_activeSenderId = targetMsg.senderId;
+    g_activeSenderName = targetMsg.senderName;
+    g_activePlatform = targetMsg.platform;
+    g_activeGroupId = targetMsg.groupId;
 
     struct ContextGuard {
         ~ContextGuard() {
@@ -501,37 +519,15 @@ BotReply Runtime::ingest(IncomingMessage message) {
         }
     } contextGuard;
 
-    // 1) 路由：身份映射 → 首次遇见 Achieve 冷读取建 unit → 融合判断（redirect）→ 目标 unit
-    FusionUnit* unit = router_.route(message, now);
+    // 3) 路由与关系图谱登记：批次内每条原始消息进行 route 处理（登记 @ 关系、亲密度等）
+    FusionUnit* unit = nullptr;
+    for (const auto& raw : batch.rawMessages) {
+        unit = router_.route(raw, now);
+    }
+    if (!unit) {
+        return BotReply{batch.conversation, ""};
+    }
     g_activeUnit = unit;
-
-    // 2) 消息投送进 FusionUnit 的 InputBuffer：长文本过滤与防抖缓冲
-    const std::string displayName = router_.displayName(message);
-    const PushResult pushRes = unit->inputBuffer().push(message, displayName, now);
-    if (pushRes == PushResult::Rejected) {
-        return BotReply{message.conversation, ""};
-    }
-    if (pushRes == PushResult::AcceptedFollower) {
-        // 作为跟随消息已合流进当前等待批次，静默返回，由 Leader 统一处理
-        return BotReply{message.conversation, ""};
-    }
-
-    // 当前线程为 Leader，等待 0.5~1.0s 防抖窗口结束，获取当前批次所有消息
-    BufferedBatch batch = unit->inputBuffer().waitForBatch();
-    if (batch.empty()) {
-        return BotReply{message.conversation, ""};
-    }
-
-    // 更新活跃线程局部上下文为当前批次的主回复目标
-    if (!batch.rawMessages.empty()) {
-        const auto& targetMsg = batch.rawMessages.back();
-        g_activeMemoryPerson = resolveMemoryPerson(targetMsg);
-        g_activeConv = targetMsg.conversation;
-        g_activeSenderId = targetMsg.senderId;
-        g_activeSenderName = targetMsg.senderName;
-        g_activePlatform = targetMsg.platform;
-        g_activeGroupId = targetMsg.groupId;
-    }
 
     ChatResponse resp;
     bool reColdStarted = false;
@@ -539,7 +535,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
         // 上下文级锁：同 unit 串行（含 LLM 往返），跨 unit 并行
         std::lock_guard<std::mutex> lock(unit->mtx);
 
-        // 3) 批次内所有原始消息分别原汁原味落入各自会话的真实档案
+        // 4) 批次内所有原始消息分别落入物理会话的真实档案
         for (const auto& raw : batch.rawMessages) {
             Msg rawTurn{Role::User};
             rawTurn.text = raw.text;
@@ -548,15 +544,15 @@ BotReply Runtime::ingest(IncomingMessage message) {
             rawTurn.senderName = router_.displayName(raw);
             rawTurn.platform = raw.platform;
             rawTurn.groupId = raw.groupId;
-            achieve_.append(raw.conversation, rawTurn);
+            achieve_.append(batch.conversation, rawTurn);
         }
 
-        // 4) 批次内重组好的独立上下文 turns 追加进 unit 上下文
+        // 5) 批次内重组好的独立上下文 turns 追加进 unit 上下文
         for (auto& turn : batch.turns) {
             unit->append(std::move(turn));
         }
 
-        // 5) 构建请求（当前回合已 append 进 unit；上下文不够 → 重新冷启动压缩）
+        // 6) 构建请求（当前回合已 append 进 unit；上下文不够 → 重新冷启动压缩）
         BuildInput in;
         in.systemPrompt = systemPrompt_;
         in.unit = unit;
@@ -567,15 +563,15 @@ BotReply Runtime::ingest(IncomingMessage message) {
         ChatRequest req = result.request;
         req.tools = registry_.defs();
 
-        // 6) 工具循环；sink：逐条落档案 + 入 unit 上下文
+        // 7) 工具循环；sink：逐条落档案 + 入 unit 上下文
         resp = runToolLoop(*currentLlm, registry_, req, ToolLoopOptions{},
-                           [this, unit, conv = batch.primaryConv](
+                           [this, unit, conv = batch.conversation](
                                const Msg& m) {
                                achieve_.append(conv, m);
                                unit->append(m);
                            });
     }
-    // 7) 锁外：状态快照 + 审计 + Facts 重建
+    // 8) 锁外：状态快照 + 审计 + Facts 重建
     for (const auto& raw : batch.rawMessages) {
         noteMessage(raw.conversation, raw.senderId);
     }
@@ -584,7 +580,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
         systemPrompt_ = rebuildSystemPrompt(diary_.consume());
     }
 
-    return BotReply{batch.primaryConv, resp.text};
+    return BotReply{batch.conversation, resp.text};
 }
 
 RuntimeState Runtime::state() const {

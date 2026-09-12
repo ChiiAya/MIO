@@ -55,8 +55,7 @@ PushResult InputBuffer::push(IncomingMessage msg, const std::string& displayName
         hasLeader_ = true;
         firstMsgTime_ = now;
         lastMsgTime_ = now;
-        primaryConv_ = msg.conversation;
-        primarySenderId_ = msg.senderId;
+        conversation_ = msg.conversation;
 
         pendingRaw_.push_back(std::move(msg));
         pendingTurns_.push_back(std::move(turn));
@@ -65,14 +64,9 @@ PushResult InputBuffer::push(IncomingMessage msg, const std::string& displayName
 
     // 后续跟随消息：追加进当前等待批次，并刷新最后到达时间
     lastMsgTime_ = now;
-    primaryConv_ = msg.conversation;
-    primarySenderId_ = msg.senderId;
 
     // 若同一会话同一发言人连续打字，合并文本以节省 Prompt 与缓存
-    if (!pendingTurns_.empty() &&
-        pendingTurns_.back().senderId == turn.senderId &&
-        pendingTurns_.back().platform == turn.platform &&
-        pendingTurns_.back().groupId == turn.groupId) {
+    if (!pendingTurns_.empty() && pendingTurns_.back().senderId == turn.senderId) {
         pendingTurns_.back().text += "\n" + turn.text;
     } else {
         pendingTurns_.push_back(std::move(turn));
@@ -118,8 +112,7 @@ BufferedBatch InputBuffer::waitForBatch() {
     BufferedBatch batch;
     batch.rawMessages = std::move(pendingRaw_);
     batch.turns = std::move(pendingTurns_);
-    batch.primaryConv = primaryConv_;
-    batch.primarySenderId = primarySenderId_;
+    batch.conversation = conversation_;
 
     pendingRaw_.clear();
     pendingTurns_.clear();
@@ -139,6 +132,48 @@ void InputBuffer::clear() {
     pendingTurns_.clear();
     hasLeader_ = false;
     cv_.notify_all();
+}
+
+// ============================================================================
+// InputBufferManager 实现
+// ============================================================================
+
+InputBufferManager::InputBufferManager(InputBufferConfig cfg) : cfg_(cfg) {}
+
+std::shared_ptr<InputBuffer> InputBufferManager::getOrCreate(const ConversationKey& conv) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    const std::string key = conv.toString();
+    auto it = buffers_.find(key);
+    if (it != buffers_.end()) {
+        return it->second;
+    }
+    auto buf = std::make_shared<InputBuffer>(cfg_);
+    buffers_[key] = buf;
+    return buf;
+}
+
+void InputBufferManager::updateConfig(InputBufferConfig cfg) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    cfg_ = cfg;
+    for (auto& [_, buf] : buffers_) {
+        buf->updateConfig(cfg);
+    }
+}
+
+void InputBufferManager::cleanupIdle() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (auto it = buffers_.begin(); it != buffers_.end(); ) {
+        if (it->second.use_count() == 1 && it->second->empty()) {
+            it = buffers_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+const InputBufferConfig& InputBufferManager::config() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return cfg_;
 }
 
 } // namespace mio

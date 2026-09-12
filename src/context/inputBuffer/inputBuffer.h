@@ -1,12 +1,12 @@
 #pragma once
 // ============================================================================
-// InputBuffer：FusionUnit 的前置消息防抖与批处理缓冲区
+// InputBuffer：物理会话（Conversation）维度的前置消息防抖与批处理缓冲区
 //
 // 职责：
-//   1. 连续输入防抖（Debounce）：收集 0.5~1.0s 内连续输入的消息；
+//   1. 物理通道防抖（Debounce）：收集物理通道 0.5~1.0s 内连续输入的消息；
 //   2. 长文本过滤与安全截断（Filter）：对超长输入限制预算，过滤空消息；
 //   3. 批次重组（Batching）：将短时连续输入打包为单次 LLM 请求上下文；
-//   4. 真实身份保全：批次内每条原始消息保留独立物理会话与发言人元数据。
+//   4. 真实身份保全：批次内每条原始消息保留独立发言人元数据。
 // ============================================================================
 
 #include "core/conversation/Conversation.h"
@@ -16,6 +16,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -38,8 +40,7 @@ enum class PushResult {
 struct BufferedBatch {
     std::vector<IncomingMessage> rawMessages; // 保留所有原始物理消息（各自落档案/关系图谱用）
     std::vector<Msg> turns;                  // 过滤并重组后的独立上下文 Msg 列表
-    ConversationKey primaryConv;             // 主回复目标会话（最后一条或触发消息）
-    std::string primarySenderId;             // 主回复目标发言人 ID
+    ConversationKey conversation;            // 物理会话 Key
 
     bool empty() const { return rawMessages.empty(); }
     std::size_t size() const { return rawMessages.size(); }
@@ -73,14 +74,38 @@ private:
     std::condition_variable cv_;
 
     bool hasLeader_ = false;
-    bool flushing_ = false;
     std::vector<IncomingMessage> pendingRaw_;
     std::vector<Msg> pendingTurns_;
-    ConversationKey primaryConv_;
-    std::string primarySenderId_;
+    ConversationKey conversation_;
 
     std::chrono::steady_clock::time_point firstMsgTime_;
     std::chrono::steady_clock::time_point lastMsgTime_;
+};
+
+// ============================================================================
+// InputBufferManager：物理会话级别的输入防抖缓冲区管理器
+//
+// 职责：按 ConversationKey 维护各个独立物理通道的 InputBuffer 实例，
+//       实现物理通道级别的防抖聚合，彻底解耦物理防抖与心智上下文融合。
+// ============================================================================
+class InputBufferManager {
+public:
+    explicit InputBufferManager(InputBufferConfig cfg = {});
+    ~InputBufferManager() = default;
+
+    InputBufferManager(const InputBufferManager&) = delete;
+    InputBufferManager& operator=(const InputBufferManager&) = delete;
+
+    std::shared_ptr<InputBuffer> getOrCreate(const ConversationKey& conv);
+    void updateConfig(InputBufferConfig cfg);
+    void cleanupIdle();
+
+    const InputBufferConfig& config() const;
+
+private:
+    InputBufferConfig cfg_;
+    mutable std::mutex mtx_;
+    std::map<std::string, std::shared_ptr<InputBuffer>> buffers_;
 };
 
 } // namespace mio
