@@ -246,32 +246,50 @@ struct NapCatConnection {
 void workerLoop(Runtime& runtime, NapCatConnection& conn, PendingActions& pending,
                 std::deque<IncomingMessage>& queue, std::mutex& queueMtx,
                 std::condition_variable& queueCv, const std::atomic<bool>& running) {
+    std::atomic<int> activeTasks{0};
+    std::mutex taskMtx;
+    std::condition_variable taskCv;
+
     for (;;) {
         std::unique_lock<std::mutex> lock(queueMtx);
         queueCv.wait(lock, [&] { return !queue.empty() || !running; });
-        if (queue.empty()) return;
+        if (queue.empty()) {
+            std::unique_lock<std::mutex> tlock(taskMtx);
+            taskCv.wait(tlock, [&] { return activeTasks == 0; });
+            return;
+        }
         IncomingMessage message = std::move(queue.front());
         queue.pop_front();
         lock.unlock();
 
-        const ConversationKey conversation = message.conversation;
-        const std::string senderId = message.senderId;
-        log::info(kTag, "处理 " + conversation.toString() + " 来自 " + senderId);
+        activeTasks++;
+        std::thread([&runtime, &conn, &pending, &activeTasks, &taskMtx, &taskCv,
+                     message = std::move(message)]() mutable {
+            const ConversationKey conversation = message.conversation;
+            const std::string senderId = message.senderId;
+            log::info(kTag, "处理 " + conversation.toString() + " 来自 " + senderId);
 
-        try {
-            const BotReply reply = runtime.ingest(std::move(message));
-            if (reply.text.empty()) continue;
-
-            std::shared_ptr<ix::WebSocket> ws;
-            {
-                std::lock_guard<std::mutex> connLock(conn.mtx);
-                ws = conn.current;
+            try {
+                const BotReply reply = runtime.ingest(std::move(message));
+                if (!reply.text.empty()) {
+                    std::shared_ptr<ix::WebSocket> ws;
+                    {
+                        std::lock_guard<std::mutex> connLock(conn.mtx);
+                        ws = conn.current;
+                    }
+                    if (sendReply(ws, pending, conversation, senderId, reply.text))
+                        log::info(kTag, "已回复 → " + conversation.toString());
+                }
+            } catch (const std::exception& error) {
+                log::error(kTag, std::string("处理消息失败: ") + error.what());
             }
-            if (sendReply(ws, pending, conversation, senderId, reply.text))
-                log::info(kTag, "已回复 → " + conversation.toString());
-        } catch (const std::exception& error) {
-            log::error(kTag, std::string("处理消息失败: ") + error.what());
-        }
+
+            {
+                std::lock_guard<std::mutex> tlock(taskMtx);
+                activeTasks--;
+            }
+            taskCv.notify_one();
+        }).detach();
     }
 }
 

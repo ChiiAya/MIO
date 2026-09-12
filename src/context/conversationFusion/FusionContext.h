@@ -11,6 +11,7 @@
 // reColdStart：上下文不够时由 contextBuilder 调用，压缩自身（重新冷启动）。
 // ============================================================================
 
+#include "context/inputBuffer/inputBuffer.h"
 #include "core/conversation/Conversation.h"
 #include "core/message/Message.h"
 
@@ -76,6 +77,9 @@ public:
         fusion_.context = std::move(context);
     }
 
+    InputBuffer& inputBuffer() { return inputBuffer_; }
+    const InputBuffer& inputBuffer() const { return inputBuffer_; }
+
     std::mutex mtx;  // 上下文级锁：同 unit 串行、跨 unit 并行
 
 private:
@@ -86,6 +90,7 @@ private:
                                    int summaryCount, int rawKeep);
 
     FusionContext fusion_;
+    InputBuffer inputBuffer_;
 };
 
 } // namespace mio

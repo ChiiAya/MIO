@@ -7,6 +7,7 @@
 #include "providers/llm/openai/OpenAiCompat.h"
 #include "providers/embedding/openai/OpenAiEmbedding.h"
 #include "providers/llm/tool/ToolLoop.h"
+#include "context/inputBuffer/inputBuffer.h"
 #include "log/Log.h"
 
 #include <ctime>
@@ -504,17 +505,33 @@ BotReply Runtime::ingest(IncomingMessage message) {
     FusionUnit* unit = router_.route(message, now);
     g_activeUnit = unit;
 
-    Msg turn{Role::User};
-    turn.text = message.text;
-    turn.createdAt = now;
-    turn.senderId = message.senderId;   // 原始平台 id：档案/身份归一用
-    turn.senderName = router_.displayName(message);  // Router 身份注入：图谱昵称优先
-    turn.platform = message.platform;
-    turn.groupId = message.groupId;
+    // 2) 消息投送进 FusionUnit 的 InputBuffer：长文本过滤与防抖缓冲
+    const std::string displayName = router_.displayName(message);
+    const PushResult pushRes = unit->inputBuffer().push(message, displayName, now);
+    if (pushRes == PushResult::Rejected) {
+        return BotReply{message.conversation, ""};
+    }
+    if (pushRes == PushResult::AcceptedFollower) {
+        // 作为跟随消息已合流进当前等待批次，静默返回，由 Leader 统一处理
+        return BotReply{message.conversation, ""};
+    }
 
-    // 2) 记忆召回改为工具化：模型需要历史背景时自行调用 recall_memory，
-    //    不再每轮自动把 Top-K 注入 user 消息。
-    //    （召回仍使用 thread_local 的 g_activeMemoryPerson / g_activeConv 做权限过滤）
+    // 当前线程为 Leader，等待 0.5~1.0s 防抖窗口结束，获取当前批次所有消息
+    BufferedBatch batch = unit->inputBuffer().waitForBatch();
+    if (batch.empty()) {
+        return BotReply{message.conversation, ""};
+    }
+
+    // 更新活跃线程局部上下文为当前批次的主回复目标
+    if (!batch.rawMessages.empty()) {
+        const auto& targetMsg = batch.rawMessages.back();
+        g_activeMemoryPerson = resolveMemoryPerson(targetMsg);
+        g_activeConv = targetMsg.conversation;
+        g_activeSenderId = targetMsg.senderId;
+        g_activeSenderName = targetMsg.senderName;
+        g_activePlatform = targetMsg.platform;
+        g_activeGroupId = targetMsg.groupId;
+    }
 
     ChatResponse resp;
     bool reColdStarted = false;
@@ -522,11 +539,24 @@ BotReply Runtime::ingest(IncomingMessage message) {
         // 上下文级锁：同 unit 串行（含 LLM 往返），跨 unit 并行
         std::lock_guard<std::mutex> lock(unit->mtx);
 
-        // 3) 落档案（事实源）+ 入 unit 上下文
-        achieve_.append(message.conversation, turn);
-        unit->append(turn);
+        // 3) 批次内所有原始消息分别原汁原味落入各自会话的真实档案
+        for (const auto& raw : batch.rawMessages) {
+            Msg rawTurn{Role::User};
+            rawTurn.text = raw.text;
+            rawTurn.createdAt = now;
+            rawTurn.senderId = raw.senderId;
+            rawTurn.senderName = router_.displayName(raw);
+            rawTurn.platform = raw.platform;
+            rawTurn.groupId = raw.groupId;
+            achieve_.append(raw.conversation, rawTurn);
+        }
 
-        // 4) 构建请求（当前回合已 append 进 unit；上下文不够 → 重新冷启动压缩）
+        // 4) 批次内重组好的独立上下文 turns 追加进 unit 上下文
+        for (auto& turn : batch.turns) {
+            unit->append(std::move(turn));
+        }
+
+        // 5) 构建请求（当前回合已 append 进 unit；上下文不够 → 重新冷启动压缩）
         BuildInput in;
         in.systemPrompt = systemPrompt_;
         in.unit = unit;
@@ -537,22 +567,24 @@ BotReply Runtime::ingest(IncomingMessage message) {
         ChatRequest req = result.request;
         req.tools = registry_.defs();
 
-        // 5) 工具循环；sink：逐条落档案 + 入 unit 上下文
+        // 6) 工具循环；sink：逐条落档案 + 入 unit 上下文
         resp = runToolLoop(*currentLlm, registry_, req, ToolLoopOptions{},
-                           [this, unit, conv = message.conversation](
+                           [this, unit, conv = batch.primaryConv](
                                const Msg& m) {
                                achieve_.append(conv, m);
                                unit->append(m);
                            });
     }
-    // 6) 锁外：状态快照 + 审计 + Facts 重建
-    noteMessage(message.conversation, message.senderId);
+    // 7) 锁外：状态快照 + 审计 + Facts 重建
+    for (const auto& raw : batch.rawMessages) {
+        noteMessage(raw.conversation, raw.senderId);
+    }
     if (reColdStarted) {
         eventLog_.append({0, EventKind::SummaryApplied, now, "上下文重新冷启动"});
         systemPrompt_ = rebuildSystemPrompt(diary_.consume());
     }
 
-    return BotReply{message.conversation, resp.text};
+    return BotReply{batch.primaryConv, resp.text};
 }
 
 RuntimeState Runtime::state() const {
