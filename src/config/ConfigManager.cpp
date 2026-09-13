@@ -9,8 +9,24 @@ namespace mio {
 ConfigManager::ConfigManager(std::shared_ptr<const AppConfig> initialConfig) {
     if (initialConfig) {
         current_ = std::move(initialConfig);
+    } else if (std::getenv("MIO_NO_CONFIG") != nullptr) {
+        current_ = std::make_shared<const AppConfig>(AppConfig::fromEnvironment());
+    } else if (const char* envPath = std::getenv("MIO_CONFIG_PATH"); envPath && std::filesystem::exists(envPath)) {
+        if (!reloadFromFile(envPath)) {
+            current_ = std::make_shared<const AppConfig>(AppConfig::fromEnvironment());
+        }
     } else if (std::filesystem::exists("config.json")) {
         if (!reloadFromFile("config.json")) {
+            current_ = std::make_shared<const AppConfig>(AppConfig::fromEnvironment());
+        }
+    } else {
+        current_ = std::make_shared<const AppConfig>(AppConfig::fromEnvironment());
+    }
+}
+
+ConfigManager::ConfigManager(const std::filesystem::path& configPath) {
+    if (!configPath.empty() && std::filesystem::exists(configPath)) {
+        if (!reloadFromFile(configPath)) {
             current_ = std::make_shared<const AppConfig>(AppConfig::fromEnvironment());
         }
     } else {
@@ -55,6 +71,11 @@ bool ConfigManager::reload(const std::string& jsonString) {
 }
 
 bool ConfigManager::reloadFromFile(const std::filesystem::path& path) {
+    if (path == "config.json" && std::getenv("MIO_NO_CONFIG") != nullptr) {
+        log::info("ConfigManager", "MIO_NO_CONFIG 启用，从环境变量重新加载");
+        return reloadFromEnvironment();
+    }
+
     if (!std::filesystem::exists(path)) {
         if (path == "config.json") {
             log::info("ConfigManager", "未找到 config.json，从环境变量重新加载");

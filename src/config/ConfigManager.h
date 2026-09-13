@@ -12,6 +12,7 @@ namespace mio {
 class ConfigManager {
 public:
     explicit ConfigManager(std::shared_ptr<const AppConfig> initialConfig = nullptr);
+    explicit ConfigManager(const std::filesystem::path& configPath);
 
     // 线程安全获取当前不可变配置快照
     std::shared_ptr<const AppConfig> get() const;

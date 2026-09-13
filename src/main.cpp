@@ -24,6 +24,7 @@
 
 #include "adapters/console/ConsoleAdapter.h"
 #include "adapters/napcat/NapCatAdapter.h"
+#include "config/ConfigManager.h"
 #include "config/openai/OpenaiConfig.h"
 #include "providers/llm/Llm.h"
 #include "providers/llm/openai/OpenAiCompat.h"
@@ -33,18 +34,17 @@
 namespace mio {
 namespace {
 
-// LLM 工厂：把 backend 名映射到具体实现。
-// 目前只有 "openai"（Chat Completions 兼容协议）；未来接新协议族在此扩展。
-std::unique_ptr<Llm> createLlm(const std::string& backend) {
-    if (backend == "openai")
-        return std::make_unique<OpenAiCompat>(OpenAiConfig::fromEnvironment());
-    throw std::runtime_error("未知 LLM backend: " + backend);
+// LLM 工厂：根据配置把 backend 映射到具体实现。
+std::shared_ptr<Llm> createLlm(const AppConfig& cfg) {
+    if (cfg.llmBackend == "openai")
+        return std::make_shared<OpenAiCompat>(cfg.openai);
+    throw std::runtime_error("未知 LLM backend: " + cfg.llmBackend);
 }
 
 } // namespace
 } // namespace mio
 
-int main() {
+int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -53,15 +53,53 @@ int main() {
     try {
         mio::log::initFromEnvironment();
 
-        const std::string backend = mio::llmBackendFromEnvironment();
-        std::cout << "LLM backend: " << backend << "\n";
+        std::filesystem::path configPath;
+        if (const char* envPath = std::getenv("MIO_CONFIG_PATH")) {
+            configPath = envPath;
+        }
 
-        mio::Runtime runtime("Mio", "data", mio::createLlm(backend));
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--config" || arg == "-c") {
+                if (i + 1 < argc) {
+                    configPath = argv[++i];
+                }
+            } else if (arg == "--help" || arg == "-h") {
+                std::cout << "Usage: " << argv[0] << " [config_file] [--config <path>]\n";
+                std::cout << "Options:\n";
+                std::cout << "  -c, --config <path>   指定配置文件路径 (默认: config.json 或 $MIO_CONFIG_PATH)\n";
+                std::cout << "  -h, --help            显示帮助信息\n";
+                return 0;
+            } else if (!arg.empty() && arg[0] != '-') {
+                configPath = arg;
+            }
+        }
 
-        // 平台选择：MIO_PLATFORM=napcat 接入 NapCatQQ 反向 WebSocket
-        const char* platform = std::getenv("MIO_PLATFORM");
-        if (platform != nullptr && std::string(platform) == "napcat") {
-            mio::runNapCat(runtime, mio::NapCatConfig::fromEnvironment());
+        std::shared_ptr<mio::ConfigManager> configMgr;
+        if (!configPath.empty()) {
+            configMgr = std::make_shared<mio::ConfigManager>(configPath);
+        } else {
+            configMgr = std::make_shared<mio::ConfigManager>();
+        }
+
+        auto cfg = configMgr->get();
+        std::cout << "Bot Name: " << cfg->botName << "\n";
+        std::cout << "LLM backend: " << cfg->llmBackend;
+        if (!cfg->openai.model.empty()) {
+            std::cout << " (" << cfg->openai.model << ")";
+        }
+        std::cout << "\n";
+
+        mio::Runtime runtime(cfg->botName, cfg->dataDir, mio::createLlm(*cfg), configMgr);
+
+        // 平台选择：MIO_PLATFORM 环境变量优先，未设置则使用配置文件里的 platform
+        std::string platform = cfg->platform;
+        if (const char* envPlatform = std::getenv("MIO_PLATFORM")) {
+            platform = envPlatform;
+        }
+
+        if (platform == "napcat") {
+            mio::runNapCat(runtime, cfg->napcat);
         } else {
             mio::runConsole(runtime, std::cin, std::cout);
         }
