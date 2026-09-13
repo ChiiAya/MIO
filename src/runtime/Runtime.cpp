@@ -1,5 +1,6 @@
 #include "runtime/Runtime.h"
 
+#include "admin/AdminServer.h"
 #include "config/AppConfig.h"
 #include "config/ConfigManager.h"
 #include "config/embedding/EmbeddingConfig.h"
@@ -30,6 +31,7 @@ static thread_local std::string g_activeSenderId;
 static thread_local std::string g_activeSenderName;
 static thread_local std::string g_activePlatform;
 static thread_local std::string g_activeGroupId;
+static thread_local bool g_activeKeepSilent = false;
 
 std::string hexEncode(const std::string& s) {
     static const char* digits = "0123456789ABCDEF";
@@ -47,9 +49,7 @@ std::string hexEncode(const std::string& s) {
 Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
                  std::shared_ptr<Llm> llm,
                  std::shared_ptr<ConfigManager> configMgr)
-    // 人设与基础事实；character 将来从配置文件来
-    : persona_{botName,
-               "你说话简短、有点毒舌但其实很关心对方，喜欢在句尾加 \"喵~\"。"},
+    : persona_{botName, "", "", ""},
       graph_{dataDir / "relationships.json"},
       diary_{dataDir / "diary.json"},
       achieve_{dataDir / "history"},
@@ -61,8 +61,18 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
       builder_(std::make_shared<ContextBuilder>(configMgr_->get()->contextBuilder, summary_)),
       memoryStore_(dataDir / "memory.db"),
       memory_(configMgr_->get()->memory, embedding_, memoryStore_),
-      router_{graph_, achieve_, summary_, configMgr_->get()->fusion, embedding_} {
+      router_{graph_, achieve_, summary_, configMgr_->get()->fusion, embedding_},
+      inputBuffers_{configMgr_->get()->inputBuffer} {
     log::initFromEnvironment();  // MIO_LOG_LEVEL，重复调用安全
+
+    if (configMgr_ && configMgr_->get()) {
+        auto cfg = configMgr_->get();
+        if (!cfg->botName.empty() && botName == "Mio") persona_.botName = cfg->botName;
+        if (!cfg->character.empty()) persona_.character = cfg->character;
+        if (!cfg->systemPromptPrefix.empty()) persona_.systemPromptPrefix = cfg->systemPromptPrefix;
+        if (!cfg->systemPromptNotice.empty()) persona_.systemPromptNotice = cfg->systemPromptNotice;
+    }
+
     registerBuiltinTools();
 
     // MIO 也是 person（统一图谱结构；隐私差异化靠装配/检索时隐藏数据）
@@ -74,14 +84,27 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
         [this](const SummaryOutcome& outcome) { onSummaryProduced(outcome); });
 
     systemPrompt_ = rebuildSystemPrompt();
-    state_.botName = std::move(botName);
+    state_.botName = persona_.botName;
     state_.messageCount = 0;
+
+    int adminPort = (configMgr_ && configMgr_->get()) ? configMgr_->get()->adminPort : 6188;
+    if (adminPort > 0) {
+        adminServer_ = std::make_unique<AdminServer>(*this, adminPort);
+        adminServer_->start();
+    }
 }
 
 Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
                  std::unique_ptr<Llm> llm)
     : Runtime(std::move(botName), std::move(dataDir),
               std::shared_ptr<Llm>(std::move(llm))) {}
+
+Runtime::~Runtime() {
+    if (adminServer_) {
+        adminServer_->stop();
+        adminServer_.reset();
+    }
+}
 
 bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
     if (!configMgr_) {
@@ -105,18 +128,32 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
         // 重载时清理动态工具
         registry_.clearDynamicTools();
 
-        // 原子切换服务指针
+        // 原子切换服务指针与更新提示词
         {
             std::unique_lock<std::shared_mutex> lock(servicesMtx_);
             llm_ = newLlm;
             embedding_ = newEmbedding;
             summary_ = newSummary;
             builder_ = newBuilder;
+
+            if (!newConfig->botName.empty()) persona_.botName = newConfig->botName;
+            if (!newConfig->character.empty()) persona_.character = newConfig->character;
+            if (!newConfig->systemPromptPrefix.empty())
+                persona_.systemPromptPrefix = newConfig->systemPromptPrefix;
+            if (!newConfig->systemPromptNotice.empty())
+                persona_.systemPromptNotice = newConfig->systemPromptNotice;
+            systemPrompt_ = rebuildSystemPrompt();
         }
 
         // 刷新长驻组件配置与依赖
         router_.update(newConfig->fusion, newSummary, newEmbedding);
         memory_.update(newConfig->memory, newEmbedding);
+        inputBuffers_.updateConfig(newConfig->inputBuffer);
+
+        {
+            std::lock_guard<std::mutex> lock(stateMtx_);
+            state_.botName = persona_.botName;
+        }
 
         const std::int64_t now = std::time(nullptr);
         eventLog_.append({0, EventKind::ConfigReloaded, now, "配置热重载: " + configPath.string()});
@@ -134,6 +171,11 @@ std::shared_ptr<const AppConfig> Runtime::config() const {
 
 std::shared_ptr<ConfigManager> Runtime::configManager() const {
     return configMgr_;
+}
+
+std::string Runtime::systemPrompt() const {
+    std::shared_lock<std::shared_mutex> lock(servicesMtx_);
+    return systemPrompt_;
 }
 
 void Runtime::registerBuiltinTools() {
@@ -423,6 +465,57 @@ void Runtime::registerBuiltinTools() {
                       return list.dump();
                   },
                   ToolLayer::Builtin);
+
+    // keepsilent —— 保持沉默（不想回答 / 已读不回 / 拒绝回复）
+    ToolDef keepSilentDef;
+    keepSilentDef.name = "keepsilent";
+    keepSilentDef.description =
+        "当你阅读了用户的话后，内心感到被冒犯不想回复、想要已读不回、或者认为此时保持沉默更符合你的心情时，调用此工具保持沉默。调用后你不会向用户发送任何消息。";
+    keepSilentDef.parametersJsonSchema = {
+        {"type", "object"},
+        {"properties",
+         {{"reason",
+           {{"type", "string"},
+            {"description", "决定保持沉默的内心理由（如：被惹毛了不想说话/觉得对方很无聊）"}}}}},
+        {"required", nlohmann::json::array({"reason"})}};
+    keepSilentDef.isTerminal = true;
+    registry_.add(
+        keepSilentDef,
+        [](const nlohmann::json& args) -> std::string {
+            g_activeKeepSilent = true;
+            std::string reason = args.value("reason", "");
+            log::info("Runtime", "模型调用 keepsilent 保持沉默: " + reason);
+            return "已选择保持沉默。本轮不会向用户发送任何回复。";
+        },
+        ToolLayer::Builtin);
+
+    // keep_silent 别名
+    ToolDef keepSilentAliasDef = keepSilentDef;
+    keepSilentAliasDef.name = "keep_silent";
+    keepSilentAliasDef.description = "同 keepsilent，在不想回答或决定已读不回时调用。";
+    registry_.add(
+        std::move(keepSilentAliasDef),
+        [](const nlohmann::json& args) -> std::string {
+            g_activeKeepSilent = true;
+            std::string reason = args.value("reason", "");
+            log::info("Runtime", "模型调用 keep_silent 保持沉默: " + reason);
+            return "已选择保持沉默。本轮不会向用户发送任何回复。";
+        },
+        ToolLayer::Builtin);
+
+    // stay_silent 别名
+    ToolDef staySilentDef = keepSilentDef;
+    staySilentDef.name = "stay_silent";
+    staySilentDef.description = "同 keepsilent，在不想回答或决定已读不回时调用。";
+    registry_.add(
+        std::move(staySilentDef),
+        [](const nlohmann::json& args) -> std::string {
+            g_activeKeepSilent = true;
+            std::string reason = args.value("reason", "");
+            log::info("Runtime", "模型调用 stay_silent 保持沉默: " + reason);
+            return "已选择保持沉默。本轮不会向用户发送任何回复。";
+        },
+        ToolLayer::Builtin);
 }
 
 std::string Runtime::rebuildSystemPrompt(
@@ -470,11 +563,13 @@ BotReply Runtime::ingest(IncomingMessage message) {
     std::shared_ptr<Llm> currentLlm;
     std::shared_ptr<ContextBuilder> currentBuilder;
     std::shared_ptr<SummaryManager> currentSummary;
+    std::string currentSystemPrompt;
     {
         std::shared_lock<std::shared_mutex> lock(servicesMtx_);
         currentLlm = llm_;
         currentBuilder = builder_;
         currentSummary = summary_;
+        currentSystemPrompt = systemPrompt_;
     }
     if (!currentLlm || !currentBuilder) {
         throw std::runtime_error("Runtime 服务未就绪");
@@ -506,6 +601,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
     g_activeSenderName = targetMsg.senderName;
     g_activePlatform = targetMsg.platform;
     g_activeGroupId = targetMsg.groupId;
+    g_activeKeepSilent = false;
 
     struct ContextGuard {
         ~ContextGuard() {
@@ -516,6 +612,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
             g_activeSenderName.clear();
             g_activePlatform.clear();
             g_activeGroupId.clear();
+            g_activeKeepSilent = false;
         }
     } contextGuard;
 
@@ -554,7 +651,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
 
         // 6) 构建请求（当前回合已 append 进 unit；上下文不够 → 重新冷启动压缩）
         BuildInput in;
-        in.systemPrompt = systemPrompt_;
+        in.systemPrompt = currentSystemPrompt;
         in.unit = unit;
         in.now = now;
         auto result = currentBuilder->build(in);
@@ -566,10 +663,10 @@ BotReply Runtime::ingest(IncomingMessage message) {
         // 7) 工具循环；sink：逐条落档案 + 入 unit 上下文
         resp = runToolLoop(*currentLlm, registry_, req, ToolLoopOptions{},
                            [this, unit, conv = batch.conversation](
-                               const Msg& m) {
-                               achieve_.append(conv, m);
-                               unit->append(m);
-                           });
+                                const Msg& m) {
+                                achieve_.append(conv, m);
+                                unit->append(m);
+                            });
     }
     // 8) 锁外：状态快照 + 审计 + Facts 重建
     for (const auto& raw : batch.rawMessages) {
@@ -577,7 +674,13 @@ BotReply Runtime::ingest(IncomingMessage message) {
     }
     if (reColdStarted) {
         eventLog_.append({0, EventKind::SummaryApplied, now, "上下文重新冷启动"});
+        std::unique_lock<std::shared_mutex> lock(servicesMtx_);
         systemPrompt_ = rebuildSystemPrompt(diary_.consume());
+    }
+
+    if (g_activeKeepSilent) {
+        log::info("Runtime", "模型自主调用 keepsilent 保持沉默，本轮不发送回复消息");
+        resp.text = "";
     }
 
     return BotReply{batch.conversation, resp.text};

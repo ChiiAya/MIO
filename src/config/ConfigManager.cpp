@@ -24,7 +24,7 @@ std::shared_ptr<const AppConfig> ConfigManager::get() const {
 }
 
 bool ConfigManager::reload(const std::string& jsonString) {
-    nlohmann::json j = nlohmann::json::parse(jsonString, nullptr, false);
+    nlohmann::json j = nlohmann::json::parse(jsonString, nullptr, false, true);
     if (j.is_discarded()) {
         log::warn("ConfigManager", "JSON 解析失败，保持当前配置");
         return false;

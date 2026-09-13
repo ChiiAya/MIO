@@ -216,18 +216,39 @@ void from_json(const nlohmann::json& j, NapCatConfig& c) {
     readIfExists(j, "token", c.token);
 }
 
+void to_json(nlohmann::json& j, const InputBufferConfig& c) {
+    j = nlohmann::json{
+        {"maxDelayMs", c.maxDelayMs},
+        {"debounceMs", c.debounceMs},
+        {"maxTextLength", c.maxTextLength},
+        {"maxBatchSize", c.maxBatchSize}
+    };
+}
+
+void from_json(const nlohmann::json& j, InputBufferConfig& c) {
+    readIfExists(j, "maxDelayMs", c.maxDelayMs);
+    readIfExists(j, "debounceMs", c.debounceMs);
+    readIfExists(j, "maxTextLength", c.maxTextLength);
+    readIfExists(j, "maxBatchSize", c.maxBatchSize);
+}
+
 void to_json(nlohmann::json& j, const AppConfig& c) {
     j = nlohmann::json{
         {"botName", c.botName},
         {"dataDir", c.dataDir},
         {"platform", c.platform},
         {"llmBackend", c.llmBackend},
+        {"character", c.character},
+        {"systemPromptPrefix", c.systemPromptPrefix},
+        {"systemPromptNotice", c.systemPromptNotice},
+        {"adminPort", c.adminPort},
         {"openai", c.openai},
         {"embedding", c.embedding},
         {"fusion", c.fusion},
         {"contextBuilder", c.contextBuilder},
         {"memory", c.memory},
-        {"napcat", c.napcat}
+        {"napcat", c.napcat},
+        {"inputBuffer", c.inputBuffer}
     };
 }
 
@@ -236,6 +257,10 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     readIfExists(j, "dataDir", c.dataDir);
     readIfExists(j, "platform", c.platform);
     readIfExists(j, "llmBackend", c.llmBackend);
+    readIfExists(j, "character", c.character);
+    readIfExists(j, "systemPromptPrefix", c.systemPromptPrefix);
+    readIfExists(j, "systemPromptNotice", c.systemPromptNotice);
+    readIfExists(j, "adminPort", c.adminPort);
 
     if (j.contains("openai") && j["openai"].is_object()) {
         from_json(j["openai"], c.openai);
@@ -255,6 +280,9 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     if (j.contains("napcat") && j["napcat"].is_object()) {
         from_json(j["napcat"], c.napcat);
     }
+    if (j.contains("inputBuffer") && j["inputBuffer"].is_object()) {
+        from_json(j["inputBuffer"], c.inputBuffer);
+    }
 }
 
 AppConfig AppConfig::fromEnvironment() {
@@ -262,6 +290,12 @@ AppConfig AppConfig::fromEnvironment() {
     if (auto v = env("MIO_BOT_NAME")) cfg.botName = *v;
     if (auto v = env("MIO_DATA_DIR")) cfg.dataDir = *v;
     if (auto v = env("MIO_PLATFORM")) cfg.platform = *v;
+    if (auto v = env("MIO_CHARACTER")) cfg.character = *v;
+    if (auto v = env("MIO_SYSTEM_PROMPT_PREFIX")) cfg.systemPromptPrefix = *v;
+    if (auto v = env("MIO_SYSTEM_PROMPT_NOTICE")) cfg.systemPromptNotice = *v;
+    if (auto v = env("MIO_ADMIN_PORT")) {
+        try { cfg.adminPort = std::stoi(*v); } catch (...) {}
+    }
     cfg.llmBackend = llmBackendFromEnvironment();
 
     cfg.openai = OpenAiConfig::fromEnvironment();
@@ -270,6 +304,7 @@ AppConfig AppConfig::fromEnvironment() {
     cfg.contextBuilder = ContextBuilderConfig{};
     cfg.memory = MemoryConfig{};
     cfg.napcat = NapCatConfig::fromEnvironment();
+    cfg.inputBuffer = InputBufferConfig{};
 
     return cfg;
 }

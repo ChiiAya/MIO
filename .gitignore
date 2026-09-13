@@ -13,3 +13,4 @@ data/
 compile_commands.json
 
 scripts/
+config.json

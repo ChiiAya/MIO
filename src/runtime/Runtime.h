@@ -53,6 +53,8 @@
 
 namespace mio {
 
+class AdminServer;
+
 struct BotReply {
     ConversationKey conversation;
     std::string text;
@@ -79,6 +81,7 @@ public:
     Runtime(std::string botName,
             std::filesystem::path dataDir,
             std::unique_ptr<Llm> llm);
+    ~Runtime();
 
     // 工具闭包捕获成员引用：拷贝/移动都会造成悬空引用，一律禁用
     Runtime(const Runtime&) = delete;
@@ -90,6 +93,7 @@ public:
     bool reloadConfig(const std::filesystem::path& configPath = "config.json");
     std::shared_ptr<const AppConfig> config() const;
     std::shared_ptr<ConfigManager> configManager() const;
+    std::string systemPrompt() const;
 
     // 程序事件审计回执（只更新 lastEventSeq）
     void updateState(const Event& event);
@@ -138,6 +142,7 @@ private:
     RuntimeState state_;
     mutable std::mutex stateMtx_;
     InputBufferManager inputBuffers_;
+    std::unique_ptr<AdminServer> adminServer_;
 };
 
 } // namespace mio

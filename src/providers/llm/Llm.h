@@ -27,6 +27,7 @@ struct ToolDef {
     // 直接存 JSON Schema 对象（{"type":"object","properties":{...}}），
     // 不发明自己的 schema DSL —— JSON Schema 本身就是通用语言。
     nlohmann::json parametersJsonSchema;
+    bool isTerminal = false; // 终结性工具（如 keepsilent），调用后立即结束工具循环，不进行无谓二次 LLM 请求
 };
 
 struct ChatRequest {

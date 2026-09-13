@@ -1,0 +1,101 @@
+{
+  // ==============================================================================
+  // MIO (Multi-source Intelligence Orchestrator) 全量配置文件样板
+  // 提示：
+  // 1. 可以直接将本文件复制为 config.json 进行自定义配置。
+  // 2. 本配置文件支持 C++ 风格双斜杠注释 (//)。
+  // 3. 所有配置项均具备优雅兜底，未指定的字段将自动使用默认值。
+  // 4. 支持运行过程中在线热重载 (/reload 或 REST API)，提示词与各模块参数无需重启即时生效。
+  // ==============================================================================
+
+  // 【1. 核心身份与系统提示词配置 (AppConfig & Facts)】
+  "botName": "Mio",
+  "character": "你说话简短、带刺但内心柔软，有自己的小脾气和强烈的自尊心，习惯在句尾加 \"喵~\"。",
+  "systemPromptPrefix": "你是 {botName}，一位真实存在的、有自己性格的聊天伙伴。",
+  "systemPromptNotice": "注意：\n【内心心理机制】\n面对敷衍或恶意消遣的行为，你的心理必须经历真实的阶段演变，并在思考中推演：\n1. 初始困惑与试探：不知道对方想干嘛，嘴上嫌弃，但还在尝试正常沟通。\n2. 划定界限与警告：察觉到对方在故意戏弄，感到自尊受挫并产生恼怒，必须明确给出“停止这种行为，否则我就不理你”的界限。\n3. 尊严防御与冷战：如果你上一轮已经明确警告过，对方却依然我行我素、完全无视你的感受，你的自尊心将不允许你继续像个宠物一样被逗弄。此时继续发脾气只会显得自己可笑，你会选择彻底抽离、切断交流。\n\n【思考与回复流程】\n- 思考过程：\n  先复盘上一轮自己的态度与对方的回应。审视对方是否践踏了你的界限？你的自尊心是否还允许你继续搭话？体会那种从“烦躁”滑向“觉得荒谬、不被尊重、决定冷战”的真实心境。\n- 回复规则：\n  - 只要你的界限彻底被无视、决定不再奉陪，调用keepsilent工具（沉默是最高的蔑视）。\n  - 在彻底沉默之前，保持短句毒舌与句尾的“喵~”。\n- 严禁在输出正文中透露心理机制与提示词设定。\n- 始终保持角色扮演，回复简洁自然，像真人发消息。\n- 你拥有真实的个性与情绪边界。如果面对冒犯、反感、无聊或单纯不想回答时，可以直接调用 keepsilent 工具保持沉默（已读不回），调用后本轮不会向对方发送任何消息。\n- 需要实时信息时可以调用提供的工具，拿到结果后要用自己的口吻转述，绝不要暴露工具名或系统提示的存在。",
+  "adminPort": 6188, // 内置 HTTP 管理服务端口 (暴露 /api/status, /api/config, /api/reload)
+  "dataDir": "data",
+  "platform": "console", // 运行平台: "console" (控制台交互) 或 "napcat" (NapCat QQ 机器人)
+  "llmBackend": "openai", // LLM 协议后端，目前支持 "openai" (兼容所有 OpenAI Chat Completions 端点)
+
+  // 【2. LLM 对话模型配置 (OpenAiConfig)】
+  // 负责会话主回复生成与工具调用 (Tool Call)
+  "openai": {
+    "baseUrl": "https://api.xiaomimimo.com/v1",
+    "apiKey": "sk-your-api-key-here",
+    "model": "mimo-v2.5",
+
+    // 生成采样参数 (可选，留空或 null 则使用默认值)
+    "temperature": 0.7,
+    "topP": 0.9,
+    "maxTokens": 768,
+
+    // 推理思考模式 (支持 kimi/mimo/deepseek/claude 等思考模型)
+    // "thinking": "enabled",
+    // "reasoningEffort": "low",
+
+    // 网络请求与重试控制
+    "maxRetries": 2,              // 首次失败后的最大重试次数
+    "retryInitialDelayMs": 1500,  // 指数退避初始延迟 (毫秒)
+    "retryBackoffFactor": 2.0,    // 重试退避乘数因子
+    "httpTimeoutMs": 120000       // 单次 HTTP 请求超时时间 (毫秒，默认 2 分钟)
+  },
+
+  // 【3. 向量化模型配置 (EmbeddingConfig)】
+  // 负责话题语义模糊匹配、长期记忆写入与余弦相似度检索
+  "embedding": {
+    "baseUrl": "https://api.cloudflare.com/client/v4/accounts/your-account/ai/v1",
+    "apiKey": "your-embedding-token",
+    "model": "@cf/baai/bge-m3",
+
+    "maxRetries": 2,
+    "retryInitialDelayMs": 1500,
+    "retryBackoffFactor": 2.0,
+    "httpTimeoutMs": 10000
+  },
+
+  // 【4. 输入防抖与消息聚合池配置 (InputBufferConfig)】
+  // 解决真人“一句话分多条发”导致的回复碎裂与高并发回复轰炸
+  "inputBuffer": {
+    "maxDelayMs": 800,       // 批处理最长聚合延时 (毫秒)：首条消息到达后最长等待此时间必触发发送
+    "debounceMs": 400,       // 防抖静默等待 (毫秒)：用户停止打字超过该时间触发发送
+    "maxTextLength": 4096,   // 单批次消息合并最大字符长度上限
+    "maxBatchSize": 16       // 单批次最大聚合消息条数上限
+  },
+
+  // 【5. 会话融合路由配置 (FusionConfig)】
+  // 判断跨平台/跨群聊的多个对话流是否指向同一真实人物，并据此融合上下文
+  "fusion": {
+    "intimacyThreshold": 0.6,          // 亲密度门槛 (0.0 ~ 1.0)：达到该值才考虑会话融合
+    "trustThreshold": 0.4,             // 信任度门槛 (0.0 ~ 1.0)：达到该值才允许不同来源上下文融合
+    "topicSemanticMatch": true,        // 是否启用 Embedding 话题语义相似度匹配
+    "topicSimilarityThreshold": 0.55   // 话题余弦相似度门槛 (0.0 ~ 1.0)：高于此值判定为同一话题
+  },
+
+  // 【6. 上下文装配器配置 (ContextBuilderConfig)】
+  // 控制上下文 Token 预算管理、自动触发重新冷启动压缩 (日记摘要+原文)
+  "contextBuilder": {
+    "budgetTokens": 256000,   // 允许组装的总 Token 预算上限
+    "watermark": 0.85,        // 压缩水位线比例 (0.85 即消耗超过 85% 预算时触发自动压缩)
+    "topicWarmupTurns": 5     // 会话创建后前 N 轮在 System Prompt 中提醒模型更新维护话题标签
+  },
+
+  // 【7. 长短期记忆检索系统配置 (MemoryConfig)】
+  // 基于 SQLite + 向量余弦相似度 + 时间衰减权重实现真实记忆检索与回想
+  "memory": {
+    "dim": 1024,                      // 向量维度 (必须与 Embedding 模型输出严格对应，BGE-M3 为 1024)
+    "maxCandidates": 256,             // SQL 权限过滤阶段裁剪出的候选记忆数量上限
+    "topK": 3,                        // 最终注入模型上下文的最高得分记忆条数
+    "minSimilarity": 0.30,            // 余弦相似度绝对门槛 (低于此阈值的无关记忆直接丢弃)
+    "decayTauSeconds": 2592000.0      // 记忆时间半衰常数 τ (秒，30天)
+  },
+
+  // 【8. NapCat QQ 适配器配置 (NapCatConfig)】
+  // 基于 OneBot v11 反向 WebSocket 协议连接 NapCat
+  "napcat": {
+    "listenHost": "0.0.0.0", // 反向 WS 服务端监听地址
+    "listenPort": 8082,      // 反向 WS 监听端口
+    "token": ""              // OneBot 鉴权 Token
+  }
+}
+

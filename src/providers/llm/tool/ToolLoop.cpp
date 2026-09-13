@@ -176,8 +176,13 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
         for (const auto& tc : resp.toolCalls) names += " " + tc.name;
         log::info("ToolLoop", "step=" + std::to_string(step) + " 调用工具:" + names);
 
+        bool shouldTerminate = false;
         std::pair<std::string, int> streak{"", 0};
         for (const auto& tc : resp.toolCalls) {
+            auto def = reg.find(tc.name);
+            if (def.has_value() && def->isTerminal) {
+                shouldTerminate = true;
+            }
             ExecOutcome out = executeOne(reg, tc, opt, streak);
             log::debug("ToolLoop", tc.name + " => " + cutUtf8(out.resultText, 160));
             Msg result{Role::Tool};
@@ -185,6 +190,12 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
             result.text = out.resultText;
             req.messages.push_back(result);
             if (sink) sink(result);
+        }
+
+        if (shouldTerminate) {
+            log::info("ToolLoop", "检测到终结性工具调用 (如 keepsilent)，提前结束工具循环");
+            last.text.clear();
+            return last;
         }
     }
 
