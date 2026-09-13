@@ -56,7 +56,7 @@ int main() {
         const std::string backend = mio::llmBackendFromEnvironment();
         std::cout << "LLM backend: " << backend << "\n";
 
-        mio::Runtime runtime("Mio", "data", mio::createLlm(backend));
+        mio::Runtime runtime("Mio", "data");
 
         // 平台选择：MIO_PLATFORM=napcat 接入 NapCatQQ 反向 WebSocket
         const char* platform = std::getenv("MIO_PLATFORM");

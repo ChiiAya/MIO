@@ -136,7 +136,11 @@ void runConsole(Runtime& runtime, std::istream& input, std::ostream& output) {
             if (parseMessage(line, message)) {
                 try {
                     const BotReply reply = runtime.ingest(std::move(message));
-                    output << "[" << reply.conversation.toString() << "] " << reply.text << "\n";
+                    if (reply.text.empty()) {
+                        output << "[" << reply.conversation.toString() << "] (保持沉默/已读不回)\n";
+                    } else {
+                        output << "[" << reply.conversation.toString() << "] " << reply.text << "\n";
+                    }
                 } catch (const std::exception& error) {
                     output << "[LLM error] " << error.what() << "\n";
                 }

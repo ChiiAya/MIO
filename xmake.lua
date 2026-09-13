@@ -17,6 +17,15 @@ target("MIO")
     -- 统一以 src/ 为 include 根，代码里写 #include "providers/llm/Llm.h"
     add_includedirs("src")
     add_packages("cpr", "nlohmann_json", "ixwebsocket", "sqlite3")
+
+-- 验收测试：编译同一份源码（去掉 main.cpp）加上 tests/ 下的用例。
+-- 不联网、不使用真实用户数据；调度用可注入时钟，摘要/插件用 fake，库用临时目录。
+target("mio_tests")
+    set_kind("binary")
+    add_files("src/**.cpp", "tests/**.cpp")
+    remove_files("src/main.cpp")
+    add_includedirs("src", "tests")
+    add_packages("cpr", "nlohmann_json", "ixwebsocket", "sqlite3")
 --
 -- If you want to known more usage about xmake, please see https://xmake.io
 --

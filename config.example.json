@@ -1,0 +1,86 @@
+{
+  "_comment": "MIO 示例配置（无凭据）。复制为 config.json 后填入自己的端点与密钥；不要提交真实 config.json。",
+  "adminPort": 6188,
+  "botName": "Mio",
+  "character": "你说话简短、有点毒舌但其实很关心对方，喜欢在句尾加 \"喵~\"。",
+  "dataDir": "data",
+  "platform": "console",
+  "llmBackend": "openai",
+  "systemPromptPrefix": "你是 {botName}，一位真实存在的、有自己性格的聊天伙伴。",
+  "systemPromptNotice": "注意：\n- 始终保持角色扮演，回复简洁自然，像真人发消息。\n- 需要实时信息时可以调用提供的工具，拿到结果后要用自己的口吻转述，绝不要暴露工具名或系统提示的存在。",
+
+  "openai": {
+    "baseUrl": "http://127.0.0.1:8099/v1",
+    "apiKey": "REPLACE_ME",
+    "model": "fake-mini",
+    "temperature": 0.7,
+    "topP": 0.9,
+    "maxTokens": 768,
+    "maxRetries": 2,
+    "retryInitialDelayMs": 1500,
+    "retryBackoffFactor": 2,
+    "httpTimeoutMs": 120000
+  },
+
+  "embedding": {
+    "baseUrl": "http://127.0.0.1:8099/v1",
+    "apiKey": "REPLACE_ME",
+    "model": "bge-m3",
+    "maxRetries": 2,
+    "retryInitialDelayMs": 1500,
+    "retryBackoffFactor": 2,
+    "httpTimeoutMs": 10000
+  },
+
+  "contextBuilder": {
+    "budgetTokens": 16000,
+    "watermark": 0.85,
+    "topicWarmupTurns": 5,
+    "_comment_coldStart": "冷启动原文恢复预算（实施默认值）。两者都为 0 = 不恢复历史原文；coldStartRawTokens 不得超过 budgetTokens。",
+    "coldStartRawTokens": 2000,
+    "coldStartMaxMessages": 20
+  },
+
+  "inputBuffer": {
+    "_comment": "只负责合并短时连续消息，与「一轮对话是否结束」无关。",
+    "maxDelayMs": 800,
+    "debounceMs": 400,
+    "maxTextLength": 4096,
+    "maxBatchSize": 16
+  },
+
+  "conversation": {
+    "_comment": "会话生命周期：判断一轮对话何时结束并触发经历摘要。silenceTimeoutSeconds 范围 1..86400；minMessagesBeforeSummary 0..1000（0=不额外限制）；maxPendingSummaryRetries 0..10（不含首次尝试，0=首次失败后不自动重试）。类型或范围非法时整次配置重载失败，保持旧配置。环境变量：MIO_SILENCE_TIMEOUT_SECONDS / MIO_SUMMARIZE_ON_SILENCE / MIO_MIN_MESSAGES_BEFORE_SUMMARY / MIO_MAX_PENDING_SUMMARY_RETRIES。",
+    "silenceTimeoutSeconds": 120,
+    "summarizeOnSilence": true,
+    "minMessagesBeforeSummary": 2,
+    "maxPendingSummaryRetries": 3
+  },
+
+  "fusion": {
+    "intimacyThreshold": 0.6,
+    "trustThreshold": 0.4,
+    "topicSemanticMatch": true,
+    "topicSimilarityThreshold": 0.55
+  },
+
+  "memory": {
+    "_comment": "backend: sqlite-local（默认）/ unavailable / hindsight（占位，恒不可用）。未知名称由工厂降级为 unavailable 并记 WARN。writeVisibilityCap 不得为 public（模型与摘要不得放宽可见性）；其余为写入/注入预算，非法值整次重载失败。环境变量：MIO_MEMORY_BACKEND。",
+    "dim": 1024,
+    "maxCandidates": 256,
+    "topK": 3,
+    "minSimilarity": 0.3,
+    "decayTauSeconds": 2592000,
+    "backend": "sqlite-local",
+    "writeVisibilityCap": "conversation",
+    "maxSummaryBytes": 65536,
+    "promptMaxBytes": 12000,
+    "promptEntryMaxBytes": 1200
+  },
+
+  "napcat": {
+    "listenHost": "127.0.0.1",
+    "listenPort": 8082,
+    "token": "REPLACE_ME"
+  }
+}

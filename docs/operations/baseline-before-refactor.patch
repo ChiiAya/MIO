@@ -1,0 +1,1037 @@
+diff --git a/.gitignore b/.gitignore
+index 1d26cd9..74c0eed 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -13,3 +13,4 @@ data/
+ compile_commands.json
+ 
+ scripts/
++config.json
+\ No newline at end of file
+diff --git a/src/adapters/console/ConsoleAdapter.cpp b/src/adapters/console/ConsoleAdapter.cpp
+index 9a36470..5de6104 100644
+--- a/src/adapters/console/ConsoleAdapter.cpp
++++ b/src/adapters/console/ConsoleAdapter.cpp
+@@ -136,7 +136,11 @@ void runConsole(Runtime& runtime, std::istream& input, std::ostream& output) {
+             if (parseMessage(line, message)) {
+                 try {
+                     const BotReply reply = runtime.ingest(std::move(message));
+-                    output << "[" << reply.conversation.toString() << "] " << reply.text << "\n";
++                    if (reply.text.empty()) {
++                        output << "[" << reply.conversation.toString() << "] (保持沉默/已读不回)\n";
++                    } else {
++                        output << "[" << reply.conversation.toString() << "] " << reply.text << "\n";
++                    }
+                 } catch (const std::exception& error) {
+                     output << "[LLM error] " << error.what() << "\n";
+                 }
+diff --git a/src/config/AppConfig.cpp b/src/config/AppConfig.cpp
+index 8d5d641..3b0a261 100644
+--- a/src/config/AppConfig.cpp
++++ b/src/config/AppConfig.cpp
+@@ -174,7 +174,9 @@ void to_json(nlohmann::json& j, const ContextBuilderConfig& c) {
+     j = nlohmann::json{
+         {"budgetTokens", c.budgetTokens},
+         {"watermark", c.watermark},
+-        {"topicWarmupTurns", c.topicWarmupTurns}
++        {"topicWarmupTurns", c.topicWarmupTurns},
++        {"coldStartRawTokens", c.coldStartRawTokens},
++        {"coldStartMaxMessages", c.coldStartMaxMessages}
+     };
+ }
+ 
+@@ -182,6 +184,26 @@ void from_json(const nlohmann::json& j, ContextBuilderConfig& c) {
+     readIfExists(j, "budgetTokens", c.budgetTokens);
+     readIfExists(j, "watermark", c.watermark);
+     readIfExists(j, "topicWarmupTurns", c.topicWarmupTurns);
++
++    // 冷启动预算为新增字段：类型/范围错误必须整次重载失败（不得部分套用），
++    // 缺失则保持默认值。
++    if (j.contains("coldStartRawTokens") && !j["coldStartRawTokens"].is_null()) {
++        if (!j["coldStartRawTokens"].is_number_integer())
++            throw std::runtime_error("contextBuilder.coldStartRawTokens 必须是整数");
++        c.coldStartRawTokens = j["coldStartRawTokens"].get<int>();
++    }
++    if (j.contains("coldStartMaxMessages") && !j["coldStartMaxMessages"].is_null()) {
++        if (!j["coldStartMaxMessages"].is_number_integer())
++            throw std::runtime_error("contextBuilder.coldStartMaxMessages 必须是整数");
++        c.coldStartMaxMessages = j["coldStartMaxMessages"].get<int>();
++    }
++    if (c.coldStartRawTokens < 0)
++        throw std::runtime_error("contextBuilder.coldStartRawTokens 不得为负");
++    if (c.coldStartMaxMessages < 0)
++        throw std::runtime_error("contextBuilder.coldStartMaxMessages 不得为负");
++    if (c.coldStartRawTokens > c.budgetTokens)
++        throw std::runtime_error(
++            "contextBuilder.coldStartRawTokens 不得超过 budgetTokens（总上下文预算）");
+ }
+ 
+ void to_json(nlohmann::json& j, const MemoryConfig& c) {
+@@ -216,18 +238,40 @@ void from_json(const nlohmann::json& j, NapCatConfig& c) {
+     readIfExists(j, "token", c.token);
+ }
+ 
++void to_json(nlohmann::json& j, const InputBufferConfig& c) {
++    j = nlohmann::json{
++        {"maxDelayMs", c.maxDelayMs},
++        {"debounceMs", c.debounceMs},
++        {"maxTextLength", c.maxTextLength},
++        {"maxBatchSize", c.maxBatchSize}
++    };
++}
++
++void from_json(const nlohmann::json& j, InputBufferConfig& c) {
++    readIfExists(j, "maxDelayMs", c.maxDelayMs);
++    readIfExists(j, "debounceMs", c.debounceMs);
++    readIfExists(j, "maxTextLength", c.maxTextLength);
++    readIfExists(j, "maxBatchSize", c.maxBatchSize);
++}
++
+ void to_json(nlohmann::json& j, const AppConfig& c) {
+     j = nlohmann::json{
+         {"botName", c.botName},
+         {"dataDir", c.dataDir},
+         {"platform", c.platform},
+         {"llmBackend", c.llmBackend},
++        {"character", c.character},
++        {"systemPromptPrefix", c.systemPromptPrefix},
++        {"systemPromptNotice", c.systemPromptNotice},
++        {"adminPort", c.adminPort},
+         {"openai", c.openai},
+         {"embedding", c.embedding},
+         {"fusion", c.fusion},
+         {"contextBuilder", c.contextBuilder},
+         {"memory", c.memory},
+-        {"napcat", c.napcat}
++        {"napcat", c.napcat},
++        {"inputBuffer", c.inputBuffer},
++        {"conversation", toJson(c.conversation)}
+     };
+ }
+ 
+@@ -236,6 +280,10 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
+     readIfExists(j, "dataDir", c.dataDir);
+     readIfExists(j, "platform", c.platform);
+     readIfExists(j, "llmBackend", c.llmBackend);
++    readIfExists(j, "character", c.character);
++    readIfExists(j, "systemPromptPrefix", c.systemPromptPrefix);
++    readIfExists(j, "systemPromptNotice", c.systemPromptNotice);
++    readIfExists(j, "adminPort", c.adminPort);
+ 
+     if (j.contains("openai") && j["openai"].is_object()) {
+         from_json(j["openai"], c.openai);
+@@ -255,22 +303,61 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
+     if (j.contains("napcat") && j["napcat"].is_object()) {
+         from_json(j["napcat"], c.napcat);
+     }
++    if (j.contains("inputBuffer") && j["inputBuffer"].is_object()) {
++        from_json(j["inputBuffer"], c.inputBuffer);
++    }
++    // conversation 节：局部热更新时缺失字段保持原值；非法则整次失败
++    if (j.contains("conversation") && !j["conversation"].is_null()) {
++        applyConversationLifecycleJson(j["conversation"], c.conversation);
++    }
++}
++
++bool AppConfig::validate(std::string* error) const {
++    const auto v = validateConversationLifecycle(conversation);
++    if (!v.ok) {
++        if (error) *error = v.error;
++        return false;
++    }
++    if (contextBuilder.coldStartRawTokens < 0 || contextBuilder.coldStartMaxMessages < 0) {
++        if (error) *error = "contextBuilder 冷启动预算不得为负";
++        return false;
++    }
++    if (contextBuilder.coldStartRawTokens > contextBuilder.budgetTokens) {
++        if (error) *error = "contextBuilder.coldStartRawTokens 不得超过 budgetTokens";
++        return false;
++    }
++    return true;
++}
++
++bool AppConfig::applyEnvironment(std::string* error) {
++    if (auto v = env("MIO_BOT_NAME")) botName = *v;
++    if (auto v = env("MIO_DATA_DIR")) dataDir = *v;
++    if (auto v = env("MIO_PLATFORM")) platform = *v;
++    if (auto v = env("MIO_CHARACTER")) character = *v;
++    if (auto v = env("MIO_SYSTEM_PROMPT_PREFIX")) systemPromptPrefix = *v;
++    if (auto v = env("MIO_SYSTEM_PROMPT_NOTICE")) systemPromptNotice = *v;
++    if (auto v = env("MIO_ADMIN_PORT")) {
++        try { adminPort = std::stoi(*v); } catch (...) {}
++    }
++    if (const char* b = std::getenv("MIO_LLM_BACKEND")) {
++        if (*b != '\0') llmBackend = b;
++    }
++
++    // 各子配置节：fromEnvironment 从默认值构造，这里按已存在的变量覆盖
++    openai = OpenAiConfig::fromEnvironment();
++    embedding = EmbeddingConfig::fromEnvironment();
++    napcat = NapCatConfig::fromEnvironment();
++
++    if (!applyConversationLifecycleEnv(conversation, error)) return false;
++    if (error) error->clear();
++    return true;
+ }
+ 
+ AppConfig AppConfig::fromEnvironment() {
+     AppConfig cfg;
+-    if (auto v = env("MIO_BOT_NAME")) cfg.botName = *v;
+-    if (auto v = env("MIO_DATA_DIR")) cfg.dataDir = *v;
+-    if (auto v = env("MIO_PLATFORM")) cfg.platform = *v;
+     cfg.llmBackend = llmBackendFromEnvironment();
+-
+-    cfg.openai = OpenAiConfig::fromEnvironment();
+-    cfg.embedding = EmbeddingConfig::fromEnvironment();
+-    cfg.fusion = FusionConfig{};
+-    cfg.contextBuilder = ContextBuilderConfig{};
+-    cfg.memory = MemoryConfig{};
+-    cfg.napcat = NapCatConfig::fromEnvironment();
+-
++    // 默认值 → 已提供的环境变量 → （由 ConfigManager 负责）JSON 字段覆盖
++    cfg.applyEnvironment(nullptr);
+     return cfg;
+ }
+ 
+diff --git a/src/config/AppConfig.h b/src/config/AppConfig.h
+index 62c9e24..9f2d75b 100644
+--- a/src/config/AppConfig.h
++++ b/src/config/AppConfig.h
+@@ -5,6 +5,8 @@
+ #include "config/openai/OpenaiConfig.h"
+ #include "context/contextBuilder/ContextBuilder.h"
+ #include "context/conversationFusion/FusionRouter.h"
++#include "context/inputBuffer/inputBuffer.h"
++#include "core/contracts/LifecycleConfig.h"
+ #include "memory/manager/MemoryManager.h"
+ 
+ #include <nlohmann/json.hpp>
+@@ -17,6 +19,14 @@ struct AppConfig {
+     std::string dataDir = "data";
+     std::string platform = "console";
+     std::string llmBackend = "openai";
++    std::string character = "你说话简短、有点毒舌但其实很关心对方，喜欢在句尾加 \"喵~\"。";
++    std::string systemPromptPrefix = "你是 {botName}，一位真实存在的、有自己性格的聊天伙伴。";
++    std::string systemPromptNotice =
++        "注意：\n"
++        "- 始终保持角色扮演，回复简洁自然，像真人发消息。\n"
++        "- 你拥有真实的个性与情绪边界。如果面对冒犯、反感、无聊或单纯不想回答时，可以直接调用 keepsilent 工具保持沉默（已读不回），调用后本轮不会向对方发送任何消息。\n"
++        "- 需要实时信息时可以调用提供的工具，拿到结果后要用自己的口吻转述，绝不要暴露工具名或系统提示的存在。";
++    int adminPort = 6188;
+ 
+     OpenAiConfig openai;
+     EmbeddingConfig embedding;
+@@ -24,8 +34,19 @@ struct AppConfig {
+     ContextBuilderConfig contextBuilder;
+     MemoryConfig memory;
+     NapCatConfig napcat;
++    InputBufferConfig inputBuffer;
++    // 会话生命周期（"conversation" 配置节）：判断一轮对话何时结束，
++    // 与 inputBuffer.debounceMs（合并短时连续消息）互不影响。
++    ConversationLifecycleConfig conversation;
+ 
+     static AppConfig fromEnvironment();
++
++    // 在现有配置之上叠加环境变量（只覆盖实际存在的变量，不重置其他字段）。
++    // 返回 false 并填 error 表示环境变量类型/范围非法（调用方不得发布新配置）。
++    bool applyEnvironment(std::string* error);
++
++    // 整体校验：任何一项非法时返回 false（调用方不得发布新配置）
++    bool validate(std::string* error) const;
+ };
+ 
+ // nlohmann::json 序列化与反序列化（支持局部更新/不完全覆盖）
+@@ -47,6 +68,9 @@ void from_json(const nlohmann::json& j, MemoryConfig& c);
+ void to_json(nlohmann::json& j, const NapCatConfig& c);
+ void from_json(const nlohmann::json& j, NapCatConfig& c);
+ 
++void to_json(nlohmann::json& j, const InputBufferConfig& c);
++void from_json(const nlohmann::json& j, InputBufferConfig& c);
++
+ void to_json(nlohmann::json& j, const AppConfig& c);
+ void from_json(const nlohmann::json& j, AppConfig& c);
+ 
+diff --git a/src/config/ConfigManager.cpp b/src/config/ConfigManager.cpp
+index c43df3c..a3dc1b2 100644
+--- a/src/config/ConfigManager.cpp
++++ b/src/config/ConfigManager.cpp
+@@ -9,7 +9,7 @@ namespace mio {
+ ConfigManager::ConfigManager(std::shared_ptr<const AppConfig> initialConfig) {
+     if (initialConfig) {
+         current_ = std::move(initialConfig);
+-    } else if (std::filesystem::exists("config.json")) {
++    } else if (std::getenv("MIO_NO_CONFIG") == nullptr && std::filesystem::exists("config.json")) {
+         if (!reloadFromFile("config.json")) {
+             current_ = std::make_shared<const AppConfig>(AppConfig::fromEnvironment());
+         }
+@@ -24,7 +24,7 @@ std::shared_ptr<const AppConfig> ConfigManager::get() const {
+ }
+ 
+ bool ConfigManager::reload(const std::string& jsonString) {
+-    nlohmann::json j = nlohmann::json::parse(jsonString, nullptr, false);
++    nlohmann::json j = nlohmann::json::parse(jsonString, nullptr, false, true);
+     if (j.is_discarded()) {
+         log::warn("ConfigManager", "JSON 解析失败，保持当前配置");
+         return false;
+@@ -47,6 +47,14 @@ bool ConfigManager::reload(const std::string& jsonString) {
+         return false;
+     }
+ 
++    // 先构造并校验候选配置，再切换运行状态：
++    // 新字段类型或范围错误时整次重载失败，不发布任何部分配置。
++    std::string validationError;
++    if (!updated.validate(&validationError)) {
++        log::warn("ConfigManager", "配置校验失败，保持当前配置: " + validationError);
++        return false;
++    }
++
+     {
+         std::unique_lock<std::shared_mutex> lock(mtx_);
+         current_ = std::make_shared<const AppConfig>(std::move(updated));
+@@ -76,10 +84,31 @@ bool ConfigManager::reloadFromFile(const std::filesystem::path& path) {
+ }
+ 
+ bool ConfigManager::reloadFromEnvironment() {
+-    AppConfig envCfg = AppConfig::fromEnvironment();
++    // 环境变量重载仅覆盖【实际存在】的变量，不重置其他字段：
++    // 以当前配置为基底叠加，缺失字段保持原值。
++    AppConfig updated;
++    {
++        std::shared_lock<std::shared_mutex> lock(mtx_);
++        if (current_) {
++            updated = *current_;
++        } else {
++            updated = AppConfig::fromEnvironment();
++        }
++    }
++
++    std::string error;
++    if (!updated.applyEnvironment(&error)) {
++        log::warn("ConfigManager", "环境变量配置非法，保持当前配置: " + error);
++        return false;
++    }
++    if (!updated.validate(&error)) {
++        log::warn("ConfigManager", "配置校验失败，保持当前配置: " + error);
++        return false;
++    }
++
+     {
+         std::unique_lock<std::shared_mutex> lock(mtx_);
+-        current_ = std::make_shared<const AppConfig>(std::move(envCfg));
++        current_ = std::make_shared<const AppConfig>(std::move(updated));
+     }
+     return true;
+ }
+diff --git a/src/context/contextBuilder/ContextBuilder.h b/src/context/contextBuilder/ContextBuilder.h
+index 22c7c2f..0ef4f5a 100644
+--- a/src/context/contextBuilder/ContextBuilder.h
++++ b/src/context/contextBuilder/ContextBuilder.h
+@@ -20,6 +20,10 @@ struct ContextBuilderConfig {
+     int budgetTokens = 16'000;   // 预算（超水位触发重新冷启动）
+     double watermark = 0.85;
+     int topicWarmupTurns = 5;    // unit 创建后前 N 轮提醒模型补 update_topic
++    // 冷启动原文恢复预算（实施默认值，允许 0 = 不恢复历史原文）：
++    // 在双重预算内按时间正序恢复最近可见消息，且不得同步调用摘要模型。
++    int coldStartRawTokens = 2000;
++    int coldStartMaxMessages = 20;
+ };
+ 
+ struct BuildInput {
+diff --git a/src/context/conversationFusion/FusionContext.cpp b/src/context/conversationFusion/FusionContext.cpp
+index a3b526d..12bf9f9 100644
+--- a/src/context/conversationFusion/FusionContext.cpp
++++ b/src/context/conversationFusion/FusionContext.cpp
+@@ -6,6 +6,7 @@
+ #include <utility>
+ 
+ #include "context/summarizor/SummaryManager.h"
++#include "providers/llm/Llm.h"
+ #include "log/Log.h"
+ 
+ namespace mio {
+@@ -122,4 +123,16 @@ void FusionUnit::reColdStart(SummaryManager& summaryManager) {
+         setTopic(std::move(r.topic));  // 话题随摘要同步更新
+ }
+ 
++void FusionUnit::recordUsage(const Usage& usage) {
++    std::lock_guard<std::mutex> lock(statsMtx_);
++    stats_.totalPromptTokens += usage.inputOther;
++    stats_.totalCachedTokens += usage.inputCached;
++    stats_.totalOutputTokens += usage.output;
++    stats_.lastPromptTokens = usage.inputOther;
++    stats_.lastCachedTokens = usage.inputCached;
++    stats_.lastOutputTokens = usage.output;
++    stats_.lastCacheHit = (usage.inputCached > 0);
++    stats_.requestCount += 1;
++}
++
+ } // namespace mio
+diff --git a/src/context/conversationFusion/FusionContext.h b/src/context/conversationFusion/FusionContext.h
+index f09a4bf..7e3d79c 100644
+--- a/src/context/conversationFusion/FusionContext.h
++++ b/src/context/conversationFusion/FusionContext.h
+@@ -14,6 +14,7 @@
+ #include "core/conversation/Conversation.h"
+ #include "core/message/Message.h"
+ 
++#include <cstdint>
+ #include <mutex>
+ #include <string>
+ #include <vector>
+@@ -21,6 +22,18 @@
+ namespace mio {
+ 
+ class SummaryManager;  // 见 context/summarizor/SummaryManager.h
++struct Usage;
++
++struct UnitTokenStats {
++    std::int64_t totalPromptTokens = 0;   // 累计输入 token（prompt_tokens）
++    std::int64_t totalCachedTokens = 0;   // 累计命中缓存 token
++    std::int64_t totalOutputTokens = 0;   // 累计输出 token
++    std::int64_t lastPromptTokens = 0;    // 最近一轮输入 token
++    std::int64_t lastCachedTokens = 0;    // 最近一轮命中缓存 token
++    std::int64_t lastOutputTokens = 0;    // 最近一轮输出 token
++    bool lastCacheHit = false;            // 最近一轮是否命中缓存
++    int requestCount = 0;                 // 请求轮数
++};
+ 
+ struct FusionContext {
+     std::vector<ConversationKey> inDegree;  // 承载的对话 key
+@@ -76,6 +89,12 @@ public:
+         fusion_.context = std::move(context);
+     }
+ 
++    UnitTokenStats stats() const {
++        std::lock_guard<std::mutex> lock(statsMtx_);
++        return stats_;
++    }
++    void recordUsage(const Usage& usage);
++
+     std::mutex mtx;  // 上下文级锁：同 unit 串行、跨 unit 并行
+ 
+ private:
+@@ -86,6 +105,8 @@ private:
+                                    int summaryCount, int rawKeep);
+ 
+     FusionContext fusion_;
++    UnitTokenStats stats_;
++    mutable std::mutex statsMtx_;
+ };
+ 
+ } // namespace mio
+diff --git a/src/context/conversationFusion/FusionRouter.cpp b/src/context/conversationFusion/FusionRouter.cpp
+index 49ca6ad..ab17615 100644
+--- a/src/context/conversationFusion/FusionRouter.cpp
++++ b/src/context/conversationFusion/FusionRouter.cpp
+@@ -71,6 +71,32 @@ std::size_t FusionRouter::unitCount() const {
+     return units_.size();
+ }
+ 
++std::vector<FusionRouter::UnitInfo> FusionRouter::unitsInfo() const {
++    std::lock_guard<std::mutex> lock(mapMtx_);
++    std::vector<UnitInfo> list;
++    list.reserve(units_.size());
++    for (const auto& [k, u] : units_) {
++        if (!u) continue;
++        bool locked = u->mtx.try_lock();
++        UnitInfo info;
++        info.key = k;
++        info.isBusy = !locked;
++        for (const auto& inKey : u->inDegree()) {
++            info.inDegree.push_back(inKey.toString());
++        }
++        info.topic = u->topic();
++        info.isPublic = u->isPublic();
++        info.turnsSinceCreation = u->turnsSinceCreation();
++        info.messageCount = u->context().size();
++        info.stats = u->stats();
++        if (locked) {
++            u->mtx.unlock();
++        }
++        list.push_back(std::move(info));
++    }
++    return list;
++}
++
+ FusionUnit* FusionRouter::findUnit(const IncomingMessage& msg) const {
+     const std::string sourceKey = msg.conversation.toString();
+     if (auto it = sourceToUnit_.find(sourceKey); it != sourceToUnit_.end()) {
+diff --git a/src/context/conversationFusion/FusionRouter.h b/src/context/conversationFusion/FusionRouter.h
+index 97b3ef0..50ad58d 100644
+--- a/src/context/conversationFusion/FusionRouter.h
++++ b/src/context/conversationFusion/FusionRouter.h
+@@ -74,6 +74,19 @@ public:
+ 
+     std::size_t unitCount() const;
+ 
++    struct UnitInfo {
++        std::string key;
++        std::vector<std::string> inDegree;
++        std::string topic;
++        bool isPublic = false;
++        bool isBusy = false;
++        int turnsSinceCreation = 0;
++        std::size_t messageCount = 0;
++        UnitTokenStats stats;
++    };
++
++    std::vector<UnitInfo> unitsInfo() const;
++
+ private:
+     // 来源身份：私聊 → person:internalId；群聊 → group:平台:群ID
+     std::string identityKey(const IncomingMessage& msg, std::time_t now);
+diff --git a/src/main.cpp b/src/main.cpp
+index f0f7ba8..12e5218 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -56,7 +56,7 @@ int main() {
+         const std::string backend = mio::llmBackendFromEnvironment();
+         std::cout << "LLM backend: " << backend << "\n";
+ 
+-        mio::Runtime runtime("Mio", "data", mio::createLlm(backend));
++        mio::Runtime runtime("Mio", "data");
+ 
+         // 平台选择：MIO_PLATFORM=napcat 接入 NapCatQQ 反向 WebSocket
+         const char* platform = std::getenv("MIO_PLATFORM");
+diff --git a/src/mind/facts/Facts.cpp b/src/mind/facts/Facts.cpp
+index 6a207da..b9c74e1 100644
+--- a/src/mind/facts/Facts.cpp
++++ b/src/mind/facts/Facts.cpp
+@@ -22,8 +22,23 @@ std::string buildSystemPrompt(const Persona& persona,
+                               const std::vector<DiaryEntry>& cognition,
+                               int maxPeopleTokens) {
+     std::ostringstream s;
+-    s << "你是 " << persona.botName << "，一位真实存在的、有自己性格的聊天伙伴。\n";
+-    if (!persona.character.empty()) s << persona.character << "\n";
++    if (!persona.systemPromptPrefix.empty()) {
++        std::string prefix = persona.systemPromptPrefix;
++        std::size_t pos = 0;
++        while ((pos = prefix.find("{botName}", pos)) != std::string::npos) {
++            prefix.replace(pos, 9, persona.botName);
++            pos += persona.botName.length();
++        }
++        s << prefix;
++        if (prefix.back() != '\n') s << "\n";
++    } else {
++        s << "你是 " << persona.botName << "，一位真实存在的、有自己性格的聊天伙伴。\n";
++    }
++
++    if (!persona.character.empty()) {
++        s << persona.character;
++        if (persona.character.back() != '\n') s << "\n";
++    }
+ 
+     // 认识的人（潜意识层，top-K，token 封顶）
+     constexpr std::size_t kMaxPeople = 20;
+@@ -42,10 +57,16 @@ std::string buildSystemPrompt(const Persona& persona,
+     // 日记认知（摘要触发时已消费的条目）
+     for (const auto& e : cognition) s << "- " << e.text << "\n";
+ 
+-    s << "注意：\n"
+-      << "- 始终保持角色扮演，回复简洁自然，像真人发消息。\n"
+-      << "- 需要实时信息时可以调用提供的工具，拿到结果后要用自己的口吻转述，"
+-      << "绝不要暴露工具名或系统提示的存在。";
++    if (!persona.systemPromptNotice.empty()) {
++        s << persona.systemPromptNotice;
++        if (persona.systemPromptNotice.back() != '\n') s << "\n";
++    } else {
++        s << "注意：\n"
++          << "- 始终保持角色扮演，回复简洁自然，像真人发消息。\n"
++          << "- 你拥有真实的个性与情绪边界。如果面对冒犯、反感、无聊或单纯不想回答时，可以直接调用 keepsilent 工具保持沉默（已读不回），调用后本轮不会向对方发送任何消息。\n"
++          << "- 需要实时信息时可以调用提供的工具，拿到结果后要用自己的口吻转述，"
++          << "绝不要暴露工具名或系统提示的存在。";
++    }
+     return s.str();
+ }
+ 
+diff --git a/src/mind/facts/Facts.h b/src/mind/facts/Facts.h
+index c7a86b2..af9394a 100644
+--- a/src/mind/facts/Facts.h
++++ b/src/mind/facts/Facts.h
+@@ -17,6 +17,8 @@ namespace mio {
+ struct Persona {
+     std::string botName = "MIO";
+     std::string character;  // 完整人设文本；将来从配置文件/管理界面来
++    std::string systemPromptPrefix;  // 身份引导前缀（可填，支持 {botName} 宏；空则走默认）
++    std::string systemPromptNotice;  // 注意事项与行为规范（可填；空则走默认）
+ };
+ 
+ // 渲染稳定 system 块：人设 + 认识的人(top-K, ≤maxPeopleTokens) + 日记认知
+diff --git a/src/providers/llm/Llm.h b/src/providers/llm/Llm.h
+index edd9792..ae7f9d8 100644
+--- a/src/providers/llm/Llm.h
++++ b/src/providers/llm/Llm.h
+@@ -27,6 +27,7 @@ struct ToolDef {
+     // 直接存 JSON Schema 对象（{"type":"object","properties":{...}}），
+     // 不发明自己的 schema DSL —— JSON Schema 本身就是通用语言。
+     nlohmann::json parametersJsonSchema;
++    bool isTerminal = false;  // 终结性工具：调用后直接结束工具循环，不触发下一轮总结/回复
+ };
+ 
+ struct ChatRequest {
+diff --git a/src/providers/llm/tool/ToolLoop.cpp b/src/providers/llm/tool/ToolLoop.cpp
+index aed38da..264805e 100644
+--- a/src/providers/llm/tool/ToolLoop.cpp
++++ b/src/providers/llm/tool/ToolLoop.cpp
+@@ -135,6 +135,7 @@ ExecOutcome executeOne(ToolRegistry& reg, const ToolCall& call,
+ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
+                          const ToolLoopOptions& opt, const MessageSink& sink) {
+     ChatResponse last;
++    Usage totalUsage;
+ 
+     for (int step = 1; step <= opt.maxSteps; ++step) {
+         ChatResponse resp;
+@@ -154,6 +155,9 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
+         if (gotEmpty)
+             throw std::runtime_error("模型连续返回空输出（无文本也无工具调用）");
+         last = resp;
++        totalUsage.inputOther += resp.usage.inputOther;
++        totalUsage.inputCached += resp.usage.inputCached;
++        totalUsage.output += resp.usage.output;
+ 
+         if (resp.toolCalls.empty()) {
+             Msg done{Role::Assistant};
+@@ -161,6 +165,7 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
+             done.reasoningContent = resp.reasoning;
+             req.messages.push_back(done);
+             if (sink) sink(done);
++            last.usage = totalUsage;
+             return last; // 正常收尾
+         }
+ 
+@@ -176,8 +181,13 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
+         for (const auto& tc : resp.toolCalls) names += " " + tc.name;
+         log::info("ToolLoop", "step=" + std::to_string(step) + " 调用工具:" + names);
+ 
++        bool shouldTerminate = false;
+         std::pair<std::string, int> streak{"", 0};
+         for (const auto& tc : resp.toolCalls) {
++            auto def = reg.find(tc.name);
++            if (def.has_value() && def->isTerminal) {
++                shouldTerminate = true;
++            }
+             ExecOutcome out = executeOne(reg, tc, opt, streak);
+             log::debug("ToolLoop", tc.name + " => " + cutUtf8(out.resultText, 160));
+             Msg result{Role::Tool};
+@@ -186,6 +196,13 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
+             req.messages.push_back(result);
+             if (sink) sink(result);
+         }
++
++        if (shouldTerminate) {
++            log::info("ToolLoop", "检测到终结性工具调用 (如 keepsilent)，提前结束工具循环");
++            last.text.clear();
++            last.usage = totalUsage;
++            return last;
++        }
+     }
+ 
+     // 护栏 5：步数耗尽 -> 拔掉工具 + 注入强制总结指令再走一步。
+@@ -202,6 +219,10 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
+     req.messages.push_back(notice);
+     if (sink) sink(notice);
+     last = llm.chat(req);
++    totalUsage.inputOther += last.usage.inputOther;
++    totalUsage.inputCached += last.usage.inputCached;
++    totalUsage.output += last.usage.output;
++    last.usage = totalUsage;
+     return last;
+ }
+ 
+diff --git a/src/providers/memory/MemoryProvider.h b/src/providers/memory/MemoryProvider.h
+index 6e6338e..5266a53 100644
+--- a/src/providers/memory/MemoryProvider.h
++++ b/src/providers/memory/MemoryProvider.h
+@@ -1,20 +1,119 @@
+ #pragma once
+ // ============================================================================
+-// Memory Provider 抽象接口（预留）
++// MemoryProvider —— 经历记忆后端插件接口（共享契约，冻结）
+ //
+-// 预留给外部记忆提供商（如 Mem0 / Chroma / Qdrant / 图数据库）的抽象接口。
+-// 现阶段 MIO 核心默认基于 SQLite + BLOB 向量检索，未来可通过本接口实现插件化接入。
++// 定位：经历记忆（episodic memory）的存储、归纳与召回后端。
++// 将来 Hindsight 只作为本接口的实现接入，【不接管】身份事实、关系权限、
++// 审批或 prompt 预算 —— 那些仍由 MIO 控制。
++//
++// 插件约束（实现方必须遵守）：
++//   * 插件 MUST NOT 读取 MIO 原始档案目录、关系图谱文件或审批字段；
++//   * 插件只接收【已通过 MIO 权限过滤】的 EpisodeMemory 和 RecallQuery；
++//   * 插件返回的内容必须经过 MIO 的可见性过滤、长度限制和注入格式化；
++//   * 插件不可用时，MIO 必须降级为无长期召回运行，不得阻塞主对话；
++//   * 插件返回的事实或关系判断只能转成 proposal，不能直接写入确认层；
++//   * 接口约束不等于进程隔离：本 C++ 接口不提供沙箱，防不可信插件需另行
++//     实现进程隔离，不得宣称当前接口已提供隔离。
+ // ============================================================================
+ 
++#include "core/contracts/AccessContext.h"
++#include "core/contracts/Errors.h"
++#include "core/contracts/SummaryContracts.h"
++#include "core/contracts/Visibility.h"
++
++#include <cstdint>
+ #include <string>
+ #include <vector>
+ 
+ namespace mio {
+ 
++// 一条经历记忆（已由 MIO 完成权限与来源标注后交给插件）
++struct EpisodeMemory {
++    std::int64_t localId = 0;             // MIO 本地持久化 ID（来源 ID）
++    std::string conversationKey;
++    std::vector<std::string> participants;
++    std::string text;                     // 已剔除 reasoning / 内部工具参数
++    Visibility visibility = Visibility::Conversation;
++    SummaryKind kind = SummaryKind::EpisodicMemory;
++    std::int64_t fromMessageId = 0;
++    std::int64_t toMessageId = 0;
++    std::int64_t createdAt = 0;
++    std::int64_t eventTime = 0;
++    std::string source;                   // 例如 "silence_summary" / "model_tool"
++    std::vector<float> embedding;         // 可为空；空则由后端自行向量化
++    EmbeddingStatus embeddingStatus = EmbeddingStatus::Pending;
++    std::string idempotencyKey;           // 幂等键（manual 记忆使用）
++};
++
++// 召回查询（权限条件已由 MIO 收敛到 AccessContext）
++struct RecallQuery {
++    std::string text;
++    AccessContext access;
++    std::size_t topK = 3;
++    double minSimilarity = 0.30;
++    std::int64_t now = 0;
++    // context_compaction 默认不得进入长期召回；只有显式转换后才可召回
++    bool allowContextCompaction = false;
++};
++
++struct MemoryHit {
++    std::int64_t localId = 0;
++    std::string text;
++    std::string conversationKey;
++    Visibility visibility = Visibility::Conversation;
++    SummaryKind kind = SummaryKind::EpisodicMemory;
++    double score = 0.0;
++    std::int64_t createdAt = 0;
++    std::string source;
++};
++
++enum class StoreStatus {
++    Stored,    // 已确认落盘（必须有本地持久化依据）
++    Queued,    // 已排队（同样必须有本地持久化依据，否则不得返回）
++    Duplicate, // 幂等命中，返回既有记录 ID
++    Failed,    // 失败（不得对模型返回"已记住"）
++    Rejected,  // 被权限/校验拒绝
++};
++
++inline const char* toString(StoreStatus s) {
++    switch (s) {
++    case StoreStatus::Stored: return "stored";
++    case StoreStatus::Queued: return "queued";
++    case StoreStatus::Duplicate: return "duplicate";
++    case StoreStatus::Failed: return "failed";
++    case StoreStatus::Rejected: return "rejected";
++    }
++    return "failed";
++}
++
++struct StoreEpisodeResult {
++    StoreStatus status = StoreStatus::Failed;
++    std::int64_t localId = 0;
++    ErrorCode code = ErrorCode::Ok;
++    std::string message;
++
++    bool ok() const {
++        return status == StoreStatus::Stored || status == StoreStatus::Queued ||
++               status == StoreStatus::Duplicate;
++    }
++};
++
+ class MemoryProvider {
+ public:
+     virtual ~MemoryProvider() = default;
++
++    // 后端标识（"sqlite-local" / "hindsight" / "unavailable"）
++    virtual std::string name() const = 0;
++
++    // 可用性：false 时 MIO 降级为无长期召回运行，绝不阻塞主对话
++    virtual bool available() const = 0;
++
++    // 存储一条经历记忆。必须返回明确的成功/失败结果与本地 ID。
++    virtual StoreEpisodeResult storeEpisode(const EpisodeMemory& episode) = 0;
++
++    // 召回：入参已带权限上下文；返回内容仍需 MIO 二次过滤与长度限制。
++    // 后端异常必须内部消化，返回空列表而不是抛出。
++    virtual std::vector<MemoryHit> recall(const RecallQuery& query) = 0;
+ };
+ 
+ } // namespace mio
+-
+diff --git a/src/runtime/Runtime.cpp b/src/runtime/Runtime.cpp
+index 2ef49e8..80bf4d6 100644
+--- a/src/runtime/Runtime.cpp
++++ b/src/runtime/Runtime.cpp
+@@ -7,6 +7,7 @@
+ #include "providers/llm/openai/OpenAiCompat.h"
+ #include "providers/embedding/openai/OpenAiEmbedding.h"
+ #include "providers/llm/tool/ToolLoop.h"
++#include "admin/AdminServer.h"
+ #include "log/Log.h"
+ 
+ #include <ctime>
+@@ -30,6 +31,7 @@ static thread_local std::string g_activeSenderId;
+ static thread_local std::string g_activeSenderName;
+ static thread_local std::string g_activePlatform;
+ static thread_local std::string g_activeGroupId;
++static thread_local bool g_activeKeepSilent = false;
+ 
+ std::string hexEncode(const std::string& s) {
+     static const char* digits = "0123456789ABCDEF";
+@@ -73,9 +75,30 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
+     summary_->setOnSummary(
+         [this](const SummaryOutcome& outcome) { onSummaryProduced(outcome); });
+ 
++    if (configMgr_ && configMgr_->get()) {
++        if (!configMgr_->get()->character.empty()) {
++            persona_.character = configMgr_->get()->character;
++        }
++        if (!configMgr_->get()->botName.empty()) {
++            persona_.botName = configMgr_->get()->botName;
++        }
++        if (!configMgr_->get()->systemPromptPrefix.empty()) {
++            persona_.systemPromptPrefix = configMgr_->get()->systemPromptPrefix;
++        }
++        if (!configMgr_->get()->systemPromptNotice.empty()) {
++            persona_.systemPromptNotice = configMgr_->get()->systemPromptNotice;
++        }
++    }
++
+     systemPrompt_ = rebuildSystemPrompt();
+-    state_.botName = std::move(botName);
++    state_.botName = persona_.botName;
+     state_.messageCount = 0;
++
++    int adminPort = (configMgr_ && configMgr_->get()) ? configMgr_->get()->adminPort : 6188;
++    if (adminPort > 0) {
++        adminServer_ = std::make_unique<AdminServer>(*this, adminPort);
++        adminServer_->start();
++    }
+ }
+ 
+ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
+@@ -83,6 +106,13 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
+     : Runtime(std::move(botName), std::move(dataDir),
+               std::shared_ptr<Llm>(std::move(llm))) {}
+ 
++Runtime::~Runtime() {
++    if (adminServer_) {
++        adminServer_->stop();
++        adminServer_.reset();
++    }
++}
++
+ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
+     if (!configMgr_) {
+         log::warn("Runtime", "ConfigManager 未初始化");
+@@ -112,11 +142,30 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
+             embedding_ = newEmbedding;
+             summary_ = newSummary;
+             builder_ = newBuilder;
++            if (!newConfig->botName.empty()) {
++                persona_.botName = newConfig->botName;
++            }
++            if (!newConfig->character.empty()) {
++                persona_.character = newConfig->character;
++            }
++            if (!newConfig->systemPromptPrefix.empty()) {
++                persona_.systemPromptPrefix = newConfig->systemPromptPrefix;
++            }
++            if (!newConfig->systemPromptNotice.empty()) {
++                persona_.systemPromptNotice = newConfig->systemPromptNotice;
++            }
++            systemPrompt_ = rebuildSystemPrompt();
+         }
+ 
+         // 刷新长驻组件配置与依赖
+         router_.update(newConfig->fusion, newSummary, newEmbedding);
+         memory_.update(newConfig->memory, newEmbedding);
++        inputBuffers_.updateConfig(newConfig->inputBuffer);
++
++        {
++            std::lock_guard<std::mutex> slock(stateMtx_);
++            state_.botName = persona_.botName;
++        }
+ 
+         const std::int64_t now = std::time(nullptr);
+         eventLog_.append({0, EventKind::ConfigReloaded, now, "配置热重载: " + configPath.string()});
+@@ -128,6 +177,11 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
+     }
+ }
+ 
++std::string Runtime::systemPrompt() const {
++    std::shared_lock<std::shared_mutex> lock(servicesMtx_);
++    return systemPrompt_;
++}
++
+ std::shared_ptr<const AppConfig> Runtime::config() const {
+     return configMgr_ ? configMgr_->get() : nullptr;
+ }
+@@ -423,6 +477,73 @@ void Runtime::registerBuiltinTools() {
+                       return list.dump();
+                   },
+                   ToolLayer::Builtin);
++
++    // keepsilent —— 保持沉默（不想回答 / 已读不回 / 拒绝回复）
++    ToolDef keepSilentDef;
++    keepSilentDef.name = "keepsilent";
++    keepSilentDef.description =
++        "当你阅读了用户的话后，内心感到被冒犯不想回复、想要已读不回、或者认为此时保持沉默更符合你的心情/不想回答时，调用此工具保持沉默。调用后你不会向用户发送任何消息。";
++    keepSilentDef.parametersJsonSchema = {
++        {"type", "object"},
++        {"properties",
++         {{"reason",
++           {{"type", "string"},
++            {"description", "决定保持沉默/不想回答的内心理由（如：被冒犯了不想理会/无聊不想回答等）"}}}}},
++        {"required", nlohmann::json::array({"reason"})}};
++    keepSilentDef.isTerminal = true;
++    registry_.add(
++        std::move(keepSilentDef),
++        [](const nlohmann::json& args) -> std::string {
++            g_activeKeepSilent = true;
++            std::string reason = args.value("reason", "");
++            log::info("Runtime", "模型调用 keepsilent 保持沉默: " + reason);
++            return "已选择保持沉默。本轮不会向用户发送任何回复。";
++        },
++        ToolLayer::Builtin);
++
++    // keep_silent 别名兼容
++    ToolDef keepSilentAliasDef;
++    keepSilentAliasDef.name = "keep_silent";
++    keepSilentAliasDef.description = "同 keepsilent，在不想回答或决定已读不回时调用。";
++    keepSilentAliasDef.parametersJsonSchema = {
++        {"type", "object"},
++        {"properties",
++         {{"reason",
++           {{"type", "string"},
++            {"description", "决定保持沉默的内心理由"}}}}},
++        {"required", nlohmann::json::array({"reason"})}};
++    keepSilentAliasDef.isTerminal = true;
++    registry_.add(
++        std::move(keepSilentAliasDef),
++        [](const nlohmann::json& args) -> std::string {
++            g_activeKeepSilent = true;
++            std::string reason = args.value("reason", "");
++            log::info("Runtime", "模型调用 keep_silent 保持沉默: " + reason);
++            return "已选择保持沉默。本轮不会向用户发送任何回复。";
++        },
++        ToolLayer::Builtin);
++
++    // stay_silent 别名兼容
++    ToolDef staySilentDef;
++    staySilentDef.name = "stay_silent";
++    staySilentDef.description = "同 keepsilent，在不想回答或决定已读不回时调用。";
++    staySilentDef.parametersJsonSchema = {
++        {"type", "object"},
++        {"properties",
++         {{"reason",
++           {{"type", "string"},
++            {"description", "决定保持沉默的内心理由"}}}}},
++        {"required", nlohmann::json::array({"reason"})}};
++    staySilentDef.isTerminal = true;
++    registry_.add(
++        std::move(staySilentDef),
++        [](const nlohmann::json& args) -> std::string {
++            g_activeKeepSilent = true;
++            std::string reason = args.value("reason", "");
++            log::info("Runtime", "模型调用 stay_silent 保持沉默: " + reason);
++            return "已选择保持沉默。本轮不会向用户发送任何回复。";
++        },
++        ToolLayer::Builtin);
+ }
+ 
+ std::string Runtime::rebuildSystemPrompt(
+@@ -465,6 +586,7 @@ void Runtime::onSummaryProduced(const SummaryOutcome& outcome) {
+ 
+ BotReply Runtime::ingest(IncomingMessage message) {
+     const std::int64_t now = std::time(nullptr);
++    g_activeKeepSilent = false;
+ 
+     // 捕获当前代际的服务快照（RCU 模式），确保单次调用内部的组件生命周期一致
+     std::shared_ptr<Llm> currentLlm;
+@@ -570,6 +692,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
+                                achieve_.append(conv, m);
+                                unit->append(m);
+                            });
++        unit->recordUsage(resp.usage);
+     }
+     // 8) 锁外：状态快照 + 审计 + Facts 重建
+     for (const auto& raw : batch.rawMessages) {
+@@ -580,6 +703,11 @@ BotReply Runtime::ingest(IncomingMessage message) {
+         systemPrompt_ = rebuildSystemPrompt(diary_.consume());
+     }
+ 
++    if (g_activeKeepSilent) {
++        log::info("Runtime", "模型自主调用 keepsilent 保持沉默，本轮不发送回复消息");
++        resp.text = "";
++    }
++
+     return BotReply{batch.conversation, resp.text};
+ }
+ 
+diff --git a/src/runtime/Runtime.h b/src/runtime/Runtime.h
+index f7fdebc..12a1c7a 100644
+--- a/src/runtime/Runtime.h
++++ b/src/runtime/Runtime.h
+@@ -53,6 +53,8 @@
+ 
+ namespace mio {
+ 
++class AdminServer;
++
+ struct BotReply {
+     ConversationKey conversation;
+     std::string text;
+@@ -79,6 +81,7 @@ public:
+     Runtime(std::string botName,
+             std::filesystem::path dataDir,
+             std::unique_ptr<Llm> llm);
++    ~Runtime();
+ 
+     // 工具闭包捕获成员引用：拷贝/移动都会造成悬空引用，一律禁用
+     Runtime(const Runtime&) = delete;
+@@ -97,6 +100,8 @@ public:
+     RuntimeState state() const;  // 值返回（线程安全快照）
+     InputBufferManager& inputBuffers() { return inputBuffers_; }
+     const InputBufferManager& inputBuffers() const { return inputBuffers_; }
++    std::vector<FusionRouter::UnitInfo> fusionUnitsInfo() const { return router_.unitsInfo(); }
++    std::string systemPrompt() const;
+ 
+ private:
+     // Facts 渲染（冷启动/重新冷启动后/图谱变化时重建）
+@@ -138,6 +143,7 @@ private:
+     RuntimeState state_;
+     mutable std::mutex stateMtx_;
+     InputBufferManager inputBuffers_;
++    std::unique_ptr<AdminServer> adminServer_;
+ };
+ 
+ } // namespace mio
+diff --git a/xmake.lua b/xmake.lua
+index a813adf..7e9fd62 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -17,6 +17,15 @@ target("MIO")
+     -- 统一以 src/ 为 include 根，代码里写 #include "providers/llm/Llm.h"
+     add_includedirs("src")
+     add_packages("cpr", "nlohmann_json", "ixwebsocket", "sqlite3")
++
++-- 验收测试：编译同一份源码（去掉 main.cpp）加上 tests/ 下的用例。
++-- 不联网、不使用真实用户数据；调度用可注入时钟，摘要/插件用 fake，库用临时目录。
++target("mio_tests")
++    set_kind("binary")
++    add_files("src/**.cpp", "tests/**.cpp")
++    remove_files("src/main.cpp")
++    add_includedirs("src", "tests")
++    add_packages("cpr", "nlohmann_json", "ixwebsocket", "sqlite3")
+ --
+ -- If you want to known more usage about xmake, please see https://xmake.io
+ --

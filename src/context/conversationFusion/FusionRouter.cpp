@@ -36,6 +36,15 @@ std::string hexEncode(const std::string& s) {
     return out;
 }
 
+// 互动事件来源：同一会话、同一对人、同一秒只计一次互动（去重 + 有界），
+// 因此"多发几条消息"不会按消息数累积亲密度，只更新熟悉/活跃统计。
+std::string interactionEventSource(const std::string& unitKey,
+                                   const std::string& a, const std::string& b,
+                                   std::time_t now) {
+    return "msg:" + unitKey + ":" + a + "->" + b + ":" +
+           std::to_string(static_cast<std::int64_t>(now));
+}
+
 } // namespace
 
 FusionRouter::FusionRouter(RelationshipGraph& graph, Achieve& achieve,
@@ -71,6 +80,32 @@ std::size_t FusionRouter::unitCount() const {
     return units_.size();
 }
 
+std::vector<FusionRouter::UnitInfo> FusionRouter::unitsInfo() const {
+    std::lock_guard<std::mutex> lock(mapMtx_);
+    std::vector<UnitInfo> list;
+    list.reserve(units_.size());
+    for (const auto& [k, u] : units_) {
+        if (!u) continue;
+        bool locked = u->mtx.try_lock();
+        UnitInfo info;
+        info.key = k;
+        info.isBusy = !locked;
+        for (const auto& inKey : u->inDegree()) {
+            info.inDegree.push_back(inKey.toString());
+        }
+        info.topic = u->topic();
+        info.isPublic = u->isPublic();
+        info.turnsSinceCreation = u->turnsSinceCreation();
+        info.messageCount = u->context().size();
+        info.stats = u->stats();
+        if (locked) {
+            u->mtx.unlock();
+        }
+        list.push_back(std::move(info));
+    }
+    return list;
+}
+
 FusionUnit* FusionRouter::findUnit(const IncomingMessage& msg) const {
     const std::string sourceKey = msg.conversation.toString();
     if (auto it = sourceToUnit_.find(sourceKey); it != sourceToUnit_.end()) {
@@ -93,16 +128,19 @@ FusionUnit* FusionRouter::findUnit(const IncomingMessage& msg) const {
 
 FusionUnit* FusionRouter::createFromColdRead(const IncomingMessage& msg,
                                              std::time_t now) {
-    // 首次遇见来源：Achieve 冷读取（摘要前20条 + 原文5条）→ 创建 FusionUnit
-    ColdRead cold;
-    if (summary_) {
-        cold = achieve_.coldRead(msg.conversation, *summary_);
-    } else {
-        cold.msgs = achieve_.load(msg.conversation);
-    }
+    // 首次遇见来源：Achieve 冷启动（无 LLM —— 不调摘要模型、不写长期记忆）：
+    // 双重预算内恢复最近可见原文，reasoning 与历史工具回合整体排除
+    const std::string convKey = msg.conversation.toString();
+    ColdStartOptions opts;
+    opts.rawTokenBudget = cfg_.coldStartRawTokens;
+    opts.maxMessages = cfg_.coldStartMaxMessages;
+    const ColdStartResult cold = achieve_.coldStart(convKey, opts);
+
     auto unit = std::make_unique<FusionUnit>(msg.conversation, cold.msgs);
-    unit->setIsPublic(cold.isPublic);
-    if (!cold.topic.empty()) unit->setTopic(cold.topic);  // 话题随摘要同步更新
+    unit->markColdStartDone();  // 已冷启动：ContextBuilder 不再兜底恢复
+    // 冷启动不再调用摘要模型 → 没有私密性判定与话题：默认私密、话题留空
+    // （topic 由 update_topic 工具或后续压缩摘要更新）
+    unit->setIsPublic(false);
 
     const std::string unitKey = msg.conversation.toString();
     FusionUnit* raw = unit.get();
@@ -114,16 +152,18 @@ FusionUnit* FusionRouter::createFromColdRead(const IncomingMessage& msg,
             unitIsPerson_[unitKey] = true;
             unitPersonId_[unitKey] = p->internalId;
             personToUnit_[p->internalId] = unitKey;
+            raw->setParticipants({p->internalId});  // 摘要请求的归属人
         }
     } else {
         unitIsPerson_[unitKey] = false;
         unitMembers_[unitKey] = {};
     }
     log::info("FusionRouter",
-              "冷读取创建 unit: " + unitKey +
-                  " topic=" + raw->topic() +
-                  " isPublic=" + (raw->isPublic() ? "true" : "false") +
-                  " topic_hex=" + hexEncode(raw->topic()));
+              "冷启动创建 unit: " + unitKey +
+                  " 恢复条数=" + std::to_string(cold.msgs.size()) +
+                  " 预算丢弃=" + std::to_string(cold.droppedByBudget) +
+                  " 工具回合剔除=" + std::to_string(cold.droppedToolRounds) +
+                  " isPublic=false");
     return raw;
 }
 
@@ -330,6 +370,7 @@ FusionUnit* FusionRouter::fuse(FusionUnit& a, FusionUnit& b,
         long_->addInDegree(k);
         sourceToUnit_[k.toString()] = longKey;
     }
+    long_->mergeParticipants(short_->participants());  // 摘要请求的参与者随之合并
     if (shortIsPerson) personToUnit_[unitPersonId_.at(shortKey)] = longKey;
     // 群成员集合合并
     if (auto it = unitMembers_.find(shortKey); it != unitMembers_.end()) {
@@ -362,21 +403,27 @@ FusionUnit* FusionRouter::route(const IncomingMessage& msg, std::time_t now) {
     FusionUnit* unit = findUnit(msg);
     if (!unit) unit = createFromColdRead(msg, now);
 
-    // 群消息：登记成员 + 共同出现 → 两人亲密累积
+    // 群消息：登记成员 + 共同出现 → 互动/熟悉度统计（不是按消息加分：
+    // 事件来源含会话+秒，同一秒同一对人只计一次；不产生 family/friend 晋级）
     const PersonNode* senderNode = graph_.findByPlatform(msg.platform, msg.senderId);
     if (msg.conversation.scope == ConversationScope::Group && !unit->inDegree().empty()) {
         const std::string unitKey = unit->inDegree().front().toString();
         if (senderNode != nullptr) {
             auto& members = unitMembers_[unitKey];
-            for (const auto& m : members)
-                if (m != senderNode->internalId)
-                    graph_.bumpIntimacy(senderNode->internalId, m, 0.05, now);
+            for (const auto& m : members) {
+                if (m == senderNode->internalId) continue;
+                graph_.noteInteraction(senderNode->internalId, m,
+                                       interactionEventSource(unitKey,
+                                                              senderNode->internalId,
+                                                              m, now),
+                                       now);
+            }
             members.insert(senderNode->internalId);
         }
     }
 
     // @ 关系映射：从 atUserIds 以及消息文本中的 @(\w+) 提取被提及用户
-    // 将其映射为认识的人，并在群聊中计入成员并累积与发言者的亲密度
+    // 将其映射为认识的人，并在群聊中计入成员并统计互动（提及也是互动事件）
     std::vector<std::string> atIds = msg.atUserIds;
     static const std::regex atRegex(R"(@(\w+))");
     auto words_begin = std::sregex_iterator(msg.text.begin(), msg.text.end(), atRegex);
@@ -397,7 +444,13 @@ FusionUnit* FusionRouter::route(const IncomingMessage& msg, std::time_t now) {
                 auto& members = unitMembers_[unitKey];
                 members.insert(atNode->internalId);
                 if (senderNode != nullptr && senderNode->internalId != atNode->internalId) {
-                    graph_.bumpIntimacy(senderNode->internalId, atNode->internalId, 0.05, now);
+                    // 与群内共同出现共用同一事件来源：同一条消息里"被 @"与
+                    // "同群发言"只算一次互动
+                    graph_.noteInteraction(
+                        senderNode->internalId, atNode->internalId,
+                        interactionEventSource(unitKey, senderNode->internalId,
+                                               atNode->internalId, now),
+                        now);
                 }
             }
         }

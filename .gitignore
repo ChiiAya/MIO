@@ -12,4 +12,8 @@ data/
 .vscode/
 compile_commands.json
 
-scripts/
+scripts/*
+# 交付的验证脚本例外（提供可复现验证步骤）
+!scripts/dev/
+!scripts/dev/**
+config.json

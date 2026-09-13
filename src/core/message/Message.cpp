@@ -14,6 +14,7 @@
 //      保证"没写的字段 = 不存在"这条不变量。
 //   4. senderId/platform 仅 User 消息携带（来源身份，wire 层渲染为标签）；
 //      旧历史文件没有这两个字段，载入后即为空、不打标签。
+//   5. messageId 缺省 0 = 未分配（旧档案兼容）；truncated 是投影标记，不落盘。
 // ============================================================================
 
 #include "core/message/Message.h"
@@ -85,6 +86,9 @@ nlohmann::json msgToJson(const Msg& m) {
     }
     if (!m.toolCallId.empty()) j["toolCallId"] = m.toolCallId;
     if (m.createdAt > 0) j["createdAt"] = m.createdAt;
+    // 0 = 未分配：旧档案没有该字段，写出 0 只会污染文件；truncated 是投影
+    // 标记，不落盘（重新加载后由冷启动重新判定）。
+    if (m.messageId > 0) j["messageId"] = m.messageId;
     if (m.isSummary) j["summary"] = true;
     if (m.firstEncounter) j["firstEncounter"] = true;
     if (!m.senderId.empty()) j["senderId"] = m.senderId;
@@ -128,6 +132,8 @@ Msg msgFromJson(const nlohmann::json& j) {
     }
     m.toolCallId = j.value("toolCallId", "");
     m.createdAt = j.value("createdAt", std::int64_t{0});
+    // 旧记录没有 messageId：缺省 0（未分配），由档案层按行位置补稳定 ID。
+    m.messageId = j.value("messageId", std::int64_t{0});
     m.isSummary = j.value("summary", false);
     m.firstEncounter = j.value("firstEncounter", false);
     m.senderId = j.value("senderId", "");

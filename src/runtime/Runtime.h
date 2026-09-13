@@ -25,21 +25,29 @@
 
 #include "config/AppConfig.h"
 #include "config/ConfigManager.h"
+#include "context/achieve/ColdStart.h"
 #include "context/achieve/Achieve.h"
 #include "context/contextBuilder/ContextBuilder.h"
 #include "context/conversationFusion/FusionRouter.h"
 #include "context/inputBuffer/inputBuffer.h"
+#include "context/lifecycle/ConversationLifecycle.h"
 #include "context/summarizor/SummaryManager.h"
+#include "core/contracts/Contracts.h"
 #include "core/event/Event.h"
 #include "core/eventlog/EventLog.h"
 #include "diary/Diary.h"
+#include "mind/proposals/CognitionStore.h"
+#include "mind/proposals/FactStore.h"
+#include "mind/proposals/ProposalStore.h"
 #include "providers/embedding/Embedding.h"
 #include "providers/llm/Llm.h"
 #include "providers/llm/tool/ToolRegistry.h"
+#include "providers/memory/MemoryProvider.h"
 #include "memory/manager/MemoryManager.h"
 #include "mind/facts/Facts.h"
 #include "mind/graph/RelationshipGraph.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -49,9 +57,12 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace mio {
+
+class AdminServer;
 
 struct BotReply {
     ConversationKey conversation;
@@ -79,6 +90,7 @@ public:
     Runtime(std::string botName,
             std::filesystem::path dataDir,
             std::unique_ptr<Llm> llm);
+    ~Runtime();
 
     // 工具闭包捕获成员引用：拷贝/移动都会造成悬空引用，一律禁用
     Runtime(const Runtime&) = delete;
@@ -97,23 +109,51 @@ public:
     RuntimeState state() const;  // 值返回（线程安全快照）
     InputBufferManager& inputBuffers() { return inputBuffers_; }
     const InputBufferManager& inputBuffers() const { return inputBuffers_; }
+    std::vector<FusionRouter::UnitInfo> fusionUnitsInfo() const { return router_.unitsInfo(); }
+    std::string systemPrompt() const;
+
+    // ---- 管理端只读观测（管理员通道；MUST NOT 注册为模型工具）--------------
+    // 待审阅提案列表：pending 提案绝不注入稳定 system prompt，只在此可见。
+    std::vector<Proposal> pendingProposals(std::size_t limit) const;
+    // 会话生命周期状态（含 summaryPending / retryCount / runState / lastError）
+    std::vector<ConversationLifecycleState> lifecycleStates() const;
+    // 人工排障复位（清除 Exhausted/Failed，retryCount 归零；不丢弃未提交范围）
+    bool clearLifecycleFailure(const std::string& conversationKey);
+    // 本次启动以来累计的摘要结果（可观测性）
+    struct SummaryStats {
+        std::uint64_t succeeded = 0;
+        std::uint64_t failed = 0;
+        std::uint64_t skippedNoContent = 0;
+    };
+    SummaryStats summaryStats() const;
 
 private:
     // Facts 渲染（冷启动/重新冷启动后/图谱变化时重建）
     std::string rebuildSystemPrompt(
         const std::vector<DiaryEntry>& cognition = {});
     void registerBuiltinTools();
+    void registerMemoryTools();
     // 消息到达的状态快照更新（messageCount/活跃用户/活跃会话）
     void noteMessage(const ConversationKey& conversation,
                      const std::string& senderId);
+    // 后台维护线程（单线程 pull 调度 + 摘要执行；不为每条消息建线程）
+    void startMaintenance();
+    void stopMaintenance();
+    void maintenanceLoop();
+    // 一轮调度：枚举已有档案会话 → 满足条件才冻结并执行摘要
+    void lifecycleTick(std::int64_t now);
+    // 执行一个冻结的摘要任务；返回是否成功（失败由调用方回报给调度器）
+    bool runSummaryJob(const SummaryJob& job, std::int64_t now);
+    // 同步工具调用路径的服务端权限上下文（仅 ingest 线程；后台任务不得读取）
+    AccessContext currentAccess() const;
+    // 从档案投影收集范围内的参与者 internalId
+    std::vector<std::string> collectParticipants(const std::string& convKey,
+                                                 std::int64_t fromMessageId,
+                                                 std::int64_t toMessageId);
+    // 管理端/人工排障：管理员 AccessContext（allowCrossConversation=false 起步）
+    AccessContext adminAccess() const;
 
-    // ---- 记忆系统（SELECT & RECALL，见 memory/MemoryManager.h）----
-    // 归属解析：私聊 → 对话者 internalId（私密记忆跨会话跟随本人）；
-    // 群聊 → 空串（无单一归属人，记忆按 conv_key 会话共享）
-    std::string resolveMemoryPerson(const IncomingMessage& msg) const;
-    // 摘要产出 sink（SummaryManager 咽喉点）→ 写入流程：向量化 → BLOB → INSERT。
-    // 会话/归属取 thread_local 上下文（sink 在 route 内部同步触发）
-    void onSummaryProduced(const SummaryOutcome& outcome);
+    void publishConfig(const AppConfig& cfg);  // 热更新落地（服务与计时器）
 
     // 声明顺序 = 构造顺序；保证成员依赖生命周期正确
     Persona persona_;
@@ -125,7 +165,7 @@ private:
     std::shared_ptr<ConfigManager> configMgr_;
     std::shared_ptr<Llm> llm_;
     std::shared_ptr<Embedding> embedding_;  // 向量化（记忆写入/召回 + Router 话题匹配共用）
-    std::shared_ptr<SummaryManager> summary_;      // 摘要器（引用 llm_；产出 sink 接到 memory_）
+    std::shared_ptr<SummaryManager> summary_;      // 摘要器（引用 llm_）
     std::shared_ptr<ContextBuilder> builder_;      // 上下文构建 + 重新冷启动
     mutable std::shared_mutex servicesMtx_;        // 保护以上 4 个服务指针的热切换
 
@@ -134,10 +174,25 @@ private:
     FusionRouter router_;         // fusion 即路由（话题语义匹配用 embedding_）
     ToolRegistry registry_;
 
+    // ---- 记忆系统改造新增（身份事实 / 认知 / 提案 / 生命周期）------------
+    std::unique_ptr<ProposalStore> proposalStore_;
+    std::unique_ptr<FactStore> factStore_;
+    std::unique_ptr<CognitionStore> cognitionStore_;
+    std::shared_ptr<ConversationLifecycle> lifecycle_;
+    // 经历记忆后端（E：本地 SQLite 适配 + 不可用测试桩；Hindsight 为占位）
+    std::shared_ptr<MemoryProvider> memoryProvider_;
+
+    std::thread maintenance_;
+    std::atomic<bool> stopping_{false};
+
     std::string systemPrompt_;    // Facts 渲染结果（重建时机由调用方保证）
     RuntimeState state_;
     mutable std::mutex stateMtx_;
     InputBufferManager inputBuffers_;
+    std::unique_ptr<AdminServer> adminServer_;
+
+    mutable std::mutex statsMtx_;
+    SummaryStats summaryStats_;
 };
 
 } // namespace mio

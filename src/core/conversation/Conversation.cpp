@@ -21,4 +21,31 @@ bool ConversationKey::operator==(const ConversationKey& other) const {
     return scope == other.scope && id == other.id && platform == other.platform;
 }
 
+std::optional<ConversationKey> ConversationKey::fromString(const std::string& s) {
+    static const std::string kPrivate = "private:";
+    static const std::string kGroup = "group:";
+    const std::size_t p = s.find(kPrivate);
+    const std::size_t g = s.find(kGroup);
+    std::size_t at = std::string::npos;
+    bool isPrivate = true;
+    if (p == std::string::npos && g == std::string::npos) return std::nullopt;
+    if (p == std::string::npos) {
+        at = g;
+        isPrivate = false;
+    } else if (g == std::string::npos) {
+        at = p;
+    } else if (p <= g) {
+        at = p;
+    } else {
+        at = g;
+        isPrivate = false;
+    }
+    ConversationKey key;
+    key.scope = isPrivate ? ConversationScope::Private : ConversationScope::Group;
+    key.platform = s.substr(0, at);
+    key.id = s.substr(at + (isPrivate ? kPrivate.size() : kGroup.size()));
+    if (key.id.empty()) return std::nullopt;
+    return key;
+}
+
 } // namespace mio

@@ -9,7 +9,9 @@
 //      判断是否将不同的 IncomingMessage 来源路由到同一个 FusionUnit，
 //      确认重定向时调用 FusionContext 的 beRedirected（redirect）函数；
 //   3、创建 FusionUnit：某一次运行中第一次遇见某 IncomingMessage 来源时，
-//      调用 Achieve 读取历史消息（冷读取：摘要前20条+原文5条）并创建新实例。
+//      调用 Achieve 冷启动（无 LLM：最近可见原文 + 双重预算，剔除 reasoning
+//      与历史工具回合）并创建新实例；冷启动不写长期记忆，unit 初始 topic 为空、
+//      默认私密。
 //   4、话题模糊语义匹配：可空依赖 Embedding，把"话题字符串相同"升级为
 //      "话题语义相近"（余弦相似度），向量带缓存、失败自动降级。
 //
@@ -44,6 +46,10 @@ struct FusionConfig {
     double trustThreshold = 0.4;     // 信任度阈值
     bool topicSemanticMatch = true;  // embedding 可用时启用话题语义匹配
     double topicSimilarityThreshold = 0.55;  // 话题余弦相似度阈值
+    // 冷启动历史原文预算（与 AppConfig.contextBuilder.coldStart* 同义）：
+    // 任一为 0 = 不恢复历史原文。Runtime 未显式接线时使用与配置一致的默认值。
+    int coldStartRawTokens = 2000;
+    int coldStartMaxMessages = 20;
 };
 
 class FusionRouter {
@@ -74,12 +80,25 @@ public:
 
     std::size_t unitCount() const;
 
+    struct UnitInfo {
+        std::string key;
+        std::vector<std::string> inDegree;
+        std::string topic;
+        bool isPublic = false;
+        bool isBusy = false;
+        int turnsSinceCreation = 0;
+        std::size_t messageCount = 0;
+        UnitTokenStats stats;
+    };
+
+    std::vector<UnitInfo> unitsInfo() const;
+
 private:
     // 来源身份：私聊 → person:internalId；群聊 → group:平台:群ID
     std::string identityKey(const IncomingMessage& msg, std::time_t now);
     // 查找来源当前路由到的 unit（sourceToUnit / personToUnit）
     FusionUnit* findUnit(const IncomingMessage& msg) const;
-    // 首次遇见：Achieve 冷读取 → 创建 unit 并登记映射
+    // 首次遇见：Achieve 冷启动（无 LLM）→ 创建 unit 并登记映射
     FusionUnit* createFromColdRead(const IncomingMessage& msg, std::time_t now);
     // 融合判断（熟悉度 + 信任度 + 话题相关 + 双方公开）
     bool canFuse(FusionUnit& a, FusionUnit& b) const;

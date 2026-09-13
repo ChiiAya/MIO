@@ -56,8 +56,16 @@ struct Msg {
     std::vector<ToolCall> toolCalls; // 仅 Assistant 使用
     std::string toolCallId;          // 仅 Tool 使用
     std::int64_t createdAt = 0;      // epoch 秒；0 = 未知（旧数据）
+    // 会话内稳定递增消息 ID（从 1 开始；0 = 未分配）。
+    // 由档案层在【确认落盘成功后】赋予；引用统一使用 (conversationKey,
+    // messageId)，不得用昵称或时间戳代替唯一身份。旧记录没有该字段 → 0。
+    std::int64_t messageId = 0;
     bool isSummary = false;          // 首条滚动摘要（历史首条）
     bool firstEncounter = false;     // 平台标记：首次见到该用户
+    // 投影标记：正文因冷启动/压缩预算被 UTF-8 安全截断。
+    // 只存在于内存投影，不落盘、不上 wire（wire 以 text 为准）——它是
+    // "这段正文不完整"的可观察信号，而不是一个可回传的协议字段。
+    bool truncated = false;
 
     // 消息来源身份（仅 User 携带，来自平台事件；模型回复/工具结果为空）。
     // wire 层渲染为 [平台][private]/[平台][group:群号] + [sender:人] 前缀标签；
