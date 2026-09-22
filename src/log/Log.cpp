@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <ctime>
 #include <mutex>
-#include <utility>
 
 namespace mio {
 namespace log {

@@ -14,7 +14,9 @@
 // ============================================================================
 
 #include "adapters/napcat/NapCatAdapter.h"
+#include "adapters/napcat/MediaResolver.h"
 #include "adapters/napcat/OneBotParser.h"
+#include "providers/asr/openai/OpenAiAsr.h"
 #include "runtime/Runtime.h"
 
 #include <ixwebsocket/IXWebSocket.h>
@@ -244,6 +246,7 @@ struct NapCatConnection {
 };
 
 void workerLoop(Runtime& runtime, NapCatConnection& conn, PendingActions& pending,
+                const MediaResolver& mediaResolver,
                 std::deque<IncomingMessage>& queue, std::mutex& queueMtx,
                 std::condition_variable& queueCv, const std::atomic<bool>& running) {
     std::atomic<int> activeTasks{0};
@@ -263,13 +266,24 @@ void workerLoop(Runtime& runtime, NapCatConnection& conn, PendingActions& pendin
         lock.unlock();
 
         activeTasks++;
-        std::thread([&runtime, &conn, &pending, &activeTasks, &taskMtx, &taskCv,
+        std::thread([&runtime, &conn, &pending, &mediaResolver, &activeTasks,
+                     &taskMtx, &taskCv,
                      message = std::move(message)]() mutable {
             const ConversationKey conversation = message.conversation;
             const std::string senderId = message.senderId;
             log::info(kTag, "处理 " + conversation.toString() + " 来自 " + senderId);
 
             try {
+                // 媒体解析放在 worker 线程：下载/ASR 都是阻塞 I/O，
+                // 且不能占用 WebSocket 回调线程（那会卡住 action 响应）。
+                const std::size_t attachmentCount = message.attachments.size();
+                mediaResolver.resolve(message);
+                if (attachmentCount > 0) {
+                    log::info(kTag, "媒体解析完成 count=" +
+                                        std::to_string(attachmentCount) +
+                                        " parts=" +
+                                        std::to_string(message.parts.size()));
+                }
                 const BotReply reply = runtime.ingest(std::move(message));
                 if (!reply.text.empty()) {
                     std::shared_ptr<ix::WebSocket> ws;
@@ -301,20 +315,29 @@ NapCatConfig NapCatConfig::fromEnvironment() {
     if (auto v = env("MIO_NAPCAT_HOST")) cfg.listenHost = *v;
     if (auto v = envInt("MIO_NAPCAT_PORT")) cfg.listenPort = *v;
     if (auto v = env("MIO_NAPCAT_TOKEN")) cfg.token = *v;
+    cfg.media = MediaConfig::fromEnvironment();
     return cfg;
 }
 
 void runNapCat(Runtime& runtime, const NapCatConfig& config) {
     PendingActions pending;
     NapCatConnection conn;
+    // ASR 只在配置启用时构造；未启用时 MediaResolver 仅缓存音频文件
+    std::shared_ptr<AsrProvider> asr;
+    if (config.media.enabled && config.media.audio && config.media.asr.enabled) {
+        asr = std::make_shared<OpenAiAsr>(config.media.asr);
+    }
+    const MediaResolver mediaResolver(config.media, std::move(asr));
+
     std::deque<IncomingMessage> queue;
     std::mutex queueMtx;
     std::condition_variable queueCv;
     std::atomic<bool> running{true};
 
     std::thread worker(workerLoop, std::ref(runtime), std::ref(conn),
-                       std::ref(pending), std::ref(queue), std::ref(queueMtx),
-                       std::ref(queueCv), std::cref(running));
+                       std::ref(pending), std::cref(mediaResolver),
+                       std::ref(queue), std::ref(queueMtx), std::ref(queueCv),
+                       std::cref(running));
     auto stopWorker = [&] {
         running = false;
         queueCv.notify_all();

@@ -28,10 +28,12 @@ void InputBuffer::updateConfig(InputBufferConfig cfg) {
 
 PushResult InputBuffer::push(IncomingMessage msg, const std::string& displayName,
                              std::int64_t nowSec) {
-    // 1. 过滤：全空白消息直接丢弃
-    if (msg.text.empty() || isAllWhitespace(msg.text)) {
+    // 1. 过滤：全空白且不含媒体内容的消息才丢弃（纯图片/语音消息正文是
+    //    "[图片]"/"[语音]" 之类的标记，媒体本体在 msg.parts 里）
+    if ((msg.text.empty() || isAllWhitespace(msg.text)) && msg.parts.empty()) {
         return PushResult::Rejected;
     }
+    if (msg.text.empty()) msg.text = "[媒体]";
 
     // 2. 长文本安全过滤与截断
     if (msg.text.size() > cfg_.maxTextLength) {
@@ -41,6 +43,7 @@ PushResult InputBuffer::push(IncomingMessage msg, const std::string& displayName
     // 3. 构建对应的上下文 Msg
     Msg turn{Role::User};
     turn.text = msg.text;
+    turn.parts = msg.parts;  // 多模态片段透传给上下文与 wire 层
     turn.createdAt = nowSec;
     turn.senderId = msg.senderId;
     turn.senderName = displayName;
@@ -65,8 +68,10 @@ PushResult InputBuffer::push(IncomingMessage msg, const std::string& displayName
     // 后续跟随消息：追加进当前等待批次，并刷新最后到达时间
     lastMsgTime_ = now;
 
-    // 若同一会话同一发言人连续打字，合并文本以节省 Prompt 与缓存
-    if (!pendingTurns_.empty() && pendingTurns_.back().senderId == turn.senderId) {
+    // 若同一会话同一发言人连续打字，合并文本以节省 Prompt 与缓存；
+    // 含多模态片段的消息不合并，避免丢失/错位媒体内容
+    if (!pendingTurns_.empty() && pendingTurns_.back().senderId == turn.senderId &&
+        pendingTurns_.back().parts.empty() && turn.parts.empty()) {
         pendingTurns_.back().text += "\n" + turn.text;
     } else {
         pendingTurns_.push_back(std::move(turn));

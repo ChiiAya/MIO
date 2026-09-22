@@ -54,6 +54,9 @@
 namespace mio {
 
 class AdminServer;
+namespace mcp {
+class McpManager;
+}
 
 struct BotReply {
     ConversationKey conversation;
@@ -143,6 +146,7 @@ private:
     mutable std::mutex stateMtx_;
     InputBufferManager inputBuffers_;
     std::unique_ptr<AdminServer> adminServer_;
+    std::unique_ptr<mcp::McpManager> mcpManager_;
 };
 
 } // namespace mio
