@@ -16,7 +16,7 @@
 namespace mio {
 
 struct ToolLoopOptions {
-    int maxSteps = 6;   // 一次提问最多几轮"模型<->工具"往返；闲聊 bot 用不了太多
+    int maxSteps = 8;   // 一次提问最多几轮"模型<->工具"往返；闲聊 bot 用不了太多
     std::size_t maxInlineResultBytes = 4096; // 工具结果超过这个字节数就落盘截断
     int repeatStreakThreshold = 3;           // 同名同参连续调用 N 次后注入提醒
     std::filesystem::path overflowDir = "data/tool_overflow";

@@ -96,6 +96,16 @@
     "listenHost": "0.0.0.0", // 反向 WS 服务端监听地址
     "listenPort": 8082,      // 反向 WS 监听端口
     "token": ""              // OneBot 鉴权 Token
+  },
+
+  // 【9. 消息分段与拟人打字延时配置 (MessageSplitterConfig)】
+  // 模型使用 [SEP] 作为分隔符时，框架自动拆分为多气泡并模拟真人打字节奏延时发送
+  "splitter": {
+    "enabled": true,         // 是否启用分段发送
+    "delimiter": "[SEP]",    // 分段标识符 (默认 [SEP])
+    "baseDelayMs": 400,      // 基础等待时间 (毫秒)
+    "delayPerCharMs": 25,    // 每字符打字模拟延时 (毫秒)
+    "maxDelayMs": 2000       // 单次最大延时上限 (毫秒)
   }
 }
 

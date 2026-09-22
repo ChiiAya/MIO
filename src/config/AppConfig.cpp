@@ -232,6 +232,24 @@ void from_json(const nlohmann::json& j, InputBufferConfig& c) {
     readIfExists(j, "maxBatchSize", c.maxBatchSize);
 }
 
+void to_json(nlohmann::json& j, const MessageSplitterConfig& c) {
+    j = nlohmann::json{
+        {"enabled", c.enabled},
+        {"delimiter", c.delimiter},
+        {"baseDelayMs", c.baseDelayMs},
+        {"delayPerCharMs", c.delayPerCharMs},
+        {"maxDelayMs", c.maxDelayMs}
+    };
+}
+
+void from_json(const nlohmann::json& j, MessageSplitterConfig& c) {
+    readIfExists(j, "enabled", c.enabled);
+    readIfExists(j, "delimiter", c.delimiter);
+    readIfExists(j, "baseDelayMs", c.baseDelayMs);
+    readIfExists(j, "delayPerCharMs", c.delayPerCharMs);
+    readIfExists(j, "maxDelayMs", c.maxDelayMs);
+}
+
 void to_json(nlohmann::json& j, const AppConfig& c) {
     j = nlohmann::json{
         {"botName", c.botName},
@@ -248,7 +266,8 @@ void to_json(nlohmann::json& j, const AppConfig& c) {
         {"contextBuilder", c.contextBuilder},
         {"memory", c.memory},
         {"napcat", c.napcat},
-        {"inputBuffer", c.inputBuffer}
+        {"inputBuffer", c.inputBuffer},
+        {"splitter", c.splitter}
     };
 }
 
@@ -283,6 +302,9 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     if (j.contains("inputBuffer") && j["inputBuffer"].is_object()) {
         from_json(j["inputBuffer"], c.inputBuffer);
     }
+    if (j.contains("splitter") && j["splitter"].is_object()) {
+        from_json(j["splitter"], c.splitter);
+    }
 }
 
 AppConfig AppConfig::fromEnvironment() {
@@ -305,6 +327,7 @@ AppConfig AppConfig::fromEnvironment() {
     cfg.memory = MemoryConfig{};
     cfg.napcat = NapCatConfig::fromEnvironment();
     cfg.inputBuffer = InputBufferConfig{};
+    cfg.splitter = MessageSplitterConfig{};
 
     return cfg;
 }

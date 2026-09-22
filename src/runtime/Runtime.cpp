@@ -10,9 +10,14 @@
 #include "providers/llm/tool/ToolLoop.h"
 #include "log/Log.h"
 
+#include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <ctime>
+#include <iomanip>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace mio {
@@ -71,6 +76,7 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
         if (!cfg->character.empty()) persona_.character = cfg->character;
         if (!cfg->systemPromptPrefix.empty()) persona_.systemPromptPrefix = cfg->systemPromptPrefix;
         if (!cfg->systemPromptNotice.empty()) persona_.systemPromptNotice = cfg->systemPromptNotice;
+        splitterConfig_ = cfg->splitter;
     }
 
     registerBuiltinTools();
@@ -154,6 +160,10 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
             std::lock_guard<std::mutex> lock(stateMtx_);
             state_.botName = persona_.botName;
         }
+        {
+            std::lock_guard<std::mutex> lock(senderMtx_);
+            splitterConfig_ = newConfig->splitter;
+        }
 
         const std::int64_t now = std::time(nullptr);
         eventLog_.append({0, EventKind::ConfigReloaded, now, "配置热重载: " + configPath.string()});
@@ -176,6 +186,107 @@ std::shared_ptr<ConfigManager> Runtime::configManager() const {
 std::string Runtime::systemPrompt() const {
     std::shared_lock<std::shared_mutex> lock(servicesMtx_);
     return systemPrompt_;
+}
+
+void Runtime::setMessageSender(MessageSender sender) {
+    std::lock_guard<std::mutex> lock(senderMtx_);
+    messageSender_ = std::move(sender);
+}
+
+bool Runtime::hasMessageSender() const {
+    std::lock_guard<std::mutex> lock(senderMtx_);
+    return messageSender_ != nullptr;
+}
+
+namespace {
+
+std::vector<std::string> splitByDelimiter(const std::string& str, const std::string& delimiter) {
+    std::vector<std::string> tokens;
+    if (delimiter.empty()) {
+        std::string s = str;
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+        s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), s.end());
+        if (!s.empty()) tokens.push_back(std::move(s));
+        return tokens;
+    }
+    std::size_t start = 0;
+    std::size_t pos = 0;
+    while ((pos = str.find(delimiter, start)) != std::string::npos) {
+        std::string token = str.substr(start, pos - start);
+        token.erase(token.begin(), std::find_if(token.begin(), token.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+        token.erase(std::find_if(token.rbegin(), token.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), token.end());
+        if (!token.empty()) {
+            tokens.push_back(std::move(token));
+        }
+        start = pos + delimiter.length();
+    }
+    if (start < str.length()) {
+        std::string token = str.substr(start);
+        token.erase(token.begin(), std::find_if(token.begin(), token.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+        token.erase(std::find_if(token.rbegin(), token.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), token.end());
+        if (!token.empty()) {
+            tokens.push_back(std::move(token));
+        }
+    }
+    return tokens;
+}
+
+int calculateDelayMs(const std::string& previousText, const MessageSplitterConfig& cfg) {
+    if (!cfg.enabled) return 0;
+    std::size_t charCount = 0;
+    for (std::size_t i = 0; i < previousText.size(); ) {
+        unsigned char c = static_cast<unsigned char>(previousText[i]);
+        if (c < 0x80) i += 1;
+        else if ((c >> 5) == 0x6) i += 2;
+        else if ((c >> 4) == 0xE) i += 3;
+        else if ((c >> 3) == 0x1E) i += 4;
+        else i += 1;
+        ++charCount;
+    }
+    int delay = cfg.baseDelayMs + static_cast<int>(charCount) * cfg.delayPerCharMs;
+    if (delay > cfg.maxDelayMs) delay = cfg.maxDelayMs;
+    if (delay < 0) delay = 0;
+    return delay;
+}
+
+} // namespace
+
+void Runtime::emit(const ConversationKey& conv, const std::string& senderId, const std::string& rawText) {
+    if (rawText.empty()) return;
+
+    MessageSender sender;
+    MessageSplitterConfig splitter;
+    {
+        std::lock_guard<std::mutex> lock(senderMtx_);
+        sender = messageSender_;
+        splitter = splitterConfig_;
+    }
+    if (!sender) {
+        log::warn("Runtime", "未配置 MessageSender，无法发送平台消息: " + rawText);
+        return;
+    }
+
+    std::vector<std::string> bubbles;
+    if (splitter.enabled && !splitter.delimiter.empty() && rawText.find(splitter.delimiter) != std::string::npos) {
+        bubbles = splitByDelimiter(rawText, splitter.delimiter);
+    } else {
+        std::string s = rawText;
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+        s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), s.end());
+        if (!s.empty()) {
+            bubbles.push_back(std::move(s));
+        }
+    }
+
+    for (std::size_t i = 0; i < bubbles.size(); ++i) {
+        if (i > 0 && splitter.enabled) {
+            int delayMs = calculateDelayMs(bubbles[i - 1], splitter);
+            if (delayMs > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            }
+        }
+        sender(conv, senderId, bubbles[i]);
+    }
 }
 
 void Runtime::registerBuiltinTools() {
@@ -220,52 +331,6 @@ void Runtime::registerBuiltinTools() {
             return "已存入长期记忆库。";
         },
         ToolLayer::Builtin);
-
-    // set_nickname —— 模型纠正对人的称呼（只改称呼，不改身份映射）
-    ToolDef nickDef;
-    nickDef.name = "set_nickname";
-    nickDef.description = "修改你对某个人的称呼昵称。";
-    nickDef.parametersJsonSchema = {
-        {"type", "object"},
-        {"properties",
-         {{"current", {{"type", "string"}, {"description", "当前昵称"}}},
-          {"nickname", {{"type", "string"}, {"description", "新昵称"}}}}},
-        {"required", nlohmann::json::array({"current", "nickname"})}};
-    registry_.add(std::move(nickDef),
-                  [this](const nlohmann::json& args) -> std::string {
-                      if (graph_.setNickname(args.value("current", ""),
-                                             args.value("nickname", ""))) {
-                          const std::int64_t now = std::time(nullptr);
-                          eventLog_.append({0, EventKind::NicknameChanged, now,
-                                            args.value("current", "") + " → " +
-                                                args.value("nickname", "")});
-                          return "已更新昵称。";
-                      }
-                      return "error: 找不到该昵称对应的人。";
-                  }, ToolLayer::Builtin);
-
-    // set_notes —— 模型补充对某个人的印象（personal）
-    ToolDef notesDef;
-    notesDef.name = "set_notes";
-    notesDef.description = "补充/修改你对某个人的印象描述（如喜好、特点）。";
-    notesDef.parametersJsonSchema = {
-        {"type", "object"},
-        {"properties",
-         {{"person", {{"type", "string"}, {"description", "昵称"}}},
-          {"notes", {{"type", "string"}, {"description", "印象描述"}}}}},
-        {"required", nlohmann::json::array({"person", "notes"})}};
-    registry_.add(std::move(notesDef),
-                  [this](const nlohmann::json& args) -> std::string {
-                      if (graph_.setNotes(args.value("person", ""),
-                                          args.value("notes", ""))) {
-                          const std::int64_t now = std::time(nullptr);
-                          eventLog_.append({0, EventKind::NotesChanged, now,
-                                            args.value("person", "") + ": " +
-                                                args.value("notes", "")});
-                          return "已更新印象。";
-                      }
-                      return "error: 找不到该昵称对应的人。";
-                  }, ToolLayer::Builtin);
 
     // set_public —— 模型控制当前上下文是否公开。
     // 直接切换当前 unit 的 isPublic，方便模型表达“这段对话是否适合融合”。
@@ -516,6 +581,129 @@ void Runtime::registerBuiltinTools() {
             return "已选择保持沉默。本轮不会向用户发送任何回复。";
         },
         ToolLayer::Builtin);
+
+    // send_message —— 主动向当前会话（或指定目标）发送消息（支持 [SEP] 拆分为多气泡并模拟打字延迟）
+    ToolDef sendMsgDef;
+    sendMsgDef.name = "send_message";
+    sendMsgDef.description =
+        "向当前会话（或指定目标）发送一条或多条消息。如需分多气泡连发，可在语句间插入 \"[SEP]\" 分段标识。"
+        "可用于耗时工具调用前先行回复告知对方、或分句自然聊天。";
+    sendMsgDef.parametersJsonSchema = {
+        {"type", "object"},
+        {"properties",
+         {{"text",
+           {{"type", "string"},
+            {"description", "要发送的消息文本，支持使用 [SEP] 分段标识分成多气泡"}}},
+          {"target",
+           {{"type", "string"},
+            {"description", "可选，目标用户ID或群号。留空则发送至当前正在对话的会话"}}}}},
+        {"required", nlohmann::json::array({"text"})}};
+    registry_.add(
+        std::move(sendMsgDef),
+        [this](const nlohmann::json& args) -> std::string {
+            const std::string text = args.value("text", "");
+            if (text.empty()) return "error: 发送内容 text 不能为空";
+
+            ConversationKey targetConv = g_activeConv;
+            std::string targetSender = g_activeSenderId;
+
+            if (args.contains("target") && args["target"].is_string()) {
+                std::string target = args["target"].get<std::string>();
+                if (!target.empty() && target != g_activeConv.id && target != g_activeSenderId) {
+                    if (target.rfind("group:", 0) == 0) {
+                        targetConv = ConversationKey::groupChat(target.substr(6));
+                    } else if (target.rfind("private:", 0) == 0) {
+                        targetConv = ConversationKey::privateChat(target.substr(8));
+                    } else {
+                        targetConv = ConversationKey{g_activeConv.scope, target};
+                    }
+                }
+            }
+
+            emit(targetConv, targetSender, text);
+            return "消息发送成功。";
+        },
+        ToolLayer::Builtin);
+
+    // wait —— 模型自主等待指定时长后再继续思考与行动
+    auto createWaitDef = []() {
+        ToolDef d;
+        d.name = "wait";
+        d.description =
+            "让系统等待/暂停指定的时长（秒），等待结束后会再次唤醒你继续思考和采取下一步行动。"
+            "适用于需要稍作停顿再继续发言、给用户留出反应阅读时间、或者先发消息告知对方稍等后再进行查阅思考的场景。";
+        d.parametersJsonSchema = {
+            {"type", "object"},
+            {"properties",
+             {{"seconds",
+               {{"type", "number"},
+                {"description", "需要等待的秒数（支持整数或小数，例如 3 或 5.0，建议 1~30 秒，最大不超过 60 秒）"}}},
+              {"duration",
+               {{"type", "number"},
+                {"description", "同 seconds，需要等待的秒数（备用字段）"}}},
+              {"reason",
+               {{"type", "string"},
+                {"description", "等待的原因或打算下一步做的事情（可选）"}}}}},
+            {"required", nlohmann::json::array({"seconds"})}};
+        return d;
+    };
+
+    auto waitHandler = [](const nlohmann::json& args) -> std::string {
+        double seconds = 0.0;
+        auto parseSec = [&](const nlohmann::json& val) -> bool {
+            if (val.is_number()) {
+                seconds = val.get<double>();
+                return true;
+            }
+            if (val.is_string()) {
+                try {
+                    seconds = std::stod(val.get<std::string>());
+                    return true;
+                } catch (...) {}
+            }
+            return false;
+        };
+
+        if (args.contains("seconds")) {
+            parseSec(args["seconds"]);
+        } else if (args.contains("duration")) {
+            parseSec(args["duration"]);
+        }
+
+        if (seconds < 0.1) {
+            seconds = 0.5;
+        } else if (seconds > 60.0) {
+            seconds = 60.0;
+        }
+
+        std::string reason = args.value("reason", "");
+        log::info("Runtime",
+                  "模型调用 wait: 等待 " + std::to_string(seconds) + " 秒" +
+                      (reason.empty() ? "" : (", 理由=" + reason)));
+
+        const int totalMs = static_cast<int>(seconds * 1000.0);
+        constexpr int sliceMs = 100;
+        int elapsedMs = 0;
+        while (elapsedMs < totalMs) {
+            int curSlice = std::min(sliceMs, totalMs - elapsedMs);
+            std::this_thread::sleep_for(std::chrono::milliseconds(curSlice));
+            elapsedMs += curSlice;
+        }
+
+        std::ostringstream oss;
+        oss << "已等待 " << std::fixed << std::setprecision(1) << seconds
+            << " 秒。等待已结束，当前时间：" << nowTimeString()
+            << "。你可以继续思考并决定是否调用工具或向用户发送消息。";
+        return oss.str();
+    };
+
+    ToolDef waitDef = createWaitDef();
+    registry_.add(std::move(waitDef), waitHandler, ToolLayer::Builtin);
+
+    ToolDef sleepDef = createWaitDef();
+    sleepDef.name = "sleep";
+    sleepDef.description = "同 wait，等待指定时长后再次继续思考和行动。";
+    registry_.add(std::move(sleepDef), waitHandler, ToolLayer::Builtin);
 }
 
 std::string Runtime::rebuildSystemPrompt(
@@ -681,6 +869,8 @@ BotReply Runtime::ingest(IncomingMessage message) {
     if (g_activeKeepSilent) {
         log::info("Runtime", "模型自主调用 keepsilent 保持沉默，本轮不发送回复消息");
         resp.text = "";
+    } else if (!resp.text.empty() && hasMessageSender()) {
+        emit(batch.conversation, targetMsg.senderId, resp.text);
     }
 
     return BotReply{batch.conversation, resp.text};

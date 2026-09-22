@@ -232,7 +232,7 @@ bool sendReply(const std::shared_ptr<ix::WebSocket>& ws, PendingActions& pending
         params["group_id"] = idToJson(conversation.id);
     } else {
         params["message_type"] = "private";
-        params["user_id"] = idToJson(senderId);
+        params["user_id"] = idToJson(!senderId.empty() ? senderId : conversation.id);
     }
     return callAction(ws, pending, "send_msg", std::move(params));
 }
@@ -272,13 +272,7 @@ void workerLoop(Runtime& runtime, NapCatConnection& conn, PendingActions& pendin
             try {
                 const BotReply reply = runtime.ingest(std::move(message));
                 if (!reply.text.empty()) {
-                    std::shared_ptr<ix::WebSocket> ws;
-                    {
-                        std::lock_guard<std::mutex> connLock(conn.mtx);
-                        ws = conn.current;
-                    }
-                    if (sendReply(ws, pending, conversation, senderId, reply.text))
-                        log::info(kTag, "已回复 → " + conversation.toString());
+                    log::info(kTag, "已回复 → " + conversation.toString());
                 }
             } catch (const std::exception& error) {
                 log::error(kTag, std::string("处理消息失败: ") + error.what());
@@ -311,6 +305,18 @@ void runNapCat(Runtime& runtime, const NapCatConfig& config) {
     std::mutex queueMtx;
     std::condition_variable queueCv;
     std::atomic<bool> running{true};
+
+    runtime.setMessageSender([&conn, &pending](const ConversationKey& conv,
+                                              const std::string& senderId,
+                                              const std::string& text) -> bool {
+        std::shared_ptr<ix::WebSocket> ws;
+        {
+            std::lock_guard<std::mutex> connLock(conn.mtx);
+            ws = conn.current;
+        }
+        if (!ws) return false;
+        return sendReply(ws, pending, conv, senderId, text);
+    });
 
     std::thread worker(workerLoop, std::ref(runtime), std::ref(conn),
                        std::ref(pending), std::ref(queue), std::ref(queueMtx),

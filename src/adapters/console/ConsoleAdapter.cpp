@@ -105,6 +105,12 @@ bool parseMessage(const std::string& input, IncomingMessage& message) {
 } // namespace
 
 void runConsole(Runtime& runtime, std::istream& input, std::ostream& output) {
+    runtime.setMessageSender([&output](const ConversationKey& conv, const std::string& /*senderId*/, const std::string& text) -> bool {
+        output << "[" << conv.toString() << "] " << text << "\n";
+        output.flush();
+        return true;
+    });
+
     printHelp(output);
 
     std::string line;
@@ -138,8 +144,6 @@ void runConsole(Runtime& runtime, std::istream& input, std::ostream& output) {
                     const BotReply reply = runtime.ingest(std::move(message));
                     if (reply.text.empty()) {
                         output << "[" << reply.conversation.toString() << "] (保持沉默/已读不回)\n";
-                    } else {
-                        output << "[" << reply.conversation.toString() << "] " << reply.text << "\n";
                     }
                 } catch (const std::exception& error) {
                     output << "[LLM error] " << error.what() << "\n";

@@ -15,9 +15,10 @@
 //            SQLite BLOB 落库；召回 = SQL 权限预过滤 + SIMD 点积 + 时间
 //            衰减 → 由模型通过 recall_memory 工具主动调用）
 //
-// 工具：get_current_time / remember / set_nickname / set_notes /
+// 工具：get_current_time / remember / recall_memory（长期记忆召回）/
 //       set_public（模型控制当前上下文公开/私密）/ update_topic（话题上报）/
-//       recall_memory（长期记忆召回）/ get_current_user_qq / get_known_person_qq
+//       get_current_user_qq / get_known_person_qq /
+//       keepsilent / send_message / wait（等待并再次开始思考）
 //
 // 严格模块边界：Achieve 只存/读，Router 只路由/融合，Builder 只构建/压缩，
 // 记忆系统只写库/召回（归属与注入时机由 Runtime 组装层决定）。
@@ -43,6 +44,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -102,6 +104,14 @@ public:
     InputBufferManager& inputBuffers() { return inputBuffers_; }
     const InputBufferManager& inputBuffers() const { return inputBuffers_; }
 
+    // 平台消息发送与分段调度
+    using MessageSender = std::function<bool(const ConversationKey& conversation,
+                                             const std::string& senderId,
+                                             const std::string& text)>;
+    void setMessageSender(MessageSender sender);
+    bool hasMessageSender() const;
+    void emit(const ConversationKey& conv, const std::string& senderId, const std::string& rawText);
+
 private:
     // Facts 渲染（冷启动/重新冷启动后/图谱变化时重建）
     std::string rebuildSystemPrompt(
@@ -143,6 +153,10 @@ private:
     mutable std::mutex stateMtx_;
     InputBufferManager inputBuffers_;
     std::unique_ptr<AdminServer> adminServer_;
+
+    MessageSender messageSender_;
+    mutable std::mutex senderMtx_;
+    MessageSplitterConfig splitterConfig_;
 };
 
 } // namespace mio
