@@ -113,6 +113,18 @@ void FusionUnit::append(Msg msg) {
     fusion_.context.push_back(std::move(msg));
 }
 
+void FusionUnit::stripEphemeralParts() {
+    for (auto& msg : fusion_.context) {
+        if (msg.parts.empty()) continue;
+        msg.parts.erase(
+            std::remove_if(msg.parts.begin(), msg.parts.end(),
+                           [](const Part& p) {
+                               return p.ephemeral || p.kind == Part::Kind::Image;
+                           }),
+            msg.parts.end());
+    }
+}
+
 void FusionUnit::reColdStart(SummaryManager& summaryManager) {
     CompressResult r =
         compress(summaryManager, fusion_.context, kSummaryCount, kRawKeep);

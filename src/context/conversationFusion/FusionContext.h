@@ -51,6 +51,10 @@ public:
 
     void append(Msg msg);  // 追加上下文
 
+    // 剥离已完结回合中的临时片段（如图片 base64、临时注入的 ephemeral part），
+    // 避免在多轮对话中向视觉模型重复上送历史图片造成冻结，并防止内存与上下文膨胀
+    void stripEphemeralParts();
+
     // 重新冷启动（contextBuilder 触发）：压缩自身为 [摘要前20 + 近5原文]
     void reColdStart(SummaryManager& summaryManager);
 

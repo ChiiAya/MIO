@@ -98,10 +98,13 @@ void appendMediaAttachment(OneBotEvent& ev, const OneBotMessageSegment& seg) {
     if (a.sizeBytes <= 0) a.sizeBytes = int64Value(d.value("size", nlohmann::json()));
     a.durationSec = int64Value(d.value("duration", nlohmann::json()));
 
-    // NapCat 与 MIO 同机部署时，file/path 常是可直接读取的绝对路径；
+    // NapCat 与 MIO 同机部署时，file/path 常是可直接读取的绝对路径（或 file:/// 协议路径）；
     // 远程部署时这里为空，只能靠 url（或后续再走 OneBot 文件接口）。
     for (const char* key : {"path", "file"}) {
-        const std::string value = stringValue(d, key);
+        std::string value = stringValue(d, key);
+        if (value.rfind("file://", 0) == 0) {
+            value = value.substr(7);
+        }
         if (!value.empty() && value[0] == '/') {
             a.localPath = value;
             break;

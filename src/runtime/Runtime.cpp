@@ -835,6 +835,15 @@ BotReply Runtime::ingest(IncomingMessage message) {
         // 上下文级锁：同 unit 串行（含 LLM 往返），跨 unit 并行
         std::lock_guard<std::mutex> lock(unit->mtx);
 
+        // RAII 保护：无论本轮正常收尾还是异常退出，当轮结束后立即剥离 unit 上下文中的临时/图片片段，
+        // 避免历史多模态数据在后续轮次累加并导致模型注意力与视觉输入冻结
+        struct EphemeralCleaner {
+            FusionUnit* u;
+            ~EphemeralCleaner() {
+                if (u) u->stripEphemeralParts();
+            }
+        } cleaner{unit};
+
         // 4) 批次内所有原始消息分别落入物理会话的真实档案
         for (const auto& raw : batch.rawMessages) {
             Msg rawTurn{Role::User};
