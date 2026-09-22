@@ -10,6 +10,7 @@
 // ============================================================================
 
 #include "core/conversation/Conversation.h"
+#include "core/message/Message.h"
 
 #include <cstdint>
 #include <optional>
@@ -20,6 +21,27 @@
 
 namespace mio {
 
+// 平台媒体类型（QQ 图片/语音/视频/文件；其它平台可复用）
+enum class MediaKind {
+    Image,
+    Audio,
+    Video,
+    File,
+};
+
+// 适配器解析出的媒体元数据：只描述"这条消息带了什么"，不做下载/转码。
+// 真正的落盘、ASR、base64 化由各平台适配器的 MediaResolver 负责。
+struct MediaAttachment {
+    MediaKind kind = MediaKind::File;
+    std::string url;        // 平台提供的外链（可能带时效签名）
+    std::string localPath;  // 平台给出的本地绝对路径（同机部署时可直接读）
+    std::string fileId;     // 平台文件 id（可用于后续 get_record 之类的回查）
+    std::string fileName;   // 原始文件名
+    std::string mimeType;   // 已知时填写，未知由后缀推断
+    std::int64_t sizeBytes = 0;
+    std::int64_t durationSec = 0; // 语音/视频时长
+};
+
 // 适配器传入的原始消息（平台层视角）；Runtime 把它转成 Msg 落入会话档案
 struct IncomingMessage {
     ConversationKey conversation;
@@ -29,6 +51,10 @@ struct IncomingMessage {
     std::string text;
     std::string platform;  // 平台标识（"qq"/"wechat"/"console"…），上下文身份用
     std::vector<std::string> atUserIds; // 消息中 @ 提及的用户 ID 列表
+    std::vector<MediaAttachment> attachments; // 媒体段元数据（解析层产出）
+    // 已解析好的多模态内容（如图片的 data-uri），随 Msg.parts 进入 wire 层；
+    // 由平台适配器填充，Runtime/InputBuffer 只做透传。
+    std::vector<Part> parts;
 };
 
 enum class EventKind {

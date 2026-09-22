@@ -95,7 +95,32 @@
   "napcat": {
     "listenHost": "0.0.0.0", // 反向 WS 服务端监听地址
     "listenPort": 8082,      // 反向 WS 监听端口
-    "token": ""              // OneBot 鉴权 Token
+    "token": "",             // OneBot 鉴权 Token
+
+    // 【入站媒体处理】图片走视觉模型；语音可走 ASR 转写；
+    // 视频/文件默认只缓存不解析。文件缓存在 data/media/（已被 gitignore）
+    "media": {
+      "enabled": true,          // 总开关：false 时富媒体只保留 [图片]/[语音] 文本标记
+      "images": true,           // 图片 -> base64 data-uri 送视觉模型（纯文本模型请设为 false）
+      "audio": true,            // 语音 -> 缓存到本地；配了下面的 asr 则追加转写文本
+      "video": false,           // 视频 -> 缓存 + 路径提示（不解析内容）
+      "files": false,           // 文件 -> 缓存 + 路径提示（不解析内容）
+      "persistImages": false,   // true = 图片 base64 也写进历史档案（体积会明显变大）
+      "maxFileBytes": 8388608,  // 单文件上限 8MB（下载与读取共用）
+      "downloadTimeoutMs": 15000,
+      "cacheDir": "data/media", // 远程附件下载后的缓存目录
+
+      // 语音识别：OpenAI /v1/audio/transcriptions 兼容端点
+      // （Whisper / SenseVoice / 云厂商；未启用时语音只缓存不转写）
+      "asr": {
+        "enabled": false,
+        "baseUrl": "",          // 留空则回退到 llm 的 baseUrl
+        "apiKey": "",
+        "model": "whisper-1",
+        "language": "zh",       // 留空 = 自动识别
+        "httpTimeoutMs": 60000
+      }
+    }
   },
 
   // 【9. 消息分段与拟人打字延时配置 (MessageSplitterConfig)】
@@ -106,6 +131,29 @@
     "baseDelayMs": 400,      // 基础等待时间 (毫秒)
     "delayPerCharMs": 25,    // 每字符打字模拟延时 (毫秒)
     "maxDelayMs": 2000       // 单次最大延时上限 (毫秒)
+  },
+
+  // 【10. MCP (Model Context Protocol) 外部动态工具扩展配置 (McpConfig)】
+  // 支持在运行时动态挂载外部生态的 MCP Servers（如文件读写、网络搜索、天气、代码沙箱等）
+  "mcp": {
+    "enabled": true,               // 全局开关：是否启用 MCP 动态工具扩展
+    "defaultTimeoutMs": 30000,      // 全局默认请求超时 (毫秒)
+    "servers": {
+      // 示例 1: 本地 Python 版测试 MCP Server
+      "mock": {
+        "command": "python3",
+        "args": ["scripts/mock_mcp_server.py"],
+        "enabled": false,
+        "toolPrefix": "mock_",     // 工具名前缀，避免与系统核心工具冲突（可选）
+        "timeoutMs": 10000
+      }
+      // 示例 2: 官方文件系统 MCP Server (需本地安装 Node.js/npx)
+      // "filesystem": {
+      //   "command": "npx",
+      //   "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      //   "enabled": true,
+      //   "toolPrefix": "fs_"
+      // }
+    }
   }
 }
-

@@ -6,6 +6,7 @@
 #include "context/contextBuilder/ContextBuilder.h"
 #include "context/conversationFusion/FusionRouter.h"
 #include "context/inputBuffer/inputBuffer.h"
+#include "config/mcp/McpConfig.h"
 #include "memory/manager/MemoryManager.h"
 
 #include <nlohmann/json.hpp>
@@ -45,6 +46,7 @@ struct AppConfig {
     NapCatConfig napcat;
     InputBufferConfig inputBuffer;
     MessageSplitterConfig splitter;
+    mcp::McpConfig mcp;
 
     static AppConfig fromEnvironment();
 };

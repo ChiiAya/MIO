@@ -8,6 +8,7 @@
 #include "providers/llm/openai/OpenAiCompat.h"
 #include "providers/embedding/openai/OpenAiEmbedding.h"
 #include "providers/llm/tool/ToolLoop.h"
+#include "providers/mcp/McpManager.h"
 #include "log/Log.h"
 
 #include <algorithm>
@@ -81,6 +82,13 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
 
     registerBuiltinTools();
 
+    // MCP 动态扩展工具接入
+    mcpManager_ = std::make_unique<mcp::McpManager>();
+    if (configMgr_ && configMgr_->get()) {
+        mcpManager_->initialize(configMgr_->get()->mcp);
+        mcpManager_->syncTools(registry_);
+    }
+
     // MIO 也是 person（统一图谱结构；隐私差异化靠装配/检索时隐藏数据）
     graph_.ensureMio(persona_.botName);
 
@@ -106,6 +114,10 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
               std::shared_ptr<Llm>(std::move(llm))) {}
 
 Runtime::~Runtime() {
+    if (mcpManager_) {
+        mcpManager_->stop();
+        mcpManager_.reset();
+    }
     if (adminServer_) {
         adminServer_->stop();
         adminServer_.reset();
@@ -131,8 +143,11 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
         newSummary->setOnSummary([this](const SummaryOutcome& o) { onSummaryProduced(o); });
         auto newBuilder = std::make_shared<ContextBuilder>(newConfig->contextBuilder, newSummary);
 
-        // 重载时清理动态工具
+        // 重载时清理动态工具并重新热加载 MCP 服务
         registry_.clearDynamicTools();
+        if (mcpManager_) {
+            mcpManager_->reload(newConfig->mcp, registry_);
+        }
 
         // 原子切换服务指针与更新提示词
         {
@@ -824,6 +839,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
         for (const auto& raw : batch.rawMessages) {
             Msg rawTurn{Role::User};
             rawTurn.text = raw.text;
+            rawTurn.parts = raw.parts;  // 图片等多模态片段随原始消息落档案
             rawTurn.createdAt = now;
             rawTurn.senderId = raw.senderId;
             rawTurn.senderName = router_.displayName(raw);

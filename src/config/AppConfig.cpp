@@ -206,7 +206,8 @@ void to_json(nlohmann::json& j, const NapCatConfig& c) {
     j = nlohmann::json{
         {"listenHost", c.listenHost},
         {"listenPort", c.listenPort},
-        {"token", c.token}
+        {"token", c.token},
+        {"media", c.media}
     };
 }
 
@@ -214,6 +215,7 @@ void from_json(const nlohmann::json& j, NapCatConfig& c) {
     readIfExists(j, "listenHost", c.listenHost);
     readIfExists(j, "listenPort", c.listenPort);
     readIfExists(j, "token", c.token);
+    readIfExists(j, "media", c.media);
 }
 
 void to_json(nlohmann::json& j, const InputBufferConfig& c) {
@@ -267,7 +269,8 @@ void to_json(nlohmann::json& j, const AppConfig& c) {
         {"memory", c.memory},
         {"napcat", c.napcat},
         {"inputBuffer", c.inputBuffer},
-        {"splitter", c.splitter}
+        {"splitter", c.splitter},
+        {"mcp", c.mcp}
     };
 }
 
@@ -305,6 +308,9 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     if (j.contains("splitter") && j["splitter"].is_object()) {
         from_json(j["splitter"], c.splitter);
     }
+    if (j.contains("mcp") && j["mcp"].is_object()) {
+        from_json(j["mcp"], c.mcp);
+    }
 }
 
 AppConfig AppConfig::fromEnvironment() {
@@ -333,4 +339,3 @@ AppConfig AppConfig::fromEnvironment() {
 }
 
 } // namespace mio
-

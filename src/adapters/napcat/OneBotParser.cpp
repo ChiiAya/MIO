@@ -59,9 +59,9 @@ std::string segmentText(const nlohmann::json& seg) {
         const std::string qq = idToString(data.value("qq", nlohmann::json()));
         return qq == "all" ? "@全体成员" : "@" + qq;
     }
-    // IncomingMessage is text-only today; retain a readable marker for rich
-    // segments so image/file/voice messages are not silently discarded when
-    // they also carry no caption text.
+    // 富媒体段：文本侧保留可读标记（保证纯媒体消息也有正文），
+    // 结构化的 url/path/时长等由 appendMediaAttachment 另存，
+    // 交给适配器 MediaResolver 决定是送视觉模型、ASR 还是仅缓存。
     if (type == "image") return "[图片]";
     if (type == "record") return "[语音]";
     if (type == "video") return "[视频]";
@@ -69,6 +69,46 @@ std::string segmentText(const nlohmann::json& seg) {
     if (type == "face" || type == "mface") return "[表情]";
     if (type == "reply") return "[回复]";
     return "";
+}
+
+// image/record/video/file 段 -> 结构化媒体元数据（只解析，不下载）
+void appendMediaAttachment(OneBotEvent& ev, const OneBotMessageSegment& seg) {
+    MediaAttachment a;
+    if (seg.type == "image") {
+        a.kind = MediaKind::Image;
+    } else if (seg.type == "record") {
+        a.kind = MediaKind::Audio;
+    } else if (seg.type == "video") {
+        a.kind = MediaKind::Video;
+    } else if (seg.type == "file") {
+        a.kind = MediaKind::File;
+    } else {
+        return;
+    }
+
+    const nlohmann::json& d = seg.data;
+    a.url = stringValue(d, "url");
+    a.fileId = stringValue(d, "file_id");
+    a.fileName = stringValue(d, "file_name");
+    if (a.fileName.empty()) a.fileName = stringValue(d, "name");
+    if (a.fileName.empty()) a.fileName = stringValue(d, "file");
+    a.mimeType = stringValue(d, "mime_type");
+    if (a.mimeType.empty()) a.mimeType = stringValue(d, "mime");
+    a.sizeBytes = int64Value(d.value("file_size", nlohmann::json()));
+    if (a.sizeBytes <= 0) a.sizeBytes = int64Value(d.value("size", nlohmann::json()));
+    a.durationSec = int64Value(d.value("duration", nlohmann::json()));
+
+    // NapCat 与 MIO 同机部署时，file/path 常是可直接读取的绝对路径；
+    // 远程部署时这里为空，只能靠 url（或后续再走 OneBot 文件接口）。
+    for (const char* key : {"path", "file"}) {
+        const std::string value = stringValue(d, key);
+        if (!value.empty() && value[0] == '/') {
+            a.localPath = value;
+            break;
+        }
+    }
+
+    ev.attachments.push_back(std::move(a));
 }
 
 OneBotPostType postTypeFromString(const std::string& s) {
@@ -144,6 +184,7 @@ OneBotEvent parseOneBotEvent(const nlohmann::json& raw) {
                     s.data = *dataIt;
                 else
                     s.data = nlohmann::json::object();
+                appendMediaAttachment(ev, s);
                 ev.segments.push_back(s);
                 ev.text += segmentText(seg);
             }
@@ -196,8 +237,7 @@ OneBotEvent parseOneBotEvent(const nlohmann::json& raw) {
 std::optional<IncomingMessage> eventToIncomingMessage(const OneBotEvent& ev) {
     if (!ev.isMessageEvent) return std::nullopt;
     if (ev.userId.empty() || ev.userId == ev.selfId) return std::nullopt;
-    // Runtime::IncomingMessage is text-only; rich segments are represented by
-    // readable markers by segmentText so they are not silently lost.
+    // 富媒体消息至少会有 [图片]/[语音] 之类的标记，不会在这里被丢弃
     if (ev.text.empty()) return std::nullopt;
 
     IncomingMessage msg;
@@ -216,6 +256,7 @@ std::optional<IncomingMessage> eventToIncomingMessage(const OneBotEvent& ev) {
     msg.senderName = !ev.sender.card.empty() ? ev.sender.card : ev.sender.nickname;
     msg.text = ev.text;
     msg.platform = "qq";
+    msg.attachments = ev.attachments;
 
     // 提取 @ 提及的 QQ 号列表
     for (const auto& seg : ev.segments) {
