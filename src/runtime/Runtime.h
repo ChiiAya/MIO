@@ -11,18 +11,15 @@
 //      ├─► ContextBuilder（信息 → ChatRequest；上下文不够 → 重新冷启动）
 //      ├─► RelationshipGraph（身份/熟悉度/信任度）
 //      ├─► EventLog（程序事件审计，只写不读）
-//      └─► MemoryStore/MemoryManager（长期记忆：摘要 → BGE-M3 向量 →
-//            SQLite BLOB 落库；召回 = SQL 权限预过滤 + SIMD 点积 + 时间
-//            衰减 → 由模型通过 recall_memory 工具主动调用）
+//      └─► 长期记忆改由 MCP 提供（如 graphiti_*），Runtime 不再内置记忆库
 //
-// 工具：get_current_time / remember / recall_memory（长期记忆召回）/
-//       set_public（模型控制当前上下文公开/私密）/ update_topic（话题上报）/
-//       get_current_user_qq / list_contacts / upsert_contact / set_notes
+// 工具：get_current_time / set_public（模型控制当前上下文公开/私密）/
+//       update_topic（话题上报）/ get_current_user_qq /
+//       list_contacts / upsert_contact / set_notes
 //       （通讯录；set_nickname 已停用，upsert_contact 也不会覆盖已有称呼）/
 //       keepsilent / send_message / wait（等待并再次开始思考）
 //
-// 严格模块边界：Achieve 只存/读，Router 只路由/融合，Builder 只构建/压缩，
-// 记忆系统只写库/召回（归属与注入时机由 Runtime 组装层决定）。
+// 严格模块边界：Achieve 只存/读，Router 只路由/融合，Builder 只构建/压缩。
 // ============================================================================
 
 #include "config/AppConfig.h"
@@ -38,7 +35,6 @@
 #include "providers/embedding/Embedding.h"
 #include "providers/llm/Llm.h"
 #include "providers/llm/tool/ToolRegistry.h"
-#include "memory/manager/MemoryManager.h"
 #include "mind/facts/Facts.h"
 #include "mind/graph/RelationshipGraph.h"
 
@@ -130,8 +126,8 @@ public:
                          std::vector<DiaryEntry> cognition = {});
 
     // 维护回合：按 prompt 对"当天有活动的每个会话"各跑一次**隐藏** LLM 回合。
-    // 模型可以调用 remember 等工具，但绝不会向平台发送消息，也不会写进
-    // 真实会话历史/档案（只在上下文副本上工作）。
+    // 模型可以调用记忆写入等副作用工具（长期记忆由 MCP 提供），但绝不会向平台
+    // 发送消息，也不会写进真实会话历史/档案（只在上下文副本上工作）。
     void runMaintenancePrompt(const std::string& prompt);
 
 private:
@@ -143,14 +139,6 @@ private:
     void noteMessage(const ConversationKey& conversation,
                      const std::string& senderId);
 
-    // ---- 记忆系统（SELECT & RECALL，见 memory/MemoryManager.h）----
-    // 归属解析：私聊 → 对话者 internalId（私密记忆跨会话跟随本人）；
-    // 群聊 → 空串（无单一归属人，记忆按 conv_key 会话共享）
-    std::string resolveMemoryPerson(const IncomingMessage& msg) const;
-    // 摘要产出 sink（SummaryManager 咽喉点）→ 写入流程：向量化 → BLOB → INSERT。
-    // 会话/归属取 thread_local 上下文（sink 在 route 内部同步触发）
-    void onSummaryProduced(const SummaryOutcome& outcome);
-
     // 声明顺序 = 构造顺序；保证成员依赖生命周期正确
     Persona persona_;
     RelationshipGraph graph_;     // 关系图谱（身份/熟悉度/信任度）
@@ -161,12 +149,10 @@ private:
     std::shared_ptr<ConfigManager> configMgr_;
     std::shared_ptr<Llm> llm_;
     std::shared_ptr<Embedding> embedding_;  // 向量化（记忆写入/召回 + Router 话题匹配共用）
-    std::shared_ptr<SummaryManager> summary_;      // 摘要器（引用 llm_；产出 sink 接到 memory_）
+    std::shared_ptr<SummaryManager> summary_;      // 摘要器（引用 llm_；供上下文压缩/融合使用）
     std::shared_ptr<ContextBuilder> builder_;      // 上下文构建 + 重新冷启动
     mutable std::shared_mutex servicesMtx_;        // 保护以上 4 个服务指针的热切换
 
-    MemoryStore memoryStore_;     // SQLite BLOB 向量仓库（data/memory.db）
-    MemoryManager memory_;        // 记忆编排：写入/召回（引用 embedding_/memoryStore_）
     FusionRouter router_;         // fusion 即路由（话题语义匹配用 embedding_）
     ToolRegistry registry_;
 

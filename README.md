@@ -211,11 +211,13 @@ MIO 提供基础的 Agent 执行闭环与保护护栏：
 
 #### 🔧 内置工具列表
 
+> 长期记忆（存取/召回）已从内置模块迁出，改由 MCP 提供（如 `graphiti_add_memory`
+> / `graphiti_search_memory_facts` / `graphiti_search_nodes`）；下表中的 `remember`
+> / `recall_memory` 已随内置记忆系统一并移除。
+
 | 工具名称 | 参数 | 职责说明 |
 |---|---|---|
 | `get_current_time` | `{}` | 获取当前本地时间（精确到分钟），避免在 System 中写死时间 |
-| `remember` | `{"text": string, "is_public"?: bool}` | 将具有长期价值的重要事实或约定存入长期记忆库 |
-| `recall_memory` | `{"query": string, "top_k"?: int}` | 面对旧事或历史背景时，主动发起记忆检索 |
 | `set_nickname` | `{"current": string, "nickname": string}` | **已停用**（模型改称呼会造成混乱，代码保留注释以便恢复） |
 | `set_notes` | `{"person": string, "notes": string}` | 补充对某人的特点、喜好或印象描述 |
 | `set_public` | `{"is_public": bool, "reason": string}` | 模型根据对话敏感程度，标记当前上下文是否允许融合 |
@@ -239,9 +241,9 @@ MIO 提供基础的 Agent 执行闭环与保护护栏：
 | `tasks[].prompt` | `action=prompt` 时的提示文本 |
 
 `refresh_facts` 是 Facts 的常规刷新边界（另外两个边界是配置重载与重新冷启动）。
-`prompt` 会对"当天有活动的每个会话"各跑一次**隐藏回合**：模型可以调用 `remember`
-把当天的经历写进长期记忆，但 `send_message` 会被拒绝、输出不落档案、也不污染真实
-会话历史（只在上下文副本上工作）。日志里 `systemPrompt 重建` 一行带 `fp` 指纹，
+`prompt` 会对"当天有活动的每个会话"各跑一次**隐藏回合**：模型可以调用长期记忆写入
+工具（长期记忆由 MCP 提供，如 `graphiti_add_memory`）把当天的经历写进记忆，但
+`send_message` 会被拒绝、输出不落档案、也不污染真实会话历史（只在上下文副本上工作）。日志里 `systemPrompt 重建` 一行带 `fp` 指纹，
 `fp` 不变就说明缓存前缀没被打断。示例见 `config.example.json` 第 11 节。
 
 ---
