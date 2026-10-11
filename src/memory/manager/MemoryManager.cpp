@@ -34,11 +34,7 @@ std::string formatDate(std::int64_t epochSeconds) {
 #ifdef _WIN32
     localtime_s(&tmBuf, &t);
 #else
-#ifdef _WIN32
-    localtime_s(&tmBuf, &t);
-#else
     localtime_r(&t, &tmBuf);
-#endif
 #endif
     char buf[16];
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tmBuf.tm_year + 1900,

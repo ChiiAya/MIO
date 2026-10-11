@@ -162,6 +162,26 @@ bool retryableHttp(long code) {
     return code == 408 || code == 429 || (code >= 500 && code <= 599);
 }
 
+bool hasImageParts(const ChatRequest& req) {
+    for (const auto& m : req.messages)
+        for (const auto& p : m.parts)
+            if (p.kind == Part::Kind::Image) return true;
+    return false;
+}
+
+// 去掉图片片段的副本：端点不支持多模态时的降级形态。
+// 只在真正降级时才调用，避免 happy path 白拷贝一次大消息体。
+ChatRequest withoutImageParts(const ChatRequest& req) {
+    ChatRequest out = req;
+    for (auto& m : out.messages) {
+        m.parts.erase(
+            std::remove_if(m.parts.begin(), m.parts.end(),
+                           [](const Part& p) { return p.kind == Part::Kind::Image; }),
+            m.parts.end());
+    }
+    return out;
+}
+
 std::string bodySnippet(const std::string& body, std::size_t max = 400) {
     return cutUtf8(body, max); // cutUtf8 见 context/costEstimator/Tokens.h，防中文截半截变乱码
 }
@@ -207,15 +227,22 @@ void OpenAiCompat::normalizeQuirks(nlohmann::json& p) const {
 
 ChatResponse OpenAiCompat::chat(const ChatRequest& req) {
     const std::string endpoint = resolveChatEndpoint(cfg_.baseUrl);
-    nlohmann::json payload = buildPayload(req);
+    const bool multiModal = hasImageParts(req);
+    const ChatRequest* activeReq = &req;         // 当前实际发送的请求（可能已降级）
+    std::optional<ChatRequest> textOnlyReq;      // 仅在降级时构造
+    nlohmann::json payload = buildPayload(*activeReq);
 
     const int maxAttempts = cfg_.maxRetries + 1;
+    // 纯文本降级只允许一次，且不占用瞬时故障的重试预算
+    int degradeBudget = multiModal ? 1 : 0;
     long lastStatus = 0;
     std::string lastBody;
     cpr::Error lastErr{};
 
-    for (int attempt = 0; attempt < maxAttempts; ++attempt) {
-        if (attempt > 0) {
+    int attempt = 0;       // 已消耗的重试次数
+    bool backoff = false;  // 下次发送前是否需要指数退避
+    while (attempt < maxAttempts) {
+        if (backoff) {
             // 指数退避 + 上限保护；真实限流场景下首退避要给足（>=1s）
             double delayMs =
                 std::min<double>(cfg_.retryInitialDelayMs *
@@ -223,7 +250,8 @@ ChatResponse OpenAiCompat::chat(const ChatRequest& req) {
                                  30'000.0);
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(static_cast<long long>(delayMs)));
-            payload = buildPayload(req); // 重试保留原始多模态内容
+            payload = buildPayload(*activeReq); // 重试保留原始多模态内容
+            backoff = false;
         }
 
         cpr::Response r = cpr::Post(
@@ -251,10 +279,26 @@ ChatResponse OpenAiCompat::chat(const ChatRequest& req) {
             const std::string why =
                 transportFailed ? r.error.message
                                 : "HTTP " + std::to_string(r.status_code);
+            ++attempt;
+            backoff = true;
             log::warn("OpenAiCompat", "请求失败(" + why +
-                          ")，将进行第 " + std::to_string(attempt + 2) + " 次尝试");
+                          ")，将进行第 " + std::to_string(attempt + 1) + " 次尝试");
             // 瞬时网络/限流/服务端故障不表示模型不支持视觉，重试保留图片。
             continue; // 再试
+        }
+
+        // 不可重试的 4xx：最常见的原因是端点/模型不支持多模态。
+        // 降级为纯文本立刻再试一次，避免整轮对话失败、图片永远滞留在
+        // 待处理状态；这次降级不计入上面的重试预算。
+        if (degradeBudget > 0) {
+            --degradeBudget;
+            textOnlyReq = withoutImageParts(req);
+            activeReq = &*textOnlyReq;
+            payload = buildPayload(*activeReq);
+            log::warn("OpenAiCompat",
+                      "多模态请求被端点拒绝(HTTP " + std::to_string(r.status_code) +
+                          ")，降级为纯文本重试（图片退化为 [图片] 文本标记）");
+            continue;
         }
         break; // 4xx 业务错误：立刻失败，把服务端的话带给调用者
     }

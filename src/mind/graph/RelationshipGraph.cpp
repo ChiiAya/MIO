@@ -142,7 +142,7 @@ SeenResult RelationshipGraph::onSeen(const std::string& platform,
         RelationshipEdge* e = ensureEdge(mioId_, n->internalId);
         e->intimacy =
             std::min(1.0, decayed(e->intimacy, prevLast, now) + 0.1);
-        save();
+        savePassive();
         return result;
     }
 
@@ -161,7 +161,7 @@ SeenResult RelationshipGraph::onSeen(const std::string& platform,
 
     result.firstEncounter = true;
     result.internalId = id;
-    save();
+    savePassive();
     return result;
 }
 
@@ -412,7 +412,7 @@ void RelationshipGraph::bumpIntimacy(const std::string& a,
     const std::int64_t last =
         std::max(na ? na->lastSeenAt : 0, nb ? nb->lastSeenAt : 0);
     e->intimacy = std::min(1.0, decayed(e->intimacy, last, now) + delta);
-    save();
+    savePassive();
 }
 
 double RelationshipGraph::intimacy(const std::string& a,
@@ -564,6 +564,15 @@ void RelationshipGraph::save() {
     out << j.dump() << '\n';
     out.flush();
     if (!out) throw std::runtime_error("无法保存通讯录: " + file_.string());
+}
+
+void RelationshipGraph::savePassive() {
+    try {
+        save();
+    } catch (const std::exception& e) {
+        log::warn("RelationshipGraph",
+                  std::string("通讯录写盘失败(本次仅内存生效): ") + e.what());
+    }
 }
 
 } // namespace mio
