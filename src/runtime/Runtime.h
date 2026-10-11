@@ -121,6 +121,16 @@ public:
     bool emit(const ConversationKey& conv, const std::string& senderId, const std::string& rawText);
     bool emit(const ConversationKey& conv, const OutgoingMessage& message);
 
+    // Facts / systemPrompt 的刷新边界（缓存前缀优先）。
+    // systemPrompt_ 位于 wire 请求的第一位，改一个字节就会让**所有**会话的
+    // 整段前缀缓存失效；因此它只在显式边界重建：进程启动、配置重载、
+    // 重新冷启动，以及定时日界（MIO 维护任务）。通讯录工具只置脏标记，
+    // 由这些边界统一消费。cognition 非空时顺带封存新认知（含日记消费）。
+    void refreshFactsNow(const std::string& reason,
+                         std::vector<DiaryEntry> cognition = {});
+    // 日界边界检查（挂在 ingest 上，无常驻线程）：到点才重建，并把边界推到明天
+    void refreshFactsAtDayBoundary();
+
 private:
     // Facts 渲染（冷启动/重新冷启动后/图谱变化时重建）
     std::string rebuildSystemPrompt(
@@ -157,7 +167,9 @@ private:
     FusionRouter router_;         // fusion 即路由（话题语义匹配用 embedding_）
     ToolRegistry registry_;
 
-    std::string systemPrompt_;    // Facts 渲染结果（重建时机由调用方保证）
+    std::string systemPrompt_;    // Facts 渲染结果（只在 refreshFactsNow 的边界重建）
+    bool factsDirty_ = false;     // 通讯录/认知已变更，等待下一个刷新边界
+    std::int64_t nextFactsRefreshAt_ = 0; // 下一个日界刷新时刻（epoch 秒，0=未排程）
     std::vector<DiaryEntry> cognition_; // 通讯录更新时重建提示词所需的已封存认知
     RuntimeState state_;
     mutable std::mutex stateMtx_;
