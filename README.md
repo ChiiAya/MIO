@@ -226,6 +226,12 @@ MIO 提供基础的 Agent 执行闭环与保护护栏：
 | `list_contacts` | `{"query"?: string}` | 查询通讯录（按称呼/QQ/internal_id，缺省列出全部联系人） |
 | `upsert_contact` | `{"name": string, "qq"?: string, "platform"?: string, "user_id"?: string, "notes"?: string}` | 登记新联系人；已登记账号不会被覆盖称呼 |
 
+#### 🕒 每轮对话的时间标签
+
+wire 层会给**每一轮**用户消息附一个 `[time:YYYY-MM-DD HH:MM]`（取消息自己的
+`createdAt`，所以历史部分逐字节稳定、不会打断 prompt cache）。同一个输入缓冲区
+（同一轮）里的多条消息共享时间戳，只给本轮第一条打标签。
+
 #### ⏰ 定时事项（维护任务）
 
 `config.json` 的 `maintenance` 段是一张通用任务表。设计前提是**缓存前缀优先**：
@@ -239,6 +245,12 @@ MIO 提供基础的 Agent 执行闭环与保护护栏：
 | `tasks[].kind` | `daily`（每天 `at`）/ `once`（`at` 执行一次）/ `interval`（每 `everyMinutes` 分钟） |
 | `tasks[].at` | 本地 `HH:MM`（`daily` / `once`） |
 | `tasks[].prompt` | `action=prompt` 时的提示文本 |
+
+**滚动摘要 → MCP 长期记忆**：`memoryBridge` 段把每次摘要产出（冷读取 / 融合重定向 /
+重新冷启动）经后台线程直接写入 MCP 记忆工具（默认 `graphiti_add_memory`，参数名用
+`textField` 指定，其余固定参数放 `extraArgs`，字符串值支持 `{text}` `{topic}` `{conv}`
+`{group}` `{private}` 占位符）。摘要 sink 只入队不阻塞（它在 ingest 线程里、常持锁），
+每个会话只保留最新一条累计摘要，同一份文本不会重复写，工具不在工具表里会告警一次后跳过。
 
 `refresh_facts` 是 Facts 的常规刷新边界（另外两个边界是配置重载与重新冷启动）。
 `prompt` 会对"当天有活动的每个会话"各跑一次**隐藏回合**：模型可以调用长期记忆写入

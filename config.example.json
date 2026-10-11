@@ -170,5 +170,18 @@
       //   "prompt": "【框架】现在是每日整理时间。请回顾上面这段对话中今天发生的事，把值得长期记住的事实、约定、人物信息与偏好，用你的长期记忆工具（graphiti_add_memory 等）逐条写入记忆（一条一件事，主语明确，不要记流水账）。不要给用户发送任何消息，也不要回复本消息。"
       // }
     ]
+  },
+
+  // 【12. 滚动摘要 → MCP 长期记忆 (MemoryBridgeConfig)】
+  // 摘要的产出点（冷读取 / 融合重定向 / 重新冷启动）都在 ingest 线程里、常持锁，
+  // 所以 sink 只入队，由后台线程直接调用 MCP 工具写入 —— 不再额外花一次 LLM 调用。
+  "memoryBridge": {
+    "enabled": true,                 // 总开关（工具不在工具表里会自动跳过并告警一次）
+    "tool": "graphiti_add_memory",   // ToolRegistry 里的 MCP 工具名
+    "textField": "episode_body",     // 摘要文本写进哪个参数
+    "maxPending": 32,                // 待写入会话数上限（每会话只保留最新一条累计摘要）
+    "extraArgs": {                   // 其余固定参数；字符串值支持占位符
+      "group_id": "mio"              // {text} {topic} {conv} {group} {private}
+    }
   }
 }

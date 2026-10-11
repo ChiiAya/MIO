@@ -65,7 +65,6 @@ enum class EventKind {
     NotesChanged,     // 认知：修改备注
     SummaryApplied,   // 上下文压缩：摘要已应用
     ConfigReloaded,   // 配置热重载
-    MemoryRemembered, // 记忆：存入长期记忆库
 };
 
 struct Event {
