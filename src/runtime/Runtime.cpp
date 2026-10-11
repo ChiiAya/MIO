@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <iomanip>
 #include <mutex>
@@ -52,6 +53,43 @@ std::string hexEncode(const std::string& s) {
         out += digits[c & 0x0F];
     }
     return out;
+}
+
+// prompt 指纹（FNV-1a 64bit → 16 位十六进制）：只用于在日志里判断"前缀是否
+// 真的逐字节变了"，不做任何安全用途。
+std::string promptFingerprint(const std::string& prompt) {
+    std::uint64_t hash = 1469598103934665603ull;
+    for (unsigned char c : prompt) {
+        hash ^= c;
+        hash *= 1099511628211ull;
+    }
+    static const char* digits = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int i = 15; i >= 0; --i) {
+        out[static_cast<std::size_t>(i)] = digits[hash & 0xF];
+        hash >>= 4;
+    }
+    return out;
+}
+
+// 下一个本地零点（epoch 秒）。"日界"这类周期边界的计算：mktime 会替我们
+// 处理 DST 归一，所以直接给 tm_mday +1 再回算，而不是加 24*3600。
+std::int64_t nextLocalMidnight(std::int64_t now) {
+    const std::time_t t = static_cast<std::time_t>(now);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    tm.tm_hour = 0;
+    tm.tm_min = 0;
+    tm.tm_sec = 0;
+    tm.tm_mday += 1;  // 今天零点已过（或正在过）→ 取明天零点
+    // 必须让 mktime 自己判定夏令时：沿用输入时刻的 isdst 会让目标时刻被错误
+    // 地按旧时区解释（NY 3/8 01:30 → 3/9 01:00 而不是 00:00）。
+    tm.tm_isdst = -1;
+    return static_cast<std::int64_t>(std::mktime(&tm));
 }
 
 } // namespace
@@ -101,7 +139,7 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
     summary_->setOnSummary(
         [this](const SummaryOutcome& outcome) { onSummaryProduced(outcome); });
 
-    systemPrompt_ = rebuildSystemPrompt();
+    refreshFactsNow("startup");
     state_.botName = persona_.botName;
     state_.messageCount = 0;
 
@@ -153,7 +191,8 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
             mcpManager_->reload(newConfig->mcp, registry_);
         }
 
-        // 原子切换服务指针与更新提示词
+        // 原子切换服务指针；提示词重建放到锁外（refreshFactsNow 自己取锁，
+        // 且它是"缓存前缀优先"策略里的一个显式刷新边界）
         {
             std::unique_lock<std::shared_mutex> lock(servicesMtx_);
             llm_ = newLlm;
@@ -167,8 +206,8 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
                 persona_.systemPromptPrefix = newConfig->systemPromptPrefix;
             if (!newConfig->systemPromptNotice.empty())
                 persona_.systemPromptNotice = newConfig->systemPromptNotice;
-            systemPrompt_ = rebuildSystemPrompt();
         }
+        refreshFactsNow("config-reload");
 
         // 刷新长驻组件配置与依赖
         router_.update(newConfig->fusion, newSummary, newEmbedding);
@@ -364,9 +403,14 @@ bool Runtime::emit(const ConversationKey& conv, const OutgoingMessage& message) 
 }
 
 void Runtime::registerBuiltinTools() {
+    // 通讯录变更只置脏标记，**不**在这里重建 systemPrompt：
+    // 它在 wire 请求的第一位，改一个字节就让所有会话的整段前缀缓存失效。
+    // 真正的重建推迟到刷新边界（见 refreshFactsNow）。
     registerContactTools(registry_, graph_, [this] {
         std::unique_lock<std::shared_mutex> lock(servicesMtx_);
-        systemPrompt_ = buildSystemPrompt(persona_, graph_, cognition_, kMaxPeopleTokens);
+        factsDirty_ = true;
+        log::info("Runtime",
+                  "通讯录已更新：按缓存前缀优先策略，systemPrompt 推迟到下一个刷新边界重建");
     });
     // get_current_time —— 故意选一个"模型绝对不可能自己知道答案"的工具，
     // 用于验证工具链路是否打通。
@@ -707,6 +751,38 @@ std::string Runtime::rebuildSystemPrompt(
     return buildSystemPrompt(persona_, graph_, cognition_, kMaxPeopleTokens);
 }
 
+// 按"缓存前缀优先"策略，systemPrompt_ 只在明确的刷新边界重建。调用方应
+// 传一个稳定的 reason 字符串（startup / config-reload / reColdStart / daily…），
+// 便于在日志里对账"前缀到底什么时候被换了"。
+void Runtime::refreshFactsNow(const std::string& reason,
+                              std::vector<DiaryEntry> cognition) {
+    std::unique_lock<std::shared_mutex> lock(servicesMtx_);
+    const bool wasDirty = factsDirty_;
+    systemPrompt_ = rebuildSystemPrompt(cognition);
+    factsDirty_ = false;
+    // fp 相同 = 前缀逐字节未变 = 缓存没被打断；相同 fp 的"重建"是零成本操作。
+    log::info("Runtime", "systemPrompt 重建: reason=" + reason +
+                             " dirty=" + (wasDirty ? "true" : "false") +
+                             " bytes=" + std::to_string(systemPrompt_.size()) +
+                             " fp=" + promptFingerprint(systemPrompt_));
+}
+
+// 日界刷新：把"通讯录/认知变更进 prompt"这件事收敛到每天一次，且不需要
+// 常驻定时线程 —— 边界检查挂在 ingest 上，没有流量时不空转，第一条消息
+// 到达时补做（那时还没有缓存前缀可保护，刷新反而是最优时机）。
+void Runtime::refreshFactsAtDayBoundary() {
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    {
+        std::unique_lock<std::shared_mutex> lock(servicesMtx_);
+        if (nextFactsRefreshAt_ == 0)  // 首次：只排程，不立即重建
+            nextFactsRefreshAt_ = nextLocalMidnight(now);
+        if (now < nextFactsRefreshAt_) return;
+        // 先把边界推到明天再放锁：并发的第二个 ingest 不会再触发第二次重建
+        nextFactsRefreshAt_ = nextLocalMidnight(now);
+    }
+    refreshFactsNow("daily", diary_.consume());
+}
+
 void Runtime::updateState(const Event& ev) {
     std::lock_guard<std::mutex> lock(stateMtx_);
     state_.lastEventSeq = ev.seq;
@@ -847,9 +923,9 @@ BotReply Runtime::ingest(IncomingMessage message) {
         }
 
         // 6) 构建请求（当前回合已 append 进 unit；上下文不够 → 重新冷启动压缩）
+        // 日界边界：通讯录/认知变更最多每天进一次 prompt（缓存前缀优先）。
+        refreshFactsAtDayBoundary();
         BuildInput in;
-        // A contact tool in another turn may have refreshed Facts after the
-        // initial service snapshot was taken.
         in.systemPrompt = systemPrompt();
         in.unit = unit;
         in.now = now;
@@ -935,8 +1011,9 @@ BotReply Runtime::ingest(IncomingMessage message) {
     }
     if (reColdStarted) {
         eventLog_.append({0, EventKind::SummaryApplied, now, "上下文重新冷启动"});
-        std::unique_lock<std::shared_mutex> lock(servicesMtx_);
-        systemPrompt_ = rebuildSystemPrompt(diary_.consume());
+        // 冷启动同时消费日记：新认知顺带进 prompt（这一天已经变过一次前缀，
+        // 边际成本为零）。注意 diary_.consume() 在取 services 锁之前求值。
+        refreshFactsNow("reColdStart", diary_.consume());
     }
 
     if (resp.finishReason == "interrupted") {
