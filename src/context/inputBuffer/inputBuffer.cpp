@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include "context/costEstimator/Tokens.h"
 
 namespace mio {
 
@@ -37,7 +38,7 @@ PushResult InputBuffer::push(IncomingMessage msg, const std::string& displayName
 
     // 2. 长文本安全过滤与截断
     if (msg.text.size() > cfg_.maxTextLength) {
-        msg.text = msg.text.substr(0, cfg_.maxTextLength) + "...(消息过长已截断)";
+        msg.text = cutUtf8(msg.text, cfg_.maxTextLength) + "...(消息过长已截断)";
     }
 
     // 3. 构建对应的上下文 Msg
@@ -49,6 +50,9 @@ PushResult InputBuffer::push(IncomingMessage msg, const std::string& displayName
     turn.senderName = displayName;
     turn.platform = msg.platform;
     turn.groupId = msg.groupId;
+    turn.messageId = msg.messageId;
+    turn.replyToMessageId = msg.replyToMessageId;
+    turn.atUserIds = msg.atUserIds;
 
     std::lock_guard<std::mutex> lock(mtx_);
     const auto now = std::chrono::steady_clock::now();
@@ -71,6 +75,9 @@ PushResult InputBuffer::push(IncomingMessage msg, const std::string& displayName
     // 若同一会话同一发言人连续打字，合并文本以节省 Prompt 与缓存；
     // 含多模态片段的消息不合并，避免丢失/错位媒体内容
     if (!pendingTurns_.empty() && pendingTurns_.back().senderId == turn.senderId &&
+        pendingTurns_.back().messageId.empty() && turn.messageId.empty() &&
+        pendingTurns_.back().replyToMessageId.empty() && turn.replyToMessageId.empty() &&
+        pendingTurns_.back().atUserIds.empty() && turn.atUserIds.empty() &&
         pendingTurns_.back().parts.empty() && turn.parts.empty()) {
         pendingTurns_.back().text += "\n" + turn.text;
     } else {

@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -68,7 +69,10 @@ std::string senderTag(const Msg& m) {
     if (who.empty()) return "";
     const std::string conv =
         m.groupId.empty() ? "private" : "group:" + m.groupId;
-    return "[" + m.platform + "][" + conv + "][sender:" + who + "] ";
+    std::string tag = "[" + m.platform + "][" + conv + "][sender:" + who + "]";
+    if (!m.messageId.empty()) tag += "[message_id:" + m.messageId + "]";
+    if (!m.replyToMessageId.empty()) tag += "[reply_to_message_id:" + m.replyToMessageId + "]";
+    return tag + " ";
 }
 
 nlohmann::json toWireMessages(const ChatRequest& req) {
@@ -151,30 +155,6 @@ nlohmann::json toWireMessages(const ChatRequest& req) {
     return wire;
 }
 
-bool hasImageParts(const ChatRequest& req) {
-    for (const auto& m : req.messages) {
-        for (const auto& p : m.parts) {
-            if (p.kind == Part::Kind::Image) return true;
-        }
-    }
-    return false;
-}
-
-// 去掉图片片段的副本：用于端点不支持多模态时的降级重试。
-// 只在真正需要降级时才调用，避免 happy path 白拷贝一次大消息体。
-ChatRequest withoutImageParts(const ChatRequest& req) {
-    ChatRequest out = req;
-    for (auto& m : out.messages) {
-        m.parts.erase(
-            std::remove_if(m.parts.begin(), m.parts.end(),
-                           [](const Part& p) {
-                               return p.kind == Part::Kind::Image;
-                           }),
-            m.parts.end());
-    }
-    return out;
-}
-
 // --- 重试分类表 -------------------------------------------------------------
 // 可重试：网络层失败、408 超时、429 限流、所有 5xx。
 // 不可重试：其余 4xx —— payload/鉴权错误重试无意义。
@@ -227,10 +207,7 @@ void OpenAiCompat::normalizeQuirks(nlohmann::json& p) const {
 
 ChatResponse OpenAiCompat::chat(const ChatRequest& req) {
     const std::string endpoint = resolveChatEndpoint(cfg_.baseUrl);
-    const bool multiModal = hasImageParts(req);
-    const ChatRequest* activeReq = &req;
-    std::optional<ChatRequest> textOnlyReq;  // 仅在降级时构造
-    nlohmann::json payload = buildPayload(*activeReq);
+    nlohmann::json payload = buildPayload(req);
 
     const int maxAttempts = cfg_.maxRetries + 1;
     long lastStatus = 0;
@@ -246,7 +223,7 @@ ChatResponse OpenAiCompat::chat(const ChatRequest& req) {
                                  30'000.0);
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(static_cast<long long>(delayMs)));
-            payload = buildPayload(*activeReq); // 重建一次
+            payload = buildPayload(req); // 重试保留原始多模态内容
         }
 
         cpr::Response r = cpr::Post(
@@ -276,15 +253,7 @@ ChatResponse OpenAiCompat::chat(const ChatRequest& req) {
                                 : "HTTP " + std::to_string(r.status_code);
             log::warn("OpenAiCompat", "请求失败(" + why +
                           ")，将进行第 " + std::to_string(attempt + 2) + " 次尝试");
-            // 有些端点（纯文本模型 / 未开通视觉）会直接拒绝多模态请求。
-            // 首次失败后自动降级为纯文本重试一次：图片退回 [图片] 标记，
-            // 至少不让整轮对话失败。
-            if (multiModal && activeReq == &req) {
-                textOnlyReq = withoutImageParts(req);
-                activeReq = &*textOnlyReq;
-                log::warn("OpenAiCompat",
-                          "多模态请求失败，降级为纯文本重试（图片退化为 [图片] 文本标记）");
-            }
+            // 瞬时网络/限流/服务端故障不表示模型不支持视觉，重试保留图片。
             continue; // 再试
         }
         break; // 4xx 业务错误：立刻失败，把服务端的话带给调用者
