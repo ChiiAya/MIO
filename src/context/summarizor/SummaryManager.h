@@ -17,9 +17,11 @@
 namespace mio {
 
 struct SummaryOutcome {
-    std::string text;            // 累计摘要（含旧摘要；标记行已剥离）
-    bool privateVerdict = false; // 摘要内容是否私密（LLM 判定，解析失败保持默认）
-    std::string topic;           // 摘要器同步产出的话题（解析失败/未输出为空）
+    std::string text;           // 累计摘要（含旧摘要；标记行已剥离）
+    // 摘要内容是否私密（LLM 判定）。默认 true = 私密：判定缺失/无法解析时
+    // 不放宽隐私 —— 冷启动本就默认私密，只有模型明确说"公开"才允许翻转。
+    bool privateVerdict = true;
+    std::string topic;          // 摘要器同步产出的话题（解析失败/未输出为空）
 };
 
 class SummaryManager {
