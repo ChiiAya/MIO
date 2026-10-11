@@ -553,38 +553,9 @@ void Runtime::registerBuiltinTools() {
                   },
                   ToolLayer::Builtin);
 
-    // get_known_person_qq —— 获取认识的人的QQ号
-    ToolDef knownPersonDef;
-    knownPersonDef.name = "get_known_person_qq";
-    knownPersonDef.description =
-        "获取认识的人的QQ号。可输入姓名/昵称查询特定人物；若不提供参数则列出所有已知人物及其QQ号。";
-    knownPersonDef.parametersJsonSchema = {
-        {"type", "object"},
-        {"properties",
-         {{"name",
-           {{"type", "string"},
-            {"description",
-             "要查询的人物姓名或称呼（可选，若为空则列出所有认识的人）"}}}}}};
-    registry_.add(std::move(knownPersonDef),
-                  [this](const nlohmann::json& args) -> std::string {
-                      const std::string query = args.value("name", "");
-                      auto render = [](const PersonNode& person) {
-                          const auto qq = RelationshipGraph::extractQq(person);
-                          return nlohmann::json{{"internal_id", person.internalId}, {"name", person.name},
-                              {"qq", qq.empty() ? "未知" : qq}, {"platform_ids", person.platformIds},
-                              {"personal", person.personal}};
-                      };
-                      if (!query.empty()) {
-                          try { return render(graph_.resolveContact(query)).dump(); }
-                          catch (const std::invalid_argument& error) {
-                              return std::string("error: ") + error.what();
-                          }
-                      }
-                      auto list = nlohmann::json::array();
-                      for (const auto& person : graph_.contacts()) list.push_back(render(person));
-                      return list.dump();
-                  },
-                  ToolLayer::Builtin);
+    // 通讯录查询已收敛到 list_contacts（见 ContactTools.cpp）：原先这里的
+    // get_known_person_qq 与它功能重复、只是返回字段略少，两个都留着模型会
+    // 随机挑一个，故删除。
 
     // keepsilent —— 保持沉默（不想回答 / 已读不回 / 拒绝回复）
     ToolDef keepSilentDef;

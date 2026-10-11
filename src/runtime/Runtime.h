@@ -17,7 +17,8 @@
 //
 // 工具：get_current_time / remember / recall_memory（长期记忆召回）/
 //       set_public（模型控制当前上下文公开/私密）/ update_topic（话题上报）/
-//       get_current_user_qq / get_known_person_qq /
+//       get_current_user_qq / list_contacts / upsert_contact / set_notes
+//       （通讯录；set_nickname 已停用，upsert_contact 也不会覆盖已有称呼）/
 //       keepsilent / send_message / wait（等待并再次开始思考）
 //
 // 严格模块边界：Achieve 只存/读，Router 只路由/融合，Builder 只构建/压缩，
