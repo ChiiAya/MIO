@@ -7,7 +7,6 @@
 #include "context/conversationFusion/FusionRouter.h"
 #include "context/inputBuffer/inputBuffer.h"
 #include "config/mcp/McpConfig.h"
-#include "memory/manager/MemoryManager.h"
 #include "scheduler/Scheduler.h"
 
 #include <nlohmann/json.hpp>
@@ -43,7 +42,6 @@ struct AppConfig {
     EmbeddingConfig embedding;
     FusionConfig fusion;
     ContextBuilderConfig contextBuilder;
-    MemoryConfig memory;
     NapCatConfig napcat;
     InputBufferConfig inputBuffer;
     MessageSplitterConfig splitter;
@@ -66,8 +64,6 @@ void from_json(const nlohmann::json& j, FusionConfig& c);
 void to_json(nlohmann::json& j, const ContextBuilderConfig& c);
 void from_json(const nlohmann::json& j, ContextBuilderConfig& c);
 
-void to_json(nlohmann::json& j, const MemoryConfig& c);
-void from_json(const nlohmann::json& j, MemoryConfig& c);
 
 void to_json(nlohmann::json& j, const NapCatConfig& c);
 void from_json(const nlohmann::json& j, NapCatConfig& c);
