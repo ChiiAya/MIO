@@ -11,7 +11,11 @@ namespace mio {
 std::string nowTimeString() {
     std::time_t t = std::time(nullptr);
     std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
     localtime_r(&t, &tm);
+#endif
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm);
     return buf;
@@ -42,11 +46,13 @@ std::string buildSystemPrompt(const Persona& persona,
 
     // 认识的人（潜意识层，top-K，token 封顶）
     constexpr std::size_t kMaxPeople = 20;
-    const auto people = graph.topK(kMaxPeople);
+    const auto people = graph.topKSnapshot(kMaxPeople);
     int peopleTokens = 0;
-    for (const auto* p : people) {
-        std::string line = "- " + p->name;
-        if (!p->personal.empty()) line += "（" + p->personal + "）";
+    for (const auto& p : people) {
+        std::string line = "- " + p.name + " [internal_id:" + p.internalId + "]";
+        const auto qq = RelationshipGraph::extractQq(p);
+        if (!qq.empty()) line += " [qq:" + qq + "]";
+        if (!p.personal.empty()) line += "（" + p.personal + "）";
         line += "\n";
         const int t = static_cast<int>(estimateTokens(line));
         if (peopleTokens + t > maxPeopleTokens) break;

@@ -8,6 +8,23 @@ namespace mio {
 
 namespace {
 
+std::string markerValue(const std::string& line, const std::string& label) {
+    std::string value = line.substr(label.size());
+    const auto begin = value.find_first_not_of(" \t");
+    if (begin == std::string::npos) return "";
+    value.erase(0, begin);
+    if (value.rfind("：", 0) == 0)
+        value.erase(0, std::string("：").size());
+    else if (value.rfind(":", 0) == 0)
+        value.erase(0, 1);
+    else
+        return "";
+    const auto first = value.find_first_not_of(" \t\r");
+    if (first == std::string::npos) return "";
+    const auto last = value.find_last_not_of(" \t\r");
+    return value.substr(first, last - first + 1);
+}
+
 std::string renderHistoryText(const std::vector<Msg>& msgs, int maxChars) {
     std::ostringstream s;
     int budget = maxChars;
@@ -82,22 +99,16 @@ SummaryOutcome SummaryManager::summarizeWithVerdict(const std::vector<Msg>& mate
 
         bool marker = false;
         if (line.rfind("私密性判断", 0) == 0) {
-            const auto colon = line.find_first_of("：:");
-            if (colon != std::string::npos) {
-                out.privateVerdict =
-                    line.substr(colon + 1).find("私密") != std::string::npos;
+            const auto value = markerValue(line, "私密性判断");
+            if (!value.empty()) {
+                // 只有明确公开才放宽隐私；未知判定保持默认私密。
+                out.privateVerdict = value != "公开";
                 marker = true;
             }
         } else if (line.rfind("话题", 0) == 0) {
-            const auto colon = line.find_first_of("：:");
-            if (colon != std::string::npos) {
-                // 话题供 Router 语义匹配用，宜短；截断并去尾部空白
-                std::string topic = line.substr(colon + 1);
-                while (!topic.empty() &&
-                       (topic.back() == ' ' || topic.back() == '\r' ||
-                        topic.back() == '\t'))
-                    topic.pop_back();
-                out.topic = cutUtf8(topic, 50);
+            const auto value = markerValue(line, "话题");
+            if (!value.empty()) {
+                out.topic = cutUtf8(value, 50);
                 marker = true;
             }
         }

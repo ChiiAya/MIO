@@ -112,9 +112,13 @@ public:
     using MessageSender = std::function<bool(const ConversationKey& conversation,
                                              const std::string& senderId,
                                              const std::string& text)>;
+    using StructuredSender = std::function<bool(const ConversationKey&,
+                                                const OutgoingMessage&)>;
     void setMessageSender(MessageSender sender);
+    void setStructuredMessageSender(StructuredSender sender);
     bool hasMessageSender() const;
-    void emit(const ConversationKey& conv, const std::string& senderId, const std::string& rawText);
+    bool emit(const ConversationKey& conv, const std::string& senderId, const std::string& rawText);
+    bool emit(const ConversationKey& conv, const OutgoingMessage& message);
 
 private:
     // Facts 渲染（冷启动/重新冷启动后/图谱变化时重建）
@@ -153,11 +157,12 @@ private:
     ToolRegistry registry_;
 
     std::string systemPrompt_;    // Facts 渲染结果（重建时机由调用方保证）
+    std::vector<DiaryEntry> cognition_; // 通讯录更新时重建提示词所需的已封存认知
     RuntimeState state_;
     mutable std::mutex stateMtx_;
     InputBufferManager inputBuffers_;
     std::unique_ptr<AdminServer> adminServer_;
-    MessageSender messageSender_;
+    StructuredSender messageSender_;
     mutable std::mutex senderMtx_;
     MessageSplitterConfig splitterConfig_;
     std::unique_ptr<mcp::McpManager> mcpManager_;

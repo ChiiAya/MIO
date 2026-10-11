@@ -9,6 +9,7 @@
 #include <string>
 
 #include "context/costEstimator/Tokens.h"
+#include "core/message/History.h"
 #include "log/Log.h"
 
 namespace mio {
@@ -150,6 +151,11 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
         // 护栏 4：空输出短重试（连续 2 次空输出则报错）
         for (int attempt = 0; attempt < 2; ++attempt) {
             resp = llm.chat(req);
+            if (opt.shouldInterrupt && opt.shouldInterrupt()) {
+                resp.finishReason = "interrupted";
+                resp.text.clear();
+                return resp;
+            }
             if (!resp.text.empty() || !resp.toolCalls.empty()) {
                 gotEmpty = false;
                 break;
@@ -193,18 +199,24 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
 
         bool shouldTerminate = false;
         std::pair<std::string, int> streak{"", 0};
-        for (const auto& tc : resp.toolCalls) {
+        for (std::size_t i = 0; i < resp.toolCalls.size(); ++i) {
+            const auto& tc = resp.toolCalls[i];
             if (opt.shouldInterrupt && opt.shouldInterrupt()) {
                 log::info("ToolLoop", "工具执行前检测到中断信号，提前退出");
+                // assistant 的整批 tool_calls 已入档；取消剩余工具也必须回填结果。
+                for (std::size_t remaining = i; remaining < resp.toolCalls.size(); ++remaining) {
+                    const Msg cancelled = history::cancelledToolResult(resp.toolCalls[remaining].id);
+                    req.messages.push_back(cancelled);
+                    if (sink) sink(cancelled);
+                }
                 last.finishReason = "interrupted";
                 last.text.clear();
                 return last;
             }
             auto def = reg.find(tc.name);
-            if (def.has_value() && def->isTerminal) {
-                shouldTerminate = true;
-            }
             ExecOutcome out = executeOne(reg, tc, opt, streak);
+            if (def.has_value() && def->isTerminal && out.resultText.rfind("error:", 0) != 0)
+                shouldTerminate = true;
             log::debug("ToolLoop", tc.name + " => " + cutUtf8(out.resultText, 160));
             Msg result{Role::Tool};
             result.toolCallId = tc.id;
@@ -215,6 +227,9 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
 
         if (shouldTerminate) {
             log::info("ToolLoop", "检测到终结性工具调用 (如 keepsilent)，提前结束工具循环");
+            Msg silent{Role::Assistant};
+            silent.text = "(本轮已读并选择保持沉默，未发送回复)";
+            if (sink) sink(silent);
             last.text.clear();
             return last;
         }
@@ -247,7 +262,14 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
         "基于以上已获得的信息，直接、简短地回复用户。";
     req.messages.push_back(notice);
     if (sink) sink(notice);
-    last = llm.chat(req);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        last = llm.chat(req);
+        if (opt.shouldInterrupt && opt.shouldInterrupt()) break;
+        if (!last.toolCalls.empty())
+            throw std::runtime_error("禁用工具的总结请求仍返回工具调用");
+        if (!last.text.empty()) break;
+        if (attempt == 1) throw std::runtime_error("模型强制总结连续返回空输出");
+    }
 
     if (opt.shouldInterrupt && opt.shouldInterrupt()) {
         log::info("ToolLoop", "强制总结 LLM 调用后检测到中断信号，丢弃当前响应");
@@ -256,6 +278,10 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
         return last;
     }
 
+    Msg done{Role::Assistant};
+    done.text = last.text;
+    done.reasoningContent = last.reasoning;
+    if (sink) sink(done);
     return last;
 }
 

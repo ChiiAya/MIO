@@ -1,3 +1,4 @@
+#include "adapters/napcat/OneBotMessage.h"
 // ============================================================================
 // NapCatQQ 适配器实现（反向 WebSocket）
 //
@@ -224,19 +225,8 @@ bool callAction(const std::shared_ptr<ix::WebSocket>& ws, PendingActions& pendin
 }
 
 bool sendReply(const std::shared_ptr<ix::WebSocket>& ws, PendingActions& pending,
-               const ConversationKey& conversation, const std::string& senderId,
-               const std::string& text) {
-    nlohmann::json params{{"message", text}};
-    if (conversation.scope == ConversationScope::Group) {
-        // NapCat's documented unified API is send_msg. It accepts the same
-        // payload as send_group_msg while making the target type explicit.
-        params["message_type"] = "group";
-        params["group_id"] = idToJson(conversation.id);
-    } else {
-        params["message_type"] = "private";
-        params["user_id"] = idToJson(!senderId.empty() ? senderId : conversation.id);
-    }
-    return callAction(ws, pending, "send_msg", std::move(params));
+               const ConversationKey& conversation, const OutgoingMessage& message) {
+    return callAction(ws, pending, "send_msg", napcat::buildSendParams(conversation, message));
 }
 
 // --- 连接与 worker ---------------------------------------------------------------
@@ -328,16 +318,15 @@ void runNapCat(Runtime& runtime, const NapCatConfig& config) {
     std::condition_variable queueCv;
     std::atomic<bool> running{true};
 
-    runtime.setMessageSender([&conn, &pending](const ConversationKey& conv,
-                                              const std::string& senderId,
-                                              const std::string& text) -> bool {
+    runtime.setStructuredMessageSender([&conn, &pending](const ConversationKey& conv,
+                                              const OutgoingMessage& message) -> bool {
         std::shared_ptr<ix::WebSocket> ws;
         {
             std::lock_guard<std::mutex> connLock(conn.mtx);
             ws = conn.current;
         }
         if (!ws) return false;
-        return sendReply(ws, pending, conv, senderId, text);
+        return sendReply(ws, pending, conv, message);
     });
 
     std::thread worker(workerLoop, std::ref(runtime), std::ref(conn),

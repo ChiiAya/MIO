@@ -7,7 +7,10 @@
 #include "context/conversationFusion/FusionRouter.h"
 
 #include <algorithm>
-#include <regex>
+#include <cctype>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
 #include <utility>
 
 #include "context/costEstimator/Tokens.h"
@@ -375,18 +378,9 @@ FusionUnit* FusionRouter::route(const IncomingMessage& msg, std::time_t now) {
         }
     }
 
-    // @ 关系映射：从 atUserIds 以及消息文本中的 @(\w+) 提取被提及用户
+    // @ 关系映射：结构化 mention 优先，纯文本只接收有独立边界的 QQ 号。
     // 将其映射为认识的人，并在群聊中计入成员并累积与发言者的亲密度
-    std::vector<std::string> atIds = msg.atUserIds;
-    static const std::regex atRegex(R"(@(\w+))");
-    auto words_begin = std::sregex_iterator(msg.text.begin(), msg.text.end(), atRegex);
-    auto words_end = std::sregex_iterator();
-    for (auto it = words_begin; it != words_end; ++it) {
-        std::string target = (*it)[1].str();
-        if (target != "all" && std::find(atIds.begin(), atIds.end(), target) == atIds.end()) {
-            atIds.push_back(std::move(target));
-        }
-    }
+    const auto atIds = mentionedUserIds(msg);
     for (const auto& atId : atIds) {
         if (atId.empty() || atId == "all" || atId == msg.senderId) continue;
         graph_.onSeen(msg.platform, atId, atId, now);
@@ -424,11 +418,68 @@ FusionUnit* FusionRouter::route(const IncomingMessage& msg, std::time_t now) {
     return unit;
 }
 
+std::vector<std::string> FusionRouter::mentionedUserIds(const IncomingMessage& msg) {
+    std::vector<std::string> ids;
+    const bool qq = msg.platform == "qq" || msg.platform == "napcat" ||
+                    msg.platform == "onebot";
+    auto append = [&](const std::string& id) {
+        if (id.empty() || id == "all") return;
+        if (qq && !std::all_of(id.begin(), id.end(), [](unsigned char c) {
+                return std::isdigit(c);
+            })) return;
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+    };
+    for (const auto& id : msg.atUserIds) append(id);
+    if (!qq) return ids;
+
+    auto identifierChar = [](unsigned char c) {
+        return c < 128 && (std::isalnum(c) || c == '_');
+    };
+    for (std::size_t pos = 0; (pos = msg.text.find('@', pos)) != std::string::npos; ++pos) {
+        if (pos > 0) {
+            const unsigned char prev = msg.text[pos - 1];
+            if (identifierChar(prev) || prev == '.' || prev == '+' ||
+                prev == '-' || prev == '%' || prev == '@') continue;
+        }
+        std::size_t end = pos + 1;
+        while (end < msg.text.size() && std::isdigit(static_cast<unsigned char>(msg.text[end]))) ++end;
+        if (end == pos + 1) continue;
+        if (end < msg.text.size() && identifierChar(static_cast<unsigned char>(msg.text[end]))) continue;
+        if (end + 1 < msg.text.size() && msg.text[end] == '.' &&
+            identifierChar(static_cast<unsigned char>(msg.text[end + 1]))) continue;
+        append(msg.text.substr(pos + 1, end - pos - 1));
+    }
+    return ids;
+}
+
+std::string FusionRouter::mentionContext(const std::vector<std::string>& ids,
+                                        const std::string& platform) const {
+    std::ostringstream result;
+    std::set<std::string> rendered;
+    for (const auto& id : ids) {
+        if (id.empty() || id == "all" || !rendered.insert(id).second) continue;
+        std::optional<PersonNode> person;
+        try {
+            person = graph_.resolveContact(RelationshipGraph::platformTag(platform, id));
+        } catch (const std::invalid_argument&) {
+            // An unknown mention remains visible with its original platform ID.
+        }
+        if (result.tellp() == std::streampos(0)) result << "[提及对象]";
+        result << " @" << id;
+        if (person) {
+            result << "=" << person->name << " (internal_id=" << person->internalId << ")";
+        } else {
+            result << " (尚无称呼记录)";
+        }
+        result << ';';
+    }
+    return result.str();
+}
+
 std::string FusionRouter::displayName(const IncomingMessage& msg) const {
     // 统一身份码在图谱中有对应身份 → 用昵称；否则回退原始 senderId
-    if (const PersonNode* p =
-            graph_.findByPlatform(msg.platform, msg.senderId);
-        p != nullptr && !p->name.empty()) {
+    if (const auto p = graph_.platformContact(msg.platform, msg.senderId);
+        p && !p->name.empty()) {
         if (p->name == msg.senderId && !msg.senderName.empty() && msg.senderName != msg.senderId) {
             return msg.senderId + "(" + msg.senderName + ")";
         }

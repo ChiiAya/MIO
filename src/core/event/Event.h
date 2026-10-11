@@ -55,6 +55,8 @@ struct IncomingMessage {
     // 已解析好的多模态内容（如图片的 data-uri），随 Msg.parts 进入 wire 层；
     // 由平台适配器填充，Runtime/InputBuffer 只做透传。
     std::vector<Part> parts;
+    std::string messageId;
+    std::string replyToMessageId;
 };
 
 enum class EventKind {

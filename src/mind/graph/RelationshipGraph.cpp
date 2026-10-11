@@ -10,6 +10,7 @@
 #include "mind/graph/RelationshipGraph.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
@@ -19,6 +20,28 @@
 #include "log/Log.h"
 
 namespace mio {
+
+namespace {
+bool isQqPlatform(const std::string& platform) {
+    return platform == "qq" || platform == "napcat" || platform == "onebot";
+}
+
+bool platformMatches(const std::string& stored, const std::string& platform,
+                     const std::string& id) {
+    if (stored == RelationshipGraph::platformTag(platform, id)) return true;
+    if (!isQqPlatform(platform)) return false;
+    return stored == RelationshipGraph::platformTag("qq", id) ||
+           stored == RelationshipGraph::platformTag("napcat", id) ||
+           stored == RelationshipGraph::platformTag("onebot", id);
+}
+
+bool nameMatches(const PersonNode& node, const std::string& name) {
+    if (node.name == name) return true;
+    // 自动登记的旧称呼为 QQ(群名片)，让用户看到的名片也可用于查询。
+    const std::string qq = RelationshipGraph::extractQq(node);
+    return !qq.empty() && node.name == qq + "(" + name + ")";
+}
+} // namespace
 
 RelationshipGraph::RelationshipGraph(std::filesystem::path file)
     : file_(std::move(file)) {
@@ -60,10 +83,9 @@ const PersonNode* RelationshipGraph::findByNameLocked(
 const PersonNode* RelationshipGraph::findByPlatformLocked(
     const std::string& platform, const std::string& platformId) const {
     // 先按 "[platform][id]" 精确匹配；未命中且带平台时回退裸 id（旧数据）
-    const std::string tag = platformTag(platform, platformId);
     for (const auto& n : nodes_)
         for (const auto& pid : n->platformIds)
-            if (pid == tag) return n.get();
+            if (platformMatches(pid, platform, platformId)) return n.get();
     if (!platform.empty()) {
         for (const auto& n : nodes_)
             for (const auto& pid : n->platformIds)
@@ -120,7 +142,7 @@ SeenResult RelationshipGraph::onSeen(const std::string& platform,
         RelationshipEdge* e = ensureEdge(mioId_, n->internalId);
         e->intimacy =
             std::min(1.0, decayed(e->intimacy, prevLast, now) + 0.1);
-        save();
+        savePassive();
         return result;
     }
 
@@ -139,7 +161,7 @@ SeenResult RelationshipGraph::onSeen(const std::string& platform,
 
     result.firstEncounter = true;
     result.internalId = id;
-    save();
+    savePassive();
     return result;
 }
 
@@ -247,6 +269,117 @@ std::vector<const PersonNode*> RelationshipGraph::allPersons() const {
     return out;
 }
 
+std::vector<PersonNode> RelationshipGraph::contacts() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<PersonNode> out;
+    for (const auto& n : nodes_)
+        if (n->internalId != mioId_) out.push_back(*n);
+    return out;
+}
+
+std::optional<PersonNode> RelationshipGraph::platformContact(
+    const std::string& platform, const std::string& platformId) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (const auto* person = findByPlatformLocked(platform, platformId)) return *person;
+    return std::nullopt;
+}
+
+std::vector<PersonNode> RelationshipGraph::topKSnapshot(std::size_t k) const {
+    auto people = contacts();
+    std::sort(people.begin(), people.end(), [](const PersonNode& a, const PersonNode& b) {
+        return a.weight != b.weight ? a.weight > b.weight : a.internalId < b.internalId;
+    });
+    if (people.size() > k) people.resize(k);
+    return people;
+}
+
+const PersonNode* RelationshipGraph::resolveContactLocked(
+    const std::string& person) const {
+    if (person.empty()) throw std::invalid_argument("联系人标识不能为空");
+    if (const auto* node = findNode(person); node && node->internalId != mioId_)
+        return node;
+    const PersonNode* match = nullptr;
+    // Account identifiers have priority over mutable display names.
+    for (const auto& node : nodes_) {
+        if (node->internalId == mioId_) continue;
+        const auto qq = extractQq(*node);
+        bool matches = !qq.empty() && (qq == person || platformTag("qq", qq) == person ||
+            platformTag("napcat", qq) == person || platformTag("onebot", qq) == person);
+        for (const auto& id : node->platformIds) matches = matches || id == person;
+        if (!matches) continue;
+        if (match) throw std::invalid_argument("账号映射不唯一，请使用 internal_id");
+        match = node.get();
+    }
+    if (match) return match;
+    for (const auto& node : nodes_) {
+        if (node->internalId == mioId_ || !nameMatches(*node, person)) continue;
+        if (match) throw std::invalid_argument("联系人重名，请使用 internal_id 或 QQ 号");
+        match = node.get();
+    }
+    if (!match) throw std::invalid_argument("未找到联系人，请先用 upsert_contact 录入");
+    return match;
+}
+
+PersonNode RelationshipGraph::resolveContact(const std::string& person) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return *resolveContactLocked(person);
+}
+
+PersonNode RelationshipGraph::upsertContact(
+    const std::string& name, const std::string& platform,
+    const std::string& platformId, const std::optional<std::string>& notes,
+    std::int64_t now) {
+    if (name.empty()) throw std::invalid_argument("联系人称呼不能为空");
+    if (platform.empty() != platformId.empty())
+        throw std::invalid_argument("platform 与 user_id 必须同时提供");
+    std::lock_guard<std::mutex> lock(mtx_);
+    PersonNode* target = nullptr;
+    if (!platformId.empty()) {
+        if (const auto* existing = findByPlatformLocked(platform, platformId))
+            target = findNode(existing->internalId);
+    }
+    if (!target) {
+        // 同名但具有不同账号的人保持独立；只有无账号的名字记录才可以绑定。
+        for (const auto& node : nodes_) {
+            if (node->internalId == mioId_ || !nameMatches(*node, name)) continue;
+            if (!platformId.empty() && !node->platformIds.empty()) continue;
+            if (target) throw std::invalid_argument("联系人重名，请提供 platform 和 user_id");
+            target = node.get();
+        }
+    }
+    if (target && target->internalId == mioId_)
+        throw std::invalid_argument("不能修改机器人自身的联系人记录");
+    if (!target) {
+        auto node = std::make_unique<PersonNode>();
+        node->internalId = "p" + std::to_string(nextInternalId_++);
+        node->firstSeenAt = now;
+        node->lastSeenAt = now;
+        node->weight = 1.0;
+        target = node.get();
+        nodes_.push_back(std::move(node));
+        ensureEdge(mioId_, target->internalId);
+    }
+    target->name = name;
+    if (!platformId.empty() && target->platformIds.empty())
+        target->platformIds.push_back(platformTag(platform, platformId));
+    if (notes) target->personal = *notes;
+    save();
+    return *target;
+}
+
+PersonNode RelationshipGraph::updateContact(
+    const std::string& person, const std::optional<std::string>& name,
+    const std::optional<std::string>& notes) {
+    if (name && name->empty()) throw std::invalid_argument("联系人称呼不能为空");
+    std::lock_guard<std::mutex> lock(mtx_);
+    const auto* found = resolveContactLocked(person);
+    auto* node = findNode(found->internalId);
+    if (name) node->name = *name;
+    if (notes) node->personal = *notes;
+    save();
+    return *node;
+}
+
 std::string RelationshipGraph::extractQq(const PersonNode& node) {
     for (const auto& pid : node.platformIds) {
         if (pid.rfind("[qq][", 0) == 0 && pid.back() == ']') {
@@ -279,7 +412,7 @@ void RelationshipGraph::bumpIntimacy(const std::string& a,
     const std::int64_t last =
         std::max(na ? na->lastSeenAt : 0, nb ? nb->lastSeenAt : 0);
     e->intimacy = std::min(1.0, decayed(e->intimacy, last, now) + delta);
-    save();
+    savePassive();
 }
 
 double RelationshipGraph::intimacy(const std::string& a,
@@ -425,8 +558,21 @@ void RelationshipGraph::save() {
     }
     j["nodes"] = std::move(nodes);
     j["edges"] = std::move(edges);
+    if (!file_.parent_path().empty())
+        std::filesystem::create_directories(file_.parent_path());
     std::ofstream out(file_, std::ios::trunc);
     out << j.dump() << '\n';
+    out.flush();
+    if (!out) throw std::runtime_error("无法保存通讯录: " + file_.string());
+}
+
+void RelationshipGraph::savePassive() {
+    try {
+        save();
+    } catch (const std::exception& e) {
+        log::warn("RelationshipGraph",
+                  std::string("通讯录写盘失败(本次仅内存生效): ") + e.what());
+    }
 }
 
 } // namespace mio

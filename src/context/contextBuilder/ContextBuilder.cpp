@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "context/costEstimator/Tokens.h"
+#include "core/message/History.h"
 #include "log/Log.h"
 
 namespace mio {
@@ -19,28 +20,8 @@ BuildResult ContextBuilder::build(const BuildInput& in) {
     FusionUnit& unit = *in.unit;
 
     // 完整候选 = unit 上下文（当前回合已由调用方 append 进来，勿重复加入）
-    std::vector<Msg> msgs = unit.context();
-
-    // 保护：历史轮次（在最后一条 Assistant 消息之前的所有 User 消息）绝不重复上送图片数据，
-    // 仅保留最新一轮未回复的 User 消息中携带的图片，彻底防止视觉模型在多轮对话中因历史图片干扰或冻结。
-    std::size_t lastAssistantIdx = std::string::npos;
-    for (std::size_t i = msgs.size(); i > 0; --i) {
-        if (msgs[i - 1].role == Role::Assistant) {
-            lastAssistantIdx = i - 1;
-            break;
-        }
-    }
-    if (lastAssistantIdx != std::string::npos) {
-        for (std::size_t i = 0; i <= lastAssistantIdx; ++i) {
-            if (msgs[i].parts.empty()) continue;
-            msgs[i].parts.erase(
-                std::remove_if(msgs[i].parts.begin(), msgs[i].parts.end(),
-                               [](const Part& p) {
-                                   return p.ephemeral || p.kind == Part::Kind::Image;
-                               }),
-                msgs[i].parts.end());
-        }
-    }
+    std::vector<Msg> msgs = history::repairToolHistory(unit.context());
+    history::stripCompletedMedia(msgs);
     std::int64_t estimated =
         estimateTokens(msgs) + estimateTokens(in.systemPrompt);
 
@@ -51,7 +32,8 @@ BuildResult ContextBuilder::build(const BuildInput& in) {
     if (overBudget && !unit.context().empty() && summary_) {
         // 上下文不够 → 对 unit 重新冷启动（[摘要前20 + 近5原文]）后重建
         unit.reColdStart(*summary_);
-        msgs = unit.context();
+        msgs = history::repairToolHistory(unit.context());
+        history::stripCompletedMedia(msgs);
         estimated = estimateTokens(msgs) + estimateTokens(in.systemPrompt);
         r.reColdStarted = true;
         log::info("ContextBuilder", "上下文超水位，触发重新冷启动");

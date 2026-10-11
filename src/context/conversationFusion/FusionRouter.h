@@ -68,6 +68,13 @@ public:
     // senderId（wire 层标签渲染用；档案/身份归一仍用原始 senderId）
     std::string displayName(const IncomingMessage& msg) const;
 
+    // Merge explicit mentions with boundary-checked textual @QQ references.
+    static std::vector<std::string> mentionedUserIds(const IncomingMessage& msg);
+    // Per-request identity hints: keep raw IDs and expose the graph's current
+    // names without waiting for the cached system prompt to be rebuilt.
+    std::string mentionContext(const std::vector<std::string>& ids,
+                               const std::string& platform) const;
+
     // 模型工具入口：设置当前来源对应 unit 的公开/私密状态。
     // 直接修改当前 unit 的 isPublic，不触发拆融合/冷启动。
     FusionUnit* setPublic(const ConversationKey& source, bool isPublic);
