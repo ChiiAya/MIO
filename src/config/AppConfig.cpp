@@ -184,24 +184,6 @@ void from_json(const nlohmann::json& j, ContextBuilderConfig& c) {
     readIfExists(j, "topicWarmupTurns", c.topicWarmupTurns);
 }
 
-void to_json(nlohmann::json& j, const MemoryConfig& c) {
-    j = nlohmann::json{
-        {"dim", c.dim},
-        {"maxCandidates", c.maxCandidates},
-        {"topK", c.topK},
-        {"minSimilarity", c.minSimilarity},
-        {"decayTauSeconds", c.decayTauSeconds}
-    };
-}
-
-void from_json(const nlohmann::json& j, MemoryConfig& c) {
-    readIfExists(j, "dim", c.dim);
-    readIfExists(j, "maxCandidates", c.maxCandidates);
-    readIfExists(j, "topK", c.topK);
-    readIfExists(j, "minSimilarity", c.minSimilarity);
-    readIfExists(j, "decayTauSeconds", c.decayTauSeconds);
-}
-
 void to_json(nlohmann::json& j, const NapCatConfig& c) {
     j = nlohmann::json{
         {"listenHost", c.listenHost},
@@ -268,7 +250,6 @@ void to_json(nlohmann::json& j, const AppConfig& c) {
         {"embedding", c.embedding},
         {"fusion", c.fusion},
         {"contextBuilder", c.contextBuilder},
-        {"memory", c.memory},
         {"napcat", c.napcat},
         {"inputBuffer", c.inputBuffer},
         {"splitter", c.splitter},
@@ -298,9 +279,6 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     }
     if (j.contains("contextBuilder") && j["contextBuilder"].is_object()) {
         from_json(j["contextBuilder"], c.contextBuilder);
-    }
-    if (j.contains("memory") && j["memory"].is_object()) {
-        from_json(j["memory"], c.memory);
     }
     if (j.contains("napcat") && j["napcat"].is_object()) {
         from_json(j["napcat"], c.napcat);
@@ -336,7 +314,6 @@ AppConfig AppConfig::fromEnvironment() {
     cfg.embedding = EmbeddingConfig::fromEnvironment();
     cfg.fusion = FusionConfig{};
     cfg.contextBuilder = ContextBuilderConfig{};
-    cfg.memory = MemoryConfig{};
     cfg.napcat = NapCatConfig::fromEnvironment();
     cfg.inputBuffer = InputBufferConfig{};
     cfg.splitter = MessageSplitterConfig{};

@@ -15,7 +15,7 @@
 
 #include "context/costEstimator/Tokens.h"
 #include "log/Log.h"
-#include "memory/VectorMath.h"
+#include "core/math/VectorMath.h"
 
 namespace mio {
 

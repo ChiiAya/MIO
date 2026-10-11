@@ -80,15 +80,8 @@
     "topicWarmupTurns": 5     // 会话创建后前 N 轮在 System Prompt 中提醒模型更新维护话题标签
   },
 
-  // 【7. 长短期记忆检索系统配置 (MemoryConfig)】
-  // 基于 SQLite + 向量余弦相似度 + 时间衰减权重实现真实记忆检索与回想
-  "memory": {
-    "dim": 1024,                      // 向量维度 (必须与 Embedding 模型输出严格对应，BGE-M3 为 1024)
-    "maxCandidates": 256,             // SQL 权限过滤阶段裁剪出的候选记忆数量上限
-    "topK": 3,                        // 最终注入模型上下文的最高得分记忆条数
-    "minSimilarity": 0.30,            // 余弦相似度绝对门槛 (低于此阈值的无关记忆直接丢弃)
-    "decayTauSeconds": 2592000.0      // 记忆时间半衰常数 τ (秒，30天)
-  },
+  // 【7. 长期记忆】已迁出内置模块，改由 MCP 提供（见下文第 10 节 mcp 配置里的
+  // graphiti_* 工具）。原先的 SQLite + 向量检索 MemoryConfig 已随内置记忆系统删除。
 
   // 【8. NapCat QQ 适配器配置 (NapCatConfig)】
   // 基于 OneBot v11 反向 WebSocket 协议连接 NapCat
