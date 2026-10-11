@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "log/Log.h"
+#include "core/message/History.h"
 
 namespace mio {
 
@@ -60,27 +61,33 @@ std::vector<Msg> Achieve::load(const ConversationKey& key) {
 
 ColdRead Achieve::coldRead(const ConversationKey& key, SummaryManager& summary,
                            int summaryCount, int rawKeep) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    const std::vector<Msg>& full = ensureLoaded(key);
-    const std::size_t n = full.size();
+    const auto full = history::repairToolHistory(load(key));
+    const auto tailStart = history::safeTailStart(full, rawKeep);
 
     ColdRead out;
-    if (n <= static_cast<std::size_t>(rawKeep)) {
-        out.msgs = full;  // 不足 rawKeep 条：原文返回，不调 LLM（保持默认私密）
+    if (tailStart == 0 || summaryCount <= 0) {
+        out.msgs = full;  // 保留完整工具批次和全部未完成输入。
         return out;
     }
-    // 摘要前 summaryCount 条（不与近 rawKeep 重叠），近 rawKeep 条原文保留
+    // 压缩边界不能拆散工具调用，也不能消费尚未回复的多模态输入。
     const std::size_t summarizeN =
-        std::min<std::size_t>(static_cast<std::size_t>(summaryCount),
-                              n - static_cast<std::size_t>(rawKeep));
+        std::min<std::size_t>(static_cast<std::size_t>(summaryCount), tailStart);
     std::vector<Msg> toSummarize(full.begin(), full.begin() + summarizeN);
-    const SummaryOutcome outcome = summary.summarizeWithVerdict(toSummarize);
+    SummaryOutcome outcome;
+    try {
+        outcome = summary.summarizeWithVerdict(toSummarize);
+        if (outcome.text.empty()) throw std::runtime_error("摘要为空");
+    } catch (const std::exception& error) {
+        log::warn("Achieve", std::string("冷读取摘要失败，保留原历史: ") + error.what());
+        out.msgs = full;
+        return out;
+    }
 
     Msg summaryMsg;
     summaryMsg.role = Role::User;
     summaryMsg.text = outcome.text;
     out.msgs.push_back(std::move(summaryMsg));
-    out.msgs.insert(out.msgs.end(), full.end() - rawKeep, full.end());
+    out.msgs.insert(out.msgs.end(), full.begin() + tailStart, full.end());
     // privateVerdict = true 表示私密，isPublic 取反；
     // topic 随摘要同步带出，供调用方创建/重建 unit 时回写。
     out.isPublic = !outcome.privateVerdict;

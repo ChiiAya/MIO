@@ -31,6 +31,10 @@
 #include "log/Log.h"
 #include "runtime/Runtime.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace mio {
 namespace {
 

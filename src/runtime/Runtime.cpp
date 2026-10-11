@@ -1,4 +1,6 @@
 #include "runtime/Runtime.h"
+#include "runtime/ContactTools.h"
+#include "runtime/MessageTools.h"
 
 #include "admin/AdminServer.h"
 #include "config/AppConfig.h"
@@ -9,6 +11,7 @@
 #include "providers/embedding/openai/OpenAiEmbedding.h"
 #include "providers/llm/tool/ToolLoop.h"
 #include "providers/mcp/McpManager.h"
+#include "core/message/History.h"
 #include "log/Log.h"
 
 #include <algorithm>
@@ -38,6 +41,7 @@ static thread_local std::string g_activeSenderName;
 static thread_local std::string g_activePlatform;
 static thread_local std::string g_activeGroupId;
 static thread_local bool g_activeKeepSilent = false;
+static thread_local std::vector<std::string> g_replyableMessageIds;
 
 std::string hexEncode(const std::string& s) {
     static const char* digits = "0123456789ABCDEF";
@@ -205,6 +209,16 @@ std::string Runtime::systemPrompt() const {
 
 void Runtime::setMessageSender(MessageSender sender) {
     std::lock_guard<std::mutex> lock(senderMtx_);
+    if (!sender) { messageSender_ = {}; return; }
+    messageSender_ = [sender = std::move(sender)](const ConversationKey& conv, const OutgoingMessage& message) {
+        // Older adapters cannot represent metadata; never silently drop it.
+        if (!message.mentionUserIds.empty() || !message.replyToMessageId.empty()) return false;
+        return sender(conv, conv.scope == ConversationScope::Private ? conv.id : std::string{}, message.text);
+    };
+}
+
+void Runtime::setStructuredMessageSender(StructuredSender sender) {
+    std::lock_guard<std::mutex> lock(senderMtx_);
     messageSender_ = std::move(sender);
 }
 
@@ -264,12 +278,42 @@ int calculateDelayMs(const std::string& previousText, const MessageSplitterConfi
     return delay;
 }
 
+// 分片睡眠的粒度：新消息打断时最多多等这么久，而不是等满整个打字延迟
+constexpr int kSplitterSleepSliceMs = 50;
+
+// 回复里是否真的存在可发送内容。
+// 模型偶尔只回空白或一个分段符（"[SEP]"），拆分后气泡为空——那不是发送
+// 失败，而是没有内容可发，必须按静默处理，否则会把整轮回复判为投递失败。
+bool hasDeliverableText(const std::string& text, const MessageSplitterConfig& cfg) {
+    const auto visible = [](const std::string& token) {
+        return token.find_first_not_of(" \t\r\n") != std::string::npos;
+    };
+    if (cfg.enabled && !cfg.delimiter.empty()) {
+        std::size_t start = 0;
+        while (start <= text.size()) {
+            const auto pos = text.find(cfg.delimiter, start);
+            const auto token = text.substr(
+                start, pos == std::string::npos ? std::string::npos : pos - start);
+            if (visible(token)) return true;
+            if (pos == std::string::npos) break;
+            start = pos + cfg.delimiter.size();
+        }
+        return false;
+    }
+    return visible(text);
+}
+
 } // namespace
 
-void Runtime::emit(const ConversationKey& conv, const std::string& senderId, const std::string& rawText) {
-    if (rawText.empty()) return;
+bool Runtime::emit(const ConversationKey& conv, const std::string&, const std::string& rawText) {
+    return emit(conv, OutgoingMessage{rawText, {}, {}});
+}
 
-    MessageSender sender;
+bool Runtime::emit(const ConversationKey& conv, const OutgoingMessage& message) {
+    const auto& rawText = message.text;
+    if (rawText.empty()) return false;
+
+    StructuredSender sender;
     MessageSplitterConfig splitter;
     {
         std::lock_guard<std::mutex> lock(senderMtx_);
@@ -278,7 +322,7 @@ void Runtime::emit(const ConversationKey& conv, const std::string& senderId, con
     }
     if (!sender) {
         log::warn("Runtime", "未配置 MessageSender，无法发送平台消息: " + rawText);
-        return;
+        return false;
     }
 
     std::vector<std::string> bubbles;
@@ -293,18 +337,37 @@ void Runtime::emit(const ConversationKey& conv, const std::string& senderId, con
         }
     }
 
+    if (bubbles.empty()) return false;
+    const auto generation = g_activeUnit ? g_activeUnit->generation() : 0;
+    const auto stillCurrent = [generation] {
+        return !g_activeUnit || g_activeUnit->generation() == generation;
+    };
     for (std::size_t i = 0; i < bubbles.size(); ++i) {
         if (i > 0 && splitter.enabled) {
             int delayMs = calculateDelayMs(bubbles[i - 1], splitter);
-            if (delayMs > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            // 分片等待：被新消息打断时立刻停止连发，不再等满整个打字延迟
+            for (int slept = 0; slept < delayMs; slept += kSplitterSleepSliceMs) {
+                if (!stillCurrent()) return false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(
+                    std::min(kSplitterSleepSliceMs, delayMs - slept)));
             }
         }
-        sender(conv, senderId, bubbles[i]);
+        if (!stillCurrent()) return false;
+        OutgoingMessage bubble{bubbles[i], {}, {}};
+        if (i == 0) {
+            bubble.mentionUserIds = message.mentionUserIds;
+            bubble.replyToMessageId = message.replyToMessageId;
+        }
+        if (!sender(conv, bubble)) return false;
     }
+    return true;
 }
 
 void Runtime::registerBuiltinTools() {
+    registerContactTools(registry_, graph_, [this] {
+        std::unique_lock<std::shared_mutex> lock(servicesMtx_);
+        systemPrompt_ = buildSystemPrompt(persona_, graph_, cognition_, kMaxPeopleTokens);
+    });
     // get_current_time —— 故意选一个"模型绝对不可能自己知道答案"的工具，
     // 用于验证工具链路是否打通。
     ToolDef timeDef;
@@ -470,9 +533,8 @@ void Runtime::registerBuiltinTools() {
                                         g_activePlatform == "onebot")
                                            ? g_activeSenderId
                                            : "";
-                      if (const PersonNode* p = graph_.findByPlatform(
-                              g_activePlatform, g_activeSenderId);
-                          p != nullptr) {
+                      if (const auto p = graph_.platformContact(
+                              g_activePlatform, g_activeSenderId); p) {
                           info["graph_name"] = p->name;
                           if (qq.empty()) {
                               qq = RelationshipGraph::extractQq(*p);
@@ -505,43 +567,21 @@ void Runtime::registerBuiltinTools() {
              "要查询的人物姓名或称呼（可选，若为空则列出所有认识的人）"}}}}}};
     registry_.add(std::move(knownPersonDef),
                   [this](const nlohmann::json& args) -> std::string {
-                      std::string queryName = args.value("name", "");
-                      if (!queryName.empty()) {
-                          const PersonNode* p = graph_.findByName(queryName);
-                          if (!p) {
-                              auto all = graph_.allPersons();
-                              for (const auto* node : all) {
-                                  if (node && (node->name.find(queryName) != std::string::npos ||
-                                               node->personal.find(queryName) != std::string::npos)) {
-                                      p = node;
-                                      break;
-                                  }
-                              }
+                      const std::string query = args.value("name", "");
+                      auto render = [](const PersonNode& person) {
+                          const auto qq = RelationshipGraph::extractQq(person);
+                          return nlohmann::json{{"internal_id", person.internalId}, {"name", person.name},
+                              {"qq", qq.empty() ? "未知" : qq}, {"platform_ids", person.platformIds},
+                              {"personal", person.personal}};
+                      };
+                      if (!query.empty()) {
+                          try { return render(graph_.resolveContact(query)).dump(); }
+                          catch (const std::invalid_argument& error) {
+                              return std::string("error: ") + error.what();
                           }
-                          if (!p) {
-                              return "未找到名为 \"" + queryName + "\" 的人。";
-                          }
-                          std::string qq = RelationshipGraph::extractQq(*p);
-                          nlohmann::json result;
-                          result["name"] = p->name;
-                          result["qq"] = qq.empty() ? "未知" : qq;
-                          result["platform_ids"] = p->platformIds;
-                          if (!p->personal.empty()) result["personal"] = p->personal;
-                          return result.dump();
                       }
-
-                      auto persons = graph_.allPersons();
-                      nlohmann::json list = nlohmann::json::array();
-                      for (const auto* p : persons) {
-                          if (!p) continue;
-                          std::string qq = RelationshipGraph::extractQq(*p);
-                          nlohmann::json item;
-                          item["name"] = p->name;
-                          item["qq"] = qq.empty() ? "未知" : qq;
-                          item["platform_ids"] = p->platformIds;
-                          if (!p->personal.empty()) item["personal"] = p->personal;
-                          list.push_back(std::move(item));
-                      }
+                      auto list = nlohmann::json::array();
+                      for (const auto& person : graph_.contacts()) list.push_back(render(person));
                       return list.dump();
                   },
                   ToolLayer::Builtin);
@@ -597,48 +637,11 @@ void Runtime::registerBuiltinTools() {
         },
         ToolLayer::Builtin);
 
-    // send_message —— 主动向当前会话（或指定目标）发送消息（支持 [SEP] 拆分为多气泡并模拟打字延迟）
-    ToolDef sendMsgDef;
-    sendMsgDef.name = "send_message";
-    sendMsgDef.description =
-        "向当前会话（或指定目标）发送一条或多条消息。如需分多气泡连发，可在语句间插入 \"[SEP]\" 分段标识。"
-        "可用于耗时工具调用前先行回复告知对方、或分句自然聊天。";
-    sendMsgDef.parametersJsonSchema = {
-        {"type", "object"},
-        {"properties",
-         {{"text",
-           {{"type", "string"},
-            {"description", "要发送的消息文本，支持使用 [SEP] 分段标识分成多气泡"}}},
-          {"target",
-           {{"type", "string"},
-            {"description", "可选，目标用户ID或群号。留空则发送至当前正在对话的会话"}}}}},
-        {"required", nlohmann::json::array({"text"})}};
-    registry_.add(
-        std::move(sendMsgDef),
-        [this](const nlohmann::json& args) -> std::string {
-            const std::string text = args.value("text", "");
-            if (text.empty()) return "error: 发送内容 text 不能为空";
-
-            ConversationKey targetConv = g_activeConv;
-            std::string targetSender = g_activeSenderId;
-
-            if (args.contains("target") && args["target"].is_string()) {
-                std::string target = args["target"].get<std::string>();
-                if (!target.empty() && target != g_activeConv.id && target != g_activeSenderId) {
-                    if (target.rfind("group:", 0) == 0) {
-                        targetConv = ConversationKey::groupChat(target.substr(6));
-                    } else if (target.rfind("private:", 0) == 0) {
-                        targetConv = ConversationKey::privateChat(target.substr(8));
-                    } else {
-                        targetConv = ConversationKey{g_activeConv.scope, target};
-                    }
-                }
-            }
-
-            emit(targetConv, targetSender, text);
-            return "消息发送成功。";
-        },
-        ToolLayer::Builtin);
+    registerMessageTools(registry_, [] {
+        return MessageToolContext{g_activeConv, g_activePlatform, g_replyableMessageIds};
+    }, [this](const ConversationKey& conv, const OutgoingMessage& message) {
+        return emit(conv, message);
+    });
 
     // wait —— 模型自主等待指定时长后再继续思考与行动
     auto createWaitDef = []() {
@@ -729,7 +732,8 @@ void Runtime::registerBuiltinTools() {
 std::string Runtime::rebuildSystemPrompt(
     const std::vector<DiaryEntry>& cognition) {
     // 只读已封存认知（由摘要路径提供），保护 prompt cache 前缀
-    return buildSystemPrompt(persona_, graph_, cognition, kMaxPeopleTokens);
+    if (!cognition.empty()) cognition_ = cognition;
+    return buildSystemPrompt(persona_, graph_, cognition_, kMaxPeopleTokens);
 }
 
 void Runtime::updateState(const Event& ev) {
@@ -749,8 +753,7 @@ std::string Runtime::resolveMemoryPerson(const IncomingMessage& msg) const {
     // 私聊 → 对话者 internalId：私密记忆跨会话跟随本人（同人跨平台可召回）；
     // 群聊 → 空：没有单一归属人，群记忆按 conv_key 在会话内共享
     if (msg.conversation.scope != ConversationScope::Private) return "";
-    if (const PersonNode* p = graph_.findByPlatform(msg.platform, msg.senderId);
-        p != nullptr)
+    if (const auto p = graph_.platformContact(msg.platform, msg.senderId); p)
         return p->internalId;
     return "";
 }
@@ -771,13 +774,11 @@ BotReply Runtime::ingest(IncomingMessage message) {
     std::shared_ptr<Llm> currentLlm;
     std::shared_ptr<ContextBuilder> currentBuilder;
     std::shared_ptr<SummaryManager> currentSummary;
-    std::string currentSystemPrompt;
     {
         std::shared_lock<std::shared_mutex> lock(servicesMtx_);
         currentLlm = llm_;
         currentBuilder = builder_;
         currentSummary = summary_;
-        currentSystemPrompt = systemPrompt_;
     }
     if (!currentLlm || !currentBuilder) {
         throw std::runtime_error("Runtime 服务未就绪");
@@ -785,6 +786,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
 
     // 1) 物理通道层防抖：获取当前物理会话专属的 InputBuffer
     auto buffer = inputBuffers_.getOrCreate(message.conversation);
+    message.atUserIds = FusionRouter::mentionedUserIds(message);
     const std::string displayName = router_.displayName(message);
     const PushResult pushRes = buffer->push(message, displayName, now);
     if (pushRes == PushResult::Rejected) {
@@ -829,6 +831,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
             g_activePlatform.clear();
             g_activeGroupId.clear();
             g_activeKeepSilent = false;
+            g_replyableMessageIds.clear();
         }
     } contextGuard;
 
@@ -851,15 +854,6 @@ BotReply Runtime::ingest(IncomingMessage message) {
         // 上下文级锁：同 unit 串行（含 LLM 往返），跨 unit 并行
         std::lock_guard<std::mutex> lock(unit->mtx);
 
-        // RAII 保护：无论本轮正常收尾还是异常退出，当轮结束后立即剥离 unit 上下文中的临时/图片片段，
-        // 避免历史多模态数据在后续轮次累加并导致模型注意力与视觉输入冻结
-        struct EphemeralCleaner {
-            FusionUnit* u;
-            ~EphemeralCleaner() {
-                if (u) u->stripEphemeralParts();
-            }
-        } cleaner{unit};
-
         // 4) 批次内所有原始消息分别落入物理会话的真实档案
         for (const auto& raw : batch.rawMessages) {
             Msg rawTurn{Role::User};
@@ -870,6 +864,9 @@ BotReply Runtime::ingest(IncomingMessage message) {
             rawTurn.senderName = router_.displayName(raw);
             rawTurn.platform = raw.platform;
             rawTurn.groupId = raw.groupId;
+            rawTurn.messageId = raw.messageId;
+            rawTurn.replyToMessageId = raw.replyToMessageId;
+            rawTurn.atUserIds = raw.atUserIds;
             achieve_.append(batch.conversation, rawTurn);
         }
 
@@ -880,7 +877,9 @@ BotReply Runtime::ingest(IncomingMessage message) {
 
         // 6) 构建请求（当前回合已 append 进 unit；上下文不够 → 重新冷启动压缩）
         BuildInput in;
-        in.systemPrompt = currentSystemPrompt;
+        // A contact tool in another turn may have refreshed Facts after the
+        // initial service snapshot was taken.
+        in.systemPrompt = systemPrompt();
         in.unit = unit;
         in.now = now;
         auto result = currentBuilder->build(in);
@@ -888,6 +887,24 @@ BotReply Runtime::ingest(IncomingMessage message) {
 
         ChatRequest req = result.request;
         req.tools = registry_.defs();
+        // Resolve identities on each request copy so cold-loaded histories and
+        // contacts learned after the message arrived also have current names.
+        // 只给"尚未回答"的输入附加身份提示：历史轮次保持逐字节稳定，提示词
+        // 缓存前缀不会被联系人改名打断，也省掉重复的 token 开销。
+        const auto hintFrom = history::pendingTurnStart(req.messages);
+        for (std::size_t index = 0; index < req.messages.size(); ++index) {
+            auto& turn = req.messages[index];
+            if (turn.role == Role::User && !turn.messageId.empty() &&
+                turn.platform == g_activePlatform &&
+                ((batch.conversation.scope == ConversationScope::Group && turn.groupId == batch.conversation.id) ||
+                 (batch.conversation.scope == ConversationScope::Private && turn.groupId.empty() &&
+                  turn.senderId == batch.conversation.id)))
+                g_replyableMessageIds.push_back(turn.messageId);
+            if (turn.role != Role::User || turn.atUserIds.empty()) continue;
+            if (index < hintFrom) continue;
+            const auto hints = router_.mentionContext(turn.atUserIds, turn.platform);
+            if (!hints.empty()) turn.text += "\n" + hints;
+        }
 
         // 7) 工具循环；sink：逐条落档案 + 入 unit 上下文
         ToolLoopOptions loopOpt;
@@ -895,12 +912,51 @@ BotReply Runtime::ingest(IncomingMessage message) {
             return unit->generation() != myGen;
         };
 
+        std::optional<Msg> completion;
         resp = runToolLoop(*currentLlm, registry_, req, loopOpt,
-                           [this, unit, conv = batch.conversation](
+                           [this, unit, &completion, conv = batch.conversation](
                                 const Msg& m) {
+                                // A final answer only completes the input after
+                                // delivery succeeds; failed sends remain retryable.
+                                if (m.role == Role::Assistant && m.toolCalls.empty()) {
+                                    completion = m;
+                                    return;
+                                }
                                 achieve_.append(conv, m);
                                 unit->append(m);
                             });
+        if (unit->generation() != myGen) {
+            resp.finishReason = "interrupted";
+            resp.text.clear();
+        }
+        if (resp.finishReason != "interrupted") {
+            if (g_activeKeepSilent) {
+                resp.text.clear();
+            } else if (!resp.text.empty() && hasMessageSender()) {
+                // 只有"确实有内容可发"时才把发送失败当成失败
+                bool deliverable = false;
+                {
+                    std::lock_guard<std::mutex> lock(senderMtx_);
+                    deliverable = hasDeliverableText(resp.text, splitterConfig_);
+                }
+                if (!deliverable) {
+                    log::info("Runtime", "模型回复仅含空白或分段符，本轮按静默处理");
+                    resp.text.clear();
+                } else if (!emit(batch.conversation, targetMsg.senderId, resp.text)) {
+                    if (unit->generation() != myGen) {
+                        resp.finishReason = "interrupted";
+                        resp.text.clear();
+                    } else throw std::runtime_error("平台回复发送失败");
+                }
+            }
+            if (resp.finishReason != "interrupted") {
+                if (completion) {
+                    achieve_.append(batch.conversation, *completion);
+                    unit->append(*completion);
+                }
+                unit->stripEphemeralParts();
+            }
+        }
     }
     // 8) 锁外：状态快照 + 审计 + Facts 重建
     for (const auto& raw : batch.rawMessages) {
@@ -921,8 +977,6 @@ BotReply Runtime::ingest(IncomingMessage message) {
     if (g_activeKeepSilent) {
         log::info("Runtime", "模型自主调用 keepsilent 保持沉默，本轮不发送回复消息");
         resp.text = "";
-    } else if (!resp.text.empty() && hasMessageSender()) {
-        emit(batch.conversation, targetMsg.senderId, resp.text);
     }
 
     return BotReply{batch.conversation, resp.text, /*interrupted=*/false};

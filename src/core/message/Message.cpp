@@ -91,6 +91,9 @@ nlohmann::json msgToJson(const Msg& m) {
     if (!m.senderName.empty()) j["senderName"] = m.senderName;
     if (!m.platform.empty()) j["platform"] = m.platform;
     if (!m.groupId.empty()) j["groupId"] = m.groupId;
+    if (!m.messageId.empty()) j["messageId"] = m.messageId;
+    if (!m.replyToMessageId.empty()) j["replyToMessageId"] = m.replyToMessageId;
+    if (!m.atUserIds.empty()) j["atUserIds"] = m.atUserIds;
 
     return j;
 }
@@ -134,6 +137,9 @@ Msg msgFromJson(const nlohmann::json& j) {
     m.senderName = j.value("senderName", "");
     m.platform = j.value("platform", "");
     m.groupId = j.value("groupId", "");
+    m.messageId = j.value("messageId", "");
+    m.replyToMessageId = j.value("replyToMessageId", "");
+    m.atUserIds = j.value("atUserIds", std::vector<std::string>{});
 
     return m;
 }
