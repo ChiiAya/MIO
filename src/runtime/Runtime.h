@@ -124,12 +124,15 @@ public:
     // Facts / systemPrompt 的刷新边界（缓存前缀优先）。
     // systemPrompt_ 位于 wire 请求的第一位，改一个字节就会让**所有**会话的
     // 整段前缀缓存失效；因此它只在显式边界重建：进程启动、配置重载、
-    // 重新冷启动，以及定时日界（MIO 维护任务）。通讯录工具只置脏标记，
+    // 重新冷启动，以及定时任务（daily refresh_facts）。通讯录工具只置脏标记，
     // 由这些边界统一消费。cognition 非空时顺带封存新认知（含日记消费）。
     void refreshFactsNow(const std::string& reason,
                          std::vector<DiaryEntry> cognition = {});
-    // 日界边界检查（挂在 ingest 上，无常驻线程）：到点才重建，并把边界推到明天
-    void refreshFactsAtDayBoundary();
+
+    // 维护回合：按 prompt 对"当天有活动的每个会话"各跑一次**隐藏** LLM 回合。
+    // 模型可以调用 remember 等工具，但绝不会向平台发送消息，也不会写进
+    // 真实会话历史/档案（只在上下文副本上工作）。
+    void runMaintenancePrompt(const std::string& prompt);
 
 private:
     // Facts 渲染（冷启动/重新冷启动后/图谱变化时重建）
@@ -169,7 +172,6 @@ private:
 
     std::string systemPrompt_;    // Facts 渲染结果（只在 refreshFactsNow 的边界重建）
     bool factsDirty_ = false;     // 通讯录/认知已变更，等待下一个刷新边界
-    std::int64_t nextFactsRefreshAt_ = 0; // 下一个日界刷新时刻（epoch 秒，0=未排程）
     std::vector<DiaryEntry> cognition_; // 通讯录更新时重建提示词所需的已封存认知
     RuntimeState state_;
     mutable std::mutex stateMtx_;
@@ -179,6 +181,10 @@ private:
     mutable std::mutex senderMtx_;
     MessageSplitterConfig splitterConfig_;
     std::unique_ptr<mcp::McpManager> mcpManager_;
+    // 声明在最后 = 最先析构：任务线程必须在其它成员（图谱/日记/服务指针）之前停掉
+    std::unique_ptr<Scheduler> scheduler_;
+
+    void startScheduler(const MaintenanceConfig& config);
 };
 
 } // namespace mio

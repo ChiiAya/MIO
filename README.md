@@ -224,6 +224,26 @@ MIO 提供基础的 Agent 执行闭环与保护护栏：
 | `list_contacts` | `{"query"?: string}` | 查询通讯录（按称呼/QQ/internal_id，缺省列出全部联系人） |
 | `upsert_contact` | `{"name": string, "qq"?: string, "platform"?: string, "user_id"?: string, "notes"?: string}` | 登记新联系人；已登记账号不会被覆盖称呼 |
 
+#### ⏰ 定时事项（维护任务）
+
+`config.json` 的 `maintenance` 段是一张通用任务表。设计前提是**缓存前缀优先**：
+`systemPrompt` 位于每次请求的第一位，改一个字节就会让**所有**会话的整段前缀缓存失效，
+所以通讯录/认知变更不会立刻进 prompt，而是折叠到日界统一消费。
+
+| 字段 | 说明 |
+|---|---|
+| `enabled` | 总开关 |
+| `tasks[].action` | `refresh_facts`（消费日记 + 重建 Facts）/ `prompt`（维护回合） |
+| `tasks[].kind` | `daily`（每天 `at`）/ `once`（`at` 执行一次）/ `interval`（每 `everyMinutes` 分钟） |
+| `tasks[].at` | 本地 `HH:MM`（`daily` / `once`） |
+| `tasks[].prompt` | `action=prompt` 时的提示文本 |
+
+`refresh_facts` 是 Facts 的常规刷新边界（另外两个边界是配置重载与重新冷启动）。
+`prompt` 会对"当天有活动的每个会话"各跑一次**隐藏回合**：模型可以调用 `remember`
+把当天的经历写进长期记忆，但 `send_message` 会被拒绝、输出不落档案、也不污染真实
+会话历史（只在上下文副本上工作）。日志里 `systemPrompt 重建` 一行带 `fp` 指纹，
+`fp` 不变就说明缓存前缀没被打断。示例见 `config.example.json` 第 11 节。
+
 ---
 
 ## 📦 依赖与构建
