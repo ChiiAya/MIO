@@ -272,7 +272,8 @@ void to_json(nlohmann::json& j, const AppConfig& c) {
         {"napcat", c.napcat},
         {"inputBuffer", c.inputBuffer},
         {"splitter", c.splitter},
-        {"mcp", c.mcp}
+        {"mcp", c.mcp},
+        {"maintenance", c.maintenance}
     };
 }
 
@@ -312,6 +313,9 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     }
     if (j.contains("mcp") && j["mcp"].is_object()) {
         from_json(j["mcp"], c.mcp);
+    }
+    if (j.contains("maintenance") && j["maintenance"].is_object()) {
+        from_json(j["maintenance"], c.maintenance);
     }
 }
 

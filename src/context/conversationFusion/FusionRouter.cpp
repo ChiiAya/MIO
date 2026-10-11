@@ -74,6 +74,47 @@ std::size_t FusionRouter::unitCount() const {
     return units_.size();
 }
 
+std::vector<FusionRouter::UnitSnapshot> FusionRouter::activeUnitsSince(
+    std::int64_t since) const {
+    // 两阶段快照：第一阶段只在 mapMtx_ 下取指针与来源 key（不碰 unit 锁），
+    // 第二阶段逐个取 unit 锁拷贝上下文。反过来同时持 mapMtx_ + unit->mtx 会和
+    // ingest 的 unit->mtx → mapMtx_（set_public 等工具回调 Router）形成反向锁序。
+    // units_ 从不 erase（融合只产生孤儿 unit），所以第二阶段的裸指针仍然有效。
+    struct Ref {
+        FusionUnit* unit = nullptr;
+        ConversationKey conversation;
+        std::string personId;
+    };
+    std::vector<Ref> refs;
+    {
+        std::lock_guard<std::mutex> lock(mapMtx_);
+        refs.reserve(units_.size());
+        for (const auto& [key, unit] : units_) {
+            if (!unit || unit->inDegree().empty()) continue;
+            Ref ref;
+            ref.unit = unit.get();
+            ref.conversation = unit->inDegree().front();
+            if (auto it = unitPersonId_.find(key); it != unitPersonId_.end())
+                ref.personId = it->second;
+            refs.push_back(std::move(ref));
+        }
+    }
+
+    std::vector<UnitSnapshot> out;
+    for (auto& ref : refs) {
+        std::lock_guard<std::mutex> unitLock(ref.unit->mtx);
+        UnitSnapshot snapshot;
+        snapshot.conversation = ref.conversation;
+        snapshot.context = ref.unit->context();
+        snapshot.topic = ref.unit->topic();
+        snapshot.personInternalId = ref.personId;
+        if (!snapshot.context.empty())
+            snapshot.lastAt = snapshot.context.back().createdAt;
+        if (snapshot.lastAt >= since) out.push_back(std::move(snapshot));
+    }
+    return out;
+}
+
 FusionUnit* FusionRouter::findUnit(const IncomingMessage& msg) const {
     const std::string sourceKey = msg.conversation.toString();
     if (auto it = sourceToUnit_.find(sourceKey); it != sourceToUnit_.end()) {

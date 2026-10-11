@@ -48,6 +48,18 @@ struct FusionConfig {
 
 class FusionRouter {
 public:
+    // 维护任务（每日记忆整理）用的只读快照：unit 的主来源 + 上下文副本。
+    // 上下文是副本、已脱离 unit 锁，调用方可以慢慢处理而不阻塞正常会话。
+    struct UnitSnapshot {
+        ConversationKey conversation;   // unit 的主来源（inDegree 第一个）
+        std::vector<Msg> context;       // 上下文副本
+        std::string topic;
+        std::string personInternalId;   // 私聊 unit 的归属人（记忆归属用；群聊为空）
+        std::int64_t lastAt = 0;        // 上下文中最后一条消息的时间
+    };
+    // 最后活动时间 >= since 的 unit 快照
+    std::vector<UnitSnapshot> activeUnitsSince(std::int64_t since) const;
+
     // embedding 为可空依赖：为空 / 失败 / 关闭时话题判断退化为精确匹配
     FusionRouter(RelationshipGraph& graph, Achieve& achieve,
                  std::shared_ptr<SummaryManager> summary, FusionConfig cfg = {},

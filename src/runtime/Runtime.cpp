@@ -43,6 +43,9 @@ static thread_local std::string g_activePlatform;
 static thread_local std::string g_activeGroupId;
 static thread_local bool g_activeKeepSilent = false;
 static thread_local std::vector<std::string> g_replyableMessageIds;
+// 维护回合标记：置位期间禁止向平台发送消息（send_message 会被拒绝），
+// 也不会写进真实会话档案 —— 维护回合只能调 remember 一类的副作用工具。
+static thread_local bool g_maintenanceMode = false;
 
 std::string hexEncode(const std::string& s) {
     static const char* digits = "0123456789ABCDEF";
@@ -72,9 +75,9 @@ std::string promptFingerprint(const std::string& prompt) {
     return out;
 }
 
-// 下一个本地零点（epoch 秒）。"日界"这类周期边界的计算：mktime 会替我们
-// 处理 DST 归一，所以直接给 tm_mday +1 再回算，而不是加 24*3600。
-std::int64_t nextLocalMidnight(std::int64_t now) {
+// 当天本地 00:00（epoch 秒）：维护任务用它筛"今天有活动"的会话。
+// tm_isdst = -1 交给 mktime 判定，跨 DST 的日期才不会差一小时。
+std::int64_t localDayStart(std::int64_t now) {
     const std::time_t t = static_cast<std::time_t>(now);
     std::tm tm{};
 #if defined(_WIN32)
@@ -85,9 +88,6 @@ std::int64_t nextLocalMidnight(std::int64_t now) {
     tm.tm_hour = 0;
     tm.tm_min = 0;
     tm.tm_sec = 0;
-    tm.tm_mday += 1;  // 今天零点已过（或正在过）→ 取明天零点
-    // 必须让 mktime 自己判定夏令时：沿用输入时刻的 isdst 会让目标时刻被错误
-    // 地按旧时区解释（NY 3/8 01:30 → 3/9 01:00 而不是 00:00）。
     tm.tm_isdst = -1;
     return static_cast<std::int64_t>(std::mktime(&tm));
 }
@@ -148,6 +148,9 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
         adminServer_ = std::make_unique<AdminServer>(*this, adminPort);
         adminServer_->start();
     }
+
+    // 定时事项最后启动：此时图谱/日记/服务指针/工具表都已就位
+    if (configMgr_ && configMgr_->get()) startScheduler(configMgr_->get()->maintenance);
 }
 
 Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
@@ -156,6 +159,12 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
               std::shared_ptr<Llm>(std::move(llm))) {}
 
 Runtime::~Runtime() {
+    // 先停定时线程：它回调进 Runtime（刷新 Facts / 维护回合），必须在
+    // 图谱/日记/服务指针析构之前退出
+    if (scheduler_) {
+        scheduler_->stop();
+        scheduler_.reset();
+    }
     if (mcpManager_) {
         mcpManager_->stop();
         mcpManager_.reset();
@@ -225,6 +234,8 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
 
         const std::int64_t now = std::time(nullptr);
         eventLog_.append({0, EventKind::ConfigReloaded, now, "配置热重载: " + configPath.string()});
+        // 定时事项按新配置重建（停旧线程 → 按新任务表起新线程）
+        startScheduler(newConfig->maintenance);
         log::info("Runtime", "配置热重载成功: " + configPath.string());
         return true;
     } catch (const std::exception& e) {
@@ -351,6 +362,11 @@ bool Runtime::emit(const ConversationKey& conv, const std::string&, const std::s
 bool Runtime::emit(const ConversationKey& conv, const OutgoingMessage& message) {
     const auto& rawText = message.text;
     if (rawText.empty()) return false;
+    // 维护回合只能产生记忆/备注一类的副作用，绝不允许真的发消息出去
+    if (g_maintenanceMode) {
+        log::warn("Runtime", "维护回合中禁止发送平台消息，已拒绝: " + conv.toString());
+        return false;
+    }
 
     StructuredSender sender;
     MessageSplitterConfig splitter;
@@ -471,6 +487,10 @@ void Runtime::registerBuiltinTools() {
     registry_.add(std::move(publicDef),
                   [this](const nlohmann::json& args) -> std::string {
                       if (!g_activeUnit) return "error: 无当前上下文";
+                      // 维护回合里的 g_activeUnit 是上下文副本，而本工具真正改的是
+                      // Router 里那个真实 unit（按会话 key 定位）—— 维护回合不许改。
+                      if (g_maintenanceMode)
+                          return "error: 维护回合中不可修改会话公开性";
                       bool isPublic = false;
                       if (args.contains("is_public")) {
                           const auto& v = args["is_public"];
@@ -767,20 +787,129 @@ void Runtime::refreshFactsNow(const std::string& reason,
                              " fp=" + promptFingerprint(systemPrompt_));
 }
 
-// 日界刷新：把"通讯录/认知变更进 prompt"这件事收敛到每天一次，且不需要
-// 常驻定时线程 —— 边界检查挂在 ingest 上，没有流量时不空转，第一条消息
-// 到达时补做（那时还没有缓存前缀可保护，刷新反而是最优时机）。
-void Runtime::refreshFactsAtDayBoundary() {
-    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
-    {
-        std::unique_lock<std::shared_mutex> lock(servicesMtx_);
-        if (nextFactsRefreshAt_ == 0)  // 首次：只排程，不立即重建
-            nextFactsRefreshAt_ = nextLocalMidnight(now);
-        if (now < nextFactsRefreshAt_) return;
-        // 先把边界推到明天再放锁：并发的第二个 ingest 不会再触发第二次重建
-        nextFactsRefreshAt_ = nextLocalMidnight(now);
+// 定时任务接线：动作名 → Runtime 能力。调度器本身不认识业务。
+void Runtime::startScheduler(const MaintenanceConfig& config) {
+    if (scheduler_) {  // 配置热重载：先停旧线程再按新表重建
+        scheduler_->stop();
+        scheduler_.reset();
     }
-    refreshFactsNow("daily", diary_.consume());
+    if (!config.enabled || config.tasks.empty()) {
+        log::info("Runtime", "定时事项未启用");
+        return;
+    }
+    scheduler_ = std::make_unique<Scheduler>(
+        config.tasks, [this](const ScheduledTask& task) {
+            if (task.action == "refresh_facts") {
+                // 缓存前缀优先策略里唯一的常规刷新边界：消费日记 + 重建 Facts
+                refreshFactsNow("scheduled:" + task.name, diary_.consume());
+            } else if (task.action == "prompt") {
+                runMaintenancePrompt(task.prompt);
+            } else {
+                log::warn("Runtime", "未知的定时任务动作: " + task.action +
+                                          " (name=" + task.name + ")");
+            }
+        });
+    scheduler_->start();
+}
+
+namespace {
+
+// 维护回合的线程上下文：工具处理器读的是 thread_local，必须逐项就位。
+// 同时把 g_maintenanceMode 置位，禁止对外发送。
+struct MaintenanceTurn {
+    explicit MaintenanceTurn(const FusionRouter::UnitSnapshot& target,
+                             FusionUnit* unit) {
+        g_maintenanceMode = true;
+        g_activeUnit = unit;
+        g_activeConv = target.conversation;
+        g_activeMemoryPerson = target.personInternalId;
+        g_activeSenderId = target.conversation.scope == ConversationScope::Private
+                               ? target.conversation.id
+                               : std::string{};
+        g_activeSenderName.clear();
+        g_activePlatform.clear();
+        g_activeGroupId = target.conversation.scope == ConversationScope::Group
+                              ? target.conversation.id
+                              : std::string{};
+        g_activeKeepSilent = false;
+        g_replyableMessageIds.clear();
+    }
+    ~MaintenanceTurn() {
+        g_maintenanceMode = false;
+        g_activeUnit = nullptr;
+        g_activeConv = {};
+        g_activeMemoryPerson.clear();
+        g_activeSenderId.clear();
+        g_activeSenderName.clear();
+        g_activePlatform.clear();
+        g_activeGroupId.clear();
+        g_activeKeepSilent = false;
+        g_replyableMessageIds.clear();
+    }
+    MaintenanceTurn(const MaintenanceTurn&) = delete;
+    MaintenanceTurn& operator=(const MaintenanceTurn&) = delete;
+};
+
+} // namespace
+
+void Runtime::runMaintenancePrompt(const std::string& prompt) {
+    if (prompt.empty()) return;
+
+    std::shared_ptr<Llm> llm;
+    std::shared_ptr<ContextBuilder> builder;
+    std::string systemPrompt;
+    {
+        std::shared_lock<std::shared_mutex> lock(servicesMtx_);
+        llm = llm_;
+        builder = builder_;
+        systemPrompt = systemPrompt_;  // 维护回合用当前已渲染的 Facts（不额外换前缀）
+    }
+    if (!llm || !builder) return;
+
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    const auto targets = router_.activeUnitsSince(localDayStart(now));
+    if (targets.empty()) {
+        log::info("Runtime", "维护回合跳过：今天没有活动会话");
+        return;
+    }
+    log::info("Runtime", "维护回合开始: 目标会话数=" + std::to_string(targets.size()));
+
+    for (const auto& target : targets) {
+        // 在上下文**副本**上跑：维护回合不写回真实历史，冷启动压缩也只影响副本
+        FusionUnit workspace(target.conversation, target.context);
+        if (!target.topic.empty()) workspace.setTopic(target.topic);
+        Msg ask{Role::User};
+        ask.text = prompt;
+        ask.createdAt = now;
+        workspace.append(std::move(ask));
+
+        ChatRequest req;
+        try {
+            BuildInput in;
+            in.systemPrompt = systemPrompt;
+            in.unit = &workspace;
+            in.now = now;
+            req = builder->build(in).request;
+        } catch (const std::exception& error) {
+            log::error("Runtime", "维护回合构建请求失败: " +
+                                      target.conversation.toString() + " " +
+                                      error.what());
+            continue;
+        }
+        req.tools = registry_.defs();
+
+        MaintenanceTurn turn(target, &workspace);
+        ToolLoopOptions loopOpt;
+        loopOpt.shouldInterrupt = [] { return false; };
+        try {
+            // sink 丢弃：维护回合的输出不进档案、不进 unit 上下文
+            runToolLoop(*llm, registry_, req, loopOpt, [](const Msg&) {});
+            log::info("Runtime", "维护回合完成: " + target.conversation.toString());
+        } catch (const std::exception& error) {
+            log::error("Runtime", "维护回合失败: " + target.conversation.toString() +
+                                      " " + error.what());
+        }
+    }
 }
 
 void Runtime::updateState(const Event& ev) {
@@ -923,8 +1052,6 @@ BotReply Runtime::ingest(IncomingMessage message) {
         }
 
         // 6) 构建请求（当前回合已 append 进 unit；上下文不够 → 重新冷启动压缩）
-        // 日界边界：通讯录/认知变更最多每天进一次 prompt（缓存前缀优先）。
-        refreshFactsAtDayBoundary();
         BuildInput in;
         in.systemPrompt = systemPrompt();
         in.unit = unit;

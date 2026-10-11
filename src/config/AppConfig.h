@@ -8,6 +8,7 @@
 #include "context/inputBuffer/inputBuffer.h"
 #include "config/mcp/McpConfig.h"
 #include "memory/manager/MemoryManager.h"
+#include "scheduler/Scheduler.h"
 
 #include <nlohmann/json.hpp>
 #include <string>
@@ -47,6 +48,7 @@ struct AppConfig {
     InputBufferConfig inputBuffer;
     MessageSplitterConfig splitter;
     mcp::McpConfig mcp;
+    MaintenanceConfig maintenance;  // 定时事项（日界刷新 Facts / 维护 prompt）
 
     static AppConfig fromEnvironment();
 };
