@@ -87,6 +87,16 @@ void registerContactTools(ToolRegistry& registry, RelationshipGraph& graph,
         if ((platform == "qq" || platform == "napcat" || platform == "onebot") &&
             !std::all_of(userId.begin(), userId.end(), [](unsigned char ch) { return std::isdigit(ch); }))
             throw std::invalid_argument("QQ 号必须仅包含数字");
+        // 本工具只负责"登记新联系人"：已登记的账号不允许借它改称呼。
+        // 模型改名会让联系人称呼在不同轮次之间漂移，先收紧成不可改名
+        // （改称呼的能力随 set_nickname 一起停用）。
+        if (!userId.empty()) {
+            if (const auto existing = graph.platformContact(platform, userId);
+                existing && existing->name != name)
+                return std::string("error: 该账号已在通讯录中（internal_id=") +
+                       existing->internalId + "，当前称呼=" + existing->name +
+                       "）；upsert_contact 只登记新联系人，不覆盖已有称呼";
+        }
         std::optional<std::string> notes;
         if (args.contains("notes")) notes = stringArg(args, "notes");
         auto result = graph.upsertContact(name, platform, userId, notes, std::time(nullptr));
@@ -94,19 +104,23 @@ void registerContactTools(ToolRegistry& registry, RelationshipGraph& graph,
         return contactJson(result).dump();
     });
 
-    ToolDef nickname;
-    nickname.name = "set_nickname";
-    nickname.description = "更新已知联系人的称呼。current 支持 internal_id、QQ 或唯一称呼；重名时必须使用账号或 internal_id。";
-    nickname.parametersJsonSchema = {{"type", "object"}, {"properties", {
-        {"current", textField("联系人 internal_id、QQ 或当前称呼")},
-        {"nickname", textField("新的称呼")}}},
-        {"required", Json::array({"current", "nickname"})}};
-    registry.add(std::move(nickname), [&graph, onChanged](const Json& args) {
-        auto result = graph.updateContact(stringArg(args, "current", true),
-            stringArg(args, "nickname", true), std::nullopt);
-        if (onChanged) onChanged();
-        return contactJson(result).dump();
-    });
+    // set_nickname —— 让模型改联系人称呼的能力先停用：称呼在轮次之间漂移
+    // 会让"这个人是谁"变得难以追踪。注意 upsert_contact 也不能改名（见上），
+    // 否则这条闸门会被绕过。想恢复时取消下面整段注释即可。
+    //
+    // ToolDef nickname;
+    // nickname.name = "set_nickname";
+    // nickname.description = "更新已知联系人的称呼。current 支持 internal_id、QQ 或唯一称呼；重名时必须使用账号或 internal_id。";
+    // nickname.parametersJsonSchema = {{"type", "object"}, {"properties", {
+    //     {"current", textField("联系人 internal_id、QQ 或当前称呼")},
+    //     {"nickname", textField("新的称呼")}}},
+    //     {"required", Json::array({"current", "nickname"})}};
+    // registry.add(std::move(nickname), [&graph, onChanged](const Json& args) {
+    //     auto result = graph.updateContact(stringArg(args, "current", true),
+    //         stringArg(args, "nickname", true), std::nullopt);
+    //     if (onChanged) onChanged();
+    //     return contactJson(result).dump();
+    // });
 
     ToolDef notes;
     notes.name = "set_notes";
