@@ -125,6 +125,10 @@ public:
     void refreshFactsNow(const std::string& reason,
                          std::vector<DiaryEntry> cognition = {});
 
+    // 滚动摘要 → MCP 长期记忆：摘要 sink 只入队（不阻塞 ingest 线程），
+    // 后台线程直接调用 ToolRegistry 里的 MCP 工具写入。见 SummaryBridge。
+    void onSummaryToMemory(const SummaryOutcome& outcome);
+
     // 维护回合：按 prompt 对"当天有活动的每个会话"各跑一次**隐藏** LLM 回合。
     // 模型可以调用记忆写入等副作用工具（长期记忆由 MCP 提供），但绝不会向平台
     // 发送消息，也不会写进真实会话历史/档案（只在上下文副本上工作）。
@@ -169,8 +173,14 @@ private:
     std::unique_ptr<mcp::McpManager> mcpManager_;
     // 声明在最后 = 最先析构：任务线程必须在其它成员（图谱/日记/服务指针）之前停掉
     std::unique_ptr<Scheduler> scheduler_;
+    // 摘要 → MCP 记忆桥：必须在 mcpManager_ 之前停止（它调用 MCP 工具）
+    std::unique_ptr<SummaryBridge> summaryBridge_;
+    MemoryBridgeConfig summaryBridgeConfig_;
+    bool bridgeToolMissingLogged_ = false;
 
     void startScheduler(const MaintenanceConfig& config);
+    void startSummaryBridge(const MemoryBridgeConfig& config);
+    bool writeSummaryToMemory(const SummaryBridge::Entry& entry);
 };
 
 } // namespace mio

@@ -254,7 +254,8 @@ void to_json(nlohmann::json& j, const AppConfig& c) {
         {"inputBuffer", c.inputBuffer},
         {"splitter", c.splitter},
         {"mcp", c.mcp},
-        {"maintenance", c.maintenance}
+        {"maintenance", c.maintenance},
+        {"memoryBridge", c.memoryBridge}
     };
 }
 
@@ -294,6 +295,9 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     }
     if (j.contains("maintenance") && j["maintenance"].is_object()) {
         from_json(j["maintenance"], c.maintenance);
+    }
+    if (j.contains("memoryBridge") && j["memoryBridge"].is_object()) {
+        from_json(j["memoryBridge"], c.memoryBridge);
     }
 }
 

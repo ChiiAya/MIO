@@ -12,6 +12,7 @@
 #include "providers/llm/tool/ToolLoop.h"
 #include "providers/mcp/McpManager.h"
 #include "core/message/History.h"
+#include "core/time/LocalTime.h"
 #include "log/Log.h"
 
 #include <algorithm>
@@ -72,23 +73,6 @@ std::string promptFingerprint(const std::string& prompt) {
     return out;
 }
 
-// 当天本地 00:00（epoch 秒）：维护任务用它筛"今天有活动"的会话。
-// tm_isdst = -1 交给 mktime 判定，跨 DST 的日期才不会差一小时。
-std::int64_t localDayStart(std::int64_t now) {
-    const std::time_t t = static_cast<std::time_t>(now);
-    std::tm tm{};
-#if defined(_WIN32)
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
-    tm.tm_hour = 0;
-    tm.tm_min = 0;
-    tm.tm_sec = 0;
-    tm.tm_isdst = -1;
-    return static_cast<std::int64_t>(std::mktime(&tm));
-}
-
 } // namespace
 
 Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
@@ -129,7 +113,11 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
     // MIO 也是 person（统一图谱结构；隐私差异化靠装配/检索时隐藏数据）
     graph_.ensureMio(persona_.botName);
 
-    // 长期记忆已交给 MCP（如 graphiti_*），这里不再有"摘要 → 记忆写入"的咽喉点
+    // 摘要 sink：唯一咽喉点（冷读取/融合重定向/重新冷启动三条路径全覆盖），
+    // 现在把摘要交给 MCP 长期记忆写入（内置记忆库已移除）
+    summary_->setOnSummary(
+        [this](const SummaryOutcome& outcome) { onSummaryToMemory(outcome); });
+
     refreshFactsNow("startup");
     state_.botName = persona_.botName;
     state_.messageCount = 0;
@@ -140,8 +128,11 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
         adminServer_->start();
     }
 
-    // 定时事项最后启动：此时图谱/日记/服务指针/工具表都已就位
-    if (configMgr_ && configMgr_->get()) startScheduler(configMgr_->get()->maintenance);
+    // 定时事项/记忆桥最后启动：此时图谱/日记/服务指针/工具表（含 MCP）都已就位
+    if (configMgr_ && configMgr_->get()) {
+        startSummaryBridge(configMgr_->get()->memoryBridge);
+        startScheduler(configMgr_->get()->maintenance);
+    }
 }
 
 Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
@@ -155,6 +146,10 @@ Runtime::~Runtime() {
     if (scheduler_) {
         scheduler_->stop();
         scheduler_.reset();
+    }
+    if (summaryBridge_) {
+        summaryBridge_->stop();
+        summaryBridge_.reset();
     }
     if (mcpManager_) {
         mcpManager_->stop();
@@ -182,6 +177,9 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
         auto newLlm = std::make_shared<OpenAiCompat>(newConfig->openai);
         auto newEmbedding = std::make_shared<OpenAiEmbedding>(newConfig->embedding);
         auto newSummary = std::make_shared<SummaryManager>(800, newLlm);
+        // 新的摘要器同样要挂 sink：摘要 → MCP 长期记忆
+        newSummary->setOnSummary(
+            [this](const SummaryOutcome& outcome) { onSummaryToMemory(outcome); });
         auto newBuilder = std::make_shared<ContextBuilder>(newConfig->contextBuilder, newSummary);
 
         // 重载时清理动态工具并重新热加载 MCP 服务
@@ -223,7 +221,8 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
 
         const std::int64_t now = std::time(nullptr);
         eventLog_.append({0, EventKind::ConfigReloaded, now, "配置热重载: " + configPath.string()});
-        // 定时事项按新配置重建（停旧线程 → 按新任务表起新线程）
+        // 定时事项与记忆桥按新配置重建（停旧线程 → 按新配置起新线程）
+        startSummaryBridge(newConfig->memoryBridge);
         startScheduler(newConfig->maintenance);
         log::info("Runtime", "配置热重载成功: " + configPath.string());
         return true;
@@ -712,6 +711,62 @@ void Runtime::refreshFactsNow(const std::string& reason,
                              " fp=" + promptFingerprint(systemPrompt_));
 }
 
+// 摘要 → MCP 长期记忆。sink 在 ingest 线程里被同步调用（可能正持有 unit 锁与
+// Router 的 mapMtx_），所以这里只入队；真正的 MCP 调用在 SummaryBridge 的后台
+// 线程里做。会话身份读 thread_local —— 三条摘要路径都在 ingest 线程内触发。
+void Runtime::onSummaryToMemory(const SummaryOutcome& outcome) {
+    if (!summaryBridge_ || outcome.text.empty()) return;
+    if (g_activeConv.id.empty()) return;  // 无会话上下文（理论上不该发生）
+    SummaryBridge::Entry entry;
+    entry.conversation = g_activeConv;
+    entry.text = outcome.text;
+    entry.topic = outcome.topic;
+    entry.isPublic = !outcome.privateVerdict;  // privateVerdict=true 表示私密
+    entry.groupId = g_activeGroupId;
+    summaryBridge_->push(std::move(entry));
+}
+
+bool Runtime::writeSummaryToMemory(const SummaryBridge::Entry& entry) {
+    const std::string& tool = summaryBridgeConfig_.tool;
+    if (tool.empty() || !registry_.find(tool)) {
+        if (!bridgeToolMissingLogged_) {
+            bridgeToolMissingLogged_ = true;
+            log::warn("Runtime", "记忆桥目标工具不在工具表中，摘要将不会写入记忆: " + tool +
+                                     "（检查 mcp 配置与 memoryBridge.tool）");
+        }
+        return false;
+    }
+    nlohmann::json args = summaryBridgeConfig_.extraArgs.is_object()
+                              ? summaryBridgeConfig_.extraArgs
+                              : nlohmann::json::object();
+    substitutePlaceholders(args, {{"text", entry.text},
+                                  {"topic", entry.topic},
+                                  {"conv", entry.conversation.toString()},
+                                  {"group", entry.groupId},
+                                  {"private", entry.isPublic ? "false" : "true"}});
+    args[summaryBridgeConfig_.textField] = entry.text;
+    registry_.invoke(tool, args);
+    return true;
+}
+
+void Runtime::startSummaryBridge(const MemoryBridgeConfig& config) {
+    if (summaryBridge_) {  // 配置热重载：先停旧线程再按新配置重建
+        summaryBridge_->stop();
+        summaryBridge_.reset();
+    }
+    bridgeToolMissingLogged_ = false;
+    summaryBridgeConfig_ = config;
+    if (!config.enabled) {
+        log::info("Runtime", "摘要 → MCP 记忆桥未启用");
+        return;
+    }
+    summaryBridge_ = std::make_unique<SummaryBridge>(
+        config, [this](const SummaryBridge::Entry& entry) {
+            return writeSummaryToMemory(entry);
+        });
+    summaryBridge_->start();
+}
+
 // 定时任务接线：动作名 → Runtime 能力。调度器本身不认识业务。
 void Runtime::startScheduler(const MaintenanceConfig& config) {
     if (scheduler_) {  // 配置热重载：先停旧线程再按新表重建
@@ -950,7 +1005,10 @@ BotReply Runtime::ingest(IncomingMessage message) {
         }
 
         // 5) 批次内重组好的独立上下文 turns 追加进 unit 上下文
+        // 同一个输入缓冲区 = 同一轮对话：统一时间戳，wire 层因此只给本轮打一次
+        // [time:...] 标签（档案里的 rawTurn 本来也全用这个 now）
         for (auto& turn : batch.turns) {
+            turn.createdAt = now;
             unit->append(std::move(turn));
         }
 

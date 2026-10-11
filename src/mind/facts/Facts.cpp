@@ -5,20 +5,12 @@
 #include <sstream>
 
 #include "context/costEstimator/Tokens.h"
+#include "core/time/LocalTime.h"
 
 namespace mio {
 
 std::string nowTimeString() {
-    std::time_t t = std::time(nullptr);
-    std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm);
-    return buf;
+    return formatLocalTime(std::time(nullptr));
 }
 
 std::string buildSystemPrompt(const Persona& persona,

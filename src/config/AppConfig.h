@@ -7,6 +7,7 @@
 #include "context/conversationFusion/FusionRouter.h"
 #include "context/inputBuffer/inputBuffer.h"
 #include "config/mcp/McpConfig.h"
+#include "runtime/SummaryBridge.h"
 #include "scheduler/Scheduler.h"
 
 #include <nlohmann/json.hpp>
@@ -47,6 +48,7 @@ struct AppConfig {
     MessageSplitterConfig splitter;
     mcp::McpConfig mcp;
     MaintenanceConfig maintenance;  // 定时事项（日界刷新 Facts / 维护 prompt）
+    MemoryBridgeConfig memoryBridge; // 滚动摘要 → MCP 长期记忆（graphiti 等）
 
     static AppConfig fromEnvironment();
 };

@@ -19,6 +19,7 @@
 #include <cpr/cpr.h>
 
 #include "context/costEstimator/Tokens.h"
+#include "core/time/LocalTime.h"
 #include "log/Log.h"
 
 #include <algorithm>
@@ -62,17 +63,21 @@ std::string resolveChatEndpoint(const std::string& baseUrl) {
 // 再接 [sender:人]。"人" = Router 注入的昵称（senderName），未命中回退原始
 // senderId；让模型知道"这句话从哪个平台、哪个会话、谁"说的；无身份
 // （旧历史/系统内部请求）则不打。
-std::string senderTag(const Msg& m) {
-    if (m.platform.empty()) return "";
+// withTime：是否附 [time:YYYY-MM-DD HH:MM]。时间取自消息自己的 createdAt
+// （不是"现在"），所以历史部分逐字节稳定，不会打断 prompt cache 前缀。
+std::string senderTag(const Msg& m, bool withTime) {
+    std::string clock;
+    if (withTime && m.createdAt > 0) clock = "[time:" + formatLocalTime(m.createdAt) + "]";
+    if (m.platform.empty()) return clock.empty() ? "" : clock + " ";
     const std::string& who =
         !m.senderName.empty() ? m.senderName : m.senderId;
-    if (who.empty()) return "";
+    if (who.empty()) return clock.empty() ? "" : clock + " ";
     const std::string conv =
         m.groupId.empty() ? "private" : "group:" + m.groupId;
     std::string tag = "[" + m.platform + "][" + conv + "][sender:" + who + "]";
     if (!m.messageId.empty()) tag += "[message_id:" + m.messageId + "]";
     if (!m.replyToMessageId.empty()) tag += "[reply_to_message_id:" + m.replyToMessageId + "]";
-    return tag + " ";
+    return tag + clock + " ";
 }
 
 nlohmann::json toWireMessages(const ChatRequest& req) {
@@ -83,8 +88,15 @@ nlohmann::json toWireMessages(const ChatRequest& req) {
     if (!req.systemPrompt.empty())
         wire.push_back({{"role", "system"}, {"content", req.systemPrompt}});
 
+    // 每轮对话只打一次时间：同一个输入缓冲区（同一轮）里的多条用户消息共享
+    // createdAt，只有本轮第一条带 [time:...]；新的一轮（前面是助手消息，或
+    // 时间戳变了）则重新打。
+    bool prevWasUser = false;
+    std::int64_t lastUserAt = 0;
+
     for (const auto& m : req.messages) {
         nlohmann::json j{{"role", nullptr}};
+        if (m.role != Role::User) prevWasUser = false;
         switch (m.role) {
         case Role::System:
             j["role"] = "system";
@@ -93,7 +105,10 @@ nlohmann::json toWireMessages(const ChatRequest& req) {
 
         case Role::User: {
             j["role"] = "user";
-            const std::string tag = senderTag(m);
+            const bool withTime = !prevWasUser || m.createdAt != lastUserAt;
+            const std::string tag = senderTag(m, withTime);
+            prevWasUser = true;
+            lastUserAt = m.createdAt;
             if (m.isTextOnly()) {
                 j["content"] = tag + m.text;
             } else {

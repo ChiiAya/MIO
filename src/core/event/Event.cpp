@@ -16,7 +16,6 @@ const char* kindToString(EventKind kind) {
     case EventKind::NotesChanged: return "NotesChanged";
     case EventKind::SummaryApplied: return "SummaryApplied";
     case EventKind::ConfigReloaded: return "ConfigReloaded";
-    case EventKind::MemoryRemembered: return "MemoryRemembered";
     }
     return "DiaryWritten";
 }
