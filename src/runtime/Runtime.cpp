@@ -11,6 +11,7 @@
 #include "providers/embedding/openai/OpenAiEmbedding.h"
 #include "providers/llm/tool/ToolLoop.h"
 #include "providers/mcp/McpManager.h"
+#include "core/message/History.h"
 #include "log/Log.h"
 
 #include <algorithm>
@@ -277,6 +278,31 @@ int calculateDelayMs(const std::string& previousText, const MessageSplitterConfi
     return delay;
 }
 
+// 分片睡眠的粒度：新消息打断时最多多等这么久，而不是等满整个打字延迟
+constexpr int kSplitterSleepSliceMs = 50;
+
+// 回复里是否真的存在可发送内容。
+// 模型偶尔只回空白或一个分段符（"[SEP]"），拆分后气泡为空——那不是发送
+// 失败，而是没有内容可发，必须按静默处理，否则会把整轮回复判为投递失败。
+bool hasDeliverableText(const std::string& text, const MessageSplitterConfig& cfg) {
+    const auto visible = [](const std::string& token) {
+        return token.find_first_not_of(" \t\r\n") != std::string::npos;
+    };
+    if (cfg.enabled && !cfg.delimiter.empty()) {
+        std::size_t start = 0;
+        while (start <= text.size()) {
+            const auto pos = text.find(cfg.delimiter, start);
+            const auto token = text.substr(
+                start, pos == std::string::npos ? std::string::npos : pos - start);
+            if (visible(token)) return true;
+            if (pos == std::string::npos) break;
+            start = pos + cfg.delimiter.size();
+        }
+        return false;
+    }
+    return visible(text);
+}
+
 } // namespace
 
 bool Runtime::emit(const ConversationKey& conv, const std::string&, const std::string& rawText) {
@@ -313,14 +339,20 @@ bool Runtime::emit(const ConversationKey& conv, const OutgoingMessage& message) 
 
     if (bubbles.empty()) return false;
     const auto generation = g_activeUnit ? g_activeUnit->generation() : 0;
+    const auto stillCurrent = [generation] {
+        return !g_activeUnit || g_activeUnit->generation() == generation;
+    };
     for (std::size_t i = 0; i < bubbles.size(); ++i) {
         if (i > 0 && splitter.enabled) {
             int delayMs = calculateDelayMs(bubbles[i - 1], splitter);
-            if (delayMs > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            // 分片等待：被新消息打断时立刻停止连发，不再等满整个打字延迟
+            for (int slept = 0; slept < delayMs; slept += kSplitterSleepSliceMs) {
+                if (!stillCurrent()) return false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(
+                    std::min(kSplitterSleepSliceMs, delayMs - slept)));
             }
         }
-        if (g_activeUnit && g_activeUnit->generation() != generation) return false;
+        if (!stillCurrent()) return false;
         OutgoingMessage bubble{bubbles[i], {}, {}};
         if (i == 0) {
             bubble.mentionUserIds = message.mentionUserIds;
@@ -857,7 +889,11 @@ BotReply Runtime::ingest(IncomingMessage message) {
         req.tools = registry_.defs();
         // Resolve identities on each request copy so cold-loaded histories and
         // contacts learned after the message arrived also have current names.
-        for (auto& turn : req.messages) {
+        // 只给"尚未回答"的输入附加身份提示：历史轮次保持逐字节稳定，提示词
+        // 缓存前缀不会被联系人改名打断，也省掉重复的 token 开销。
+        const auto hintFrom = history::pendingTurnStart(req.messages);
+        for (std::size_t index = 0; index < req.messages.size(); ++index) {
+            auto& turn = req.messages[index];
             if (turn.role == Role::User && !turn.messageId.empty() &&
                 turn.platform == g_activePlatform &&
                 ((batch.conversation.scope == ConversationScope::Group && turn.groupId == batch.conversation.id) ||
@@ -865,6 +901,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
                   turn.senderId == batch.conversation.id)))
                 g_replyableMessageIds.push_back(turn.messageId);
             if (turn.role != Role::User || turn.atUserIds.empty()) continue;
+            if (index < hintFrom) continue;
             const auto hints = router_.mentionContext(turn.atUserIds, turn.platform);
             if (!hints.empty()) turn.text += "\n" + hints;
         }
@@ -893,13 +930,24 @@ BotReply Runtime::ingest(IncomingMessage message) {
             resp.text.clear();
         }
         if (resp.finishReason != "interrupted") {
-            if (g_activeKeepSilent) resp.text.clear();
-            else if (!resp.text.empty() && hasMessageSender() &&
-                     !emit(batch.conversation, targetMsg.senderId, resp.text)) {
-                if (unit->generation() != myGen) {
-                    resp.finishReason = "interrupted";
+            if (g_activeKeepSilent) {
+                resp.text.clear();
+            } else if (!resp.text.empty() && hasMessageSender()) {
+                // 只有"确实有内容可发"时才把发送失败当成失败
+                bool deliverable = false;
+                {
+                    std::lock_guard<std::mutex> lock(senderMtx_);
+                    deliverable = hasDeliverableText(resp.text, splitterConfig_);
+                }
+                if (!deliverable) {
+                    log::info("Runtime", "模型回复仅含空白或分段符，本轮按静默处理");
                     resp.text.clear();
-                } else throw std::runtime_error("平台回复发送失败");
+                } else if (!emit(batch.conversation, targetMsg.senderId, resp.text)) {
+                    if (unit->generation() != myGen) {
+                        resp.finishReason = "interrupted";
+                        resp.text.clear();
+                    } else throw std::runtime_error("平台回复发送失败");
+                }
             }
             if (resp.finishReason != "interrupted") {
                 if (completion) {

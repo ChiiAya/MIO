@@ -119,6 +119,10 @@ public:
     void save();
 
 private:
+    // 被动路径（消息路由自动登记/亲密度累加）的写盘失败只记日志：磁盘抖动
+    // 不该打断整轮对话；显式的通讯录工具调用仍由 save() 抛异常上报给模型。
+    void savePassive();
+
     // 无锁内部函数：调用方必须已持有 mtx_
     PersonNode* findNode(const std::string& internalId);
     const PersonNode* findNode(const std::string& internalId) const;
