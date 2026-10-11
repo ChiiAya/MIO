@@ -83,19 +83,17 @@ std::vector<FusionRouter::UnitSnapshot> FusionRouter::activeUnitsSince(
     struct Ref {
         FusionUnit* unit = nullptr;
         ConversationKey conversation;
-        std::string personId;
     };
     std::vector<Ref> refs;
     {
         std::lock_guard<std::mutex> lock(mapMtx_);
         refs.reserve(units_.size());
-        for (const auto& [key, unit] : units_) {
+        for (const auto& entry : units_) {
+            const auto& unit = entry.second;
             if (!unit || unit->inDegree().empty()) continue;
             Ref ref;
             ref.unit = unit.get();
             ref.conversation = unit->inDegree().front();
-            if (auto it = unitPersonId_.find(key); it != unitPersonId_.end())
-                ref.personId = it->second;
             refs.push_back(std::move(ref));
         }
     }
@@ -107,7 +105,6 @@ std::vector<FusionRouter::UnitSnapshot> FusionRouter::activeUnitsSince(
         snapshot.conversation = ref.conversation;
         snapshot.context = ref.unit->context();
         snapshot.topic = ref.unit->topic();
-        snapshot.personInternalId = ref.personId;
         if (!snapshot.context.empty())
             snapshot.lastAt = snapshot.context.back().createdAt;
         if (snapshot.lastAt >= since) out.push_back(std::move(snapshot));

@@ -34,9 +34,6 @@ constexpr int kMaxPeopleTokens = 1200;
 // 并发 ingest 各自线程互不干扰，故用 thread_local
 static thread_local FusionUnit* g_activeUnit = nullptr;
 static thread_local ConversationKey g_activeConv;
-// 记忆归属上下文：私聊 → 对话者 internalId；群聊 → 空串（按会话共享）。
-// 摘要 sink 在 route 内部同步触发，必须先于 route 就位
-static thread_local std::string g_activeMemoryPerson;
 static thread_local std::string g_activeSenderId;
 static thread_local std::string g_activeSenderName;
 static thread_local std::string g_activePlatform;
@@ -44,7 +41,7 @@ static thread_local std::string g_activeGroupId;
 static thread_local bool g_activeKeepSilent = false;
 static thread_local std::vector<std::string> g_replyableMessageIds;
 // 维护回合标记：置位期间禁止向平台发送消息（send_message 会被拒绝），
-// 也不会写进真实会话档案 —— 维护回合只能调 remember 一类的副作用工具。
+// 也不会写进真实会话档案 —— 维护回合只能调记忆写入一类的副作用工具。
 static thread_local bool g_maintenanceMode = false;
 
 std::string hexEncode(const std::string& s) {
@@ -107,8 +104,6 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
       embedding_(std::make_shared<OpenAiEmbedding>(configMgr_->get()->embedding)),
       summary_(std::make_shared<SummaryManager>(800, llm_)),
       builder_(std::make_shared<ContextBuilder>(configMgr_->get()->contextBuilder, summary_)),
-      memoryStore_(dataDir / "memory.db"),
-      memory_(configMgr_->get()->memory, embedding_, memoryStore_),
       router_{graph_, achieve_, summary_, configMgr_->get()->fusion, embedding_},
       inputBuffers_{configMgr_->get()->inputBuffer} {
     log::initFromEnvironment();  // MIO_LOG_LEVEL，重复调用安全
@@ -134,11 +129,7 @@ Runtime::Runtime(std::string botName, std::filesystem::path dataDir,
     // MIO 也是 person（统一图谱结构；隐私差异化靠装配/检索时隐藏数据）
     graph_.ensureMio(persona_.botName);
 
-    // 写入流程接线：三条摘要路径（冷读取/融合重定向/重新冷启动）共用
-    // SummaryManager 这一个咽喉点，产出即写入长期记忆
-    summary_->setOnSummary(
-        [this](const SummaryOutcome& outcome) { onSummaryProduced(outcome); });
-
+    // 长期记忆已交给 MCP（如 graphiti_*），这里不再有"摘要 → 记忆写入"的咽喉点
     refreshFactsNow("startup");
     state_.botName = persona_.botName;
     state_.messageCount = 0;
@@ -191,7 +182,6 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
         auto newLlm = std::make_shared<OpenAiCompat>(newConfig->openai);
         auto newEmbedding = std::make_shared<OpenAiEmbedding>(newConfig->embedding);
         auto newSummary = std::make_shared<SummaryManager>(800, newLlm);
-        newSummary->setOnSummary([this](const SummaryOutcome& o) { onSummaryProduced(o); });
         auto newBuilder = std::make_shared<ContextBuilder>(newConfig->contextBuilder, newSummary);
 
         // 重载时清理动态工具并重新热加载 MCP 服务
@@ -220,7 +210,6 @@ bool Runtime::reloadConfig(const std::filesystem::path& configPath) {
 
         // 刷新长驻组件配置与依赖
         router_.update(newConfig->fusion, newSummary, newEmbedding);
-        memory_.update(newConfig->memory, newEmbedding);
         inputBuffers_.updateConfig(newConfig->inputBuffer);
 
         {
@@ -440,36 +429,6 @@ void Runtime::registerBuiltinTools() {
                       return "当前时间: " + nowTimeString();
                   }, ToolLayer::Builtin);
 
-    // remember —— 存储具有长期价值的事实或背景到长期记忆库（供后续 recall_memory 检索回忆）
-    ToolDef rememberDef;
-    rememberDef.name = "remember";
-    rememberDef.description =
-        "将具有长期价值的对话事实、用户喜好、重要事件或约定存储到长期记忆库中。后续可通过 recall_memory 检索回忆。";
-    rememberDef.parametersJsonSchema = {
-        {"type", "object"},
-        {"properties",
-         {{"text", {{"type", "string"}, {"description", "要存储的事实或记忆内容"}}},
-          {"is_public",
-           {{"type", "boolean"},
-            {"description",
-             "是否对其他会话公开（可选，默认随当前会话私密性）"}}}}},
-        {"required", nlohmann::json::array({"text"})}};
-    registry_.add(
-        std::move(rememberDef),
-        [this](const nlohmann::json& args) -> std::string {
-            const std::string text = args.value("text", "");
-            if (text.empty()) return "error: 记忆内容不能为空";
-            const std::int64_t now = std::time(nullptr);
-            bool isPublic = g_activeUnit ? g_activeUnit->isPublic() : false;
-            if (args.contains("is_public") && args["is_public"].is_boolean()) {
-                isPublic = args["is_public"].get<bool>();
-            }
-            memory_.remember(g_activeConv, g_activeMemoryPerson, text, isPublic, now);
-            eventLog_.append({0, EventKind::MemoryRemembered, now, text});
-            return "已存入长期记忆库。";
-        },
-        ToolLayer::Builtin);
-
     // set_public —— 模型控制当前上下文是否公开。
     // 直接切换当前 unit 的 isPublic，方便模型表达“这段对话是否适合融合”。
     ToolDef publicDef;
@@ -539,40 +498,6 @@ void Runtime::registerBuiltinTools() {
                                     " isPublic=" +
                                     (g_activeUnit->isPublic() ? "true" : "false"));
                       return "已更新话题:" + newTopic + "\n";
-                  }, ToolLayer::Builtin);
-
-    // recall_memory —— 长期记忆召回由模型自行决定何时调用。
-    // 之前是每轮自动把 Top-K 塞进 user 消息，现在改为工具化，
-    // 模型只在需要回忆旧事、或判断当前话题与历史相关时主动检索。
-    ToolDef recallDef;
-    recallDef.name = "recall_memory";
-    recallDef.description =
-        "检索长期记忆中的历史经历摘要。当用户提到过去的事、你记不清旧对话、"
-        "或需要结合历史背景回答时调用。";
-    recallDef.parametersJsonSchema = {
-        {"type", "object"},
-        {"properties",
-         {{"query", {{"type", "string"},
-                      {"description", "检索关键词或自然语言问题，例如：用户喜欢什么"}}},
-          {"top_k", {{"type", "integer"},
-                      {"description", "返回条数，默认 3，最多 10"}}}}},
-        {"required", nlohmann::json::array({"query"})}};
-    registry_.add(std::move(recallDef),
-                  [this](const nlohmann::json& args) -> std::string {
-                      const std::string query = args.value("query", "");
-                      if (query.empty()) return "error: query 不能为空";
-                      std::size_t topK = 0;
-                      if (args.contains("top_k") &&
-                          args["top_k"].is_number_integer()) {
-                          const int raw = args["top_k"].get<int>();
-                          topK = raw > 0 ? static_cast<std::size_t>(raw) : 0;
-                          if (topK > 10) topK = 10;
-                      }
-                      auto recalled = memory_.recall(
-                          query, g_activeMemoryPerson, g_activeConv.toString(),
-                          std::time(nullptr), topK);
-                      if (recalled.empty()) return "没有找到相关记忆。";
-                      return MemoryManager::renderForPrompt(recalled);
                   }, ToolLayer::Builtin);
 
     // get_current_user_qq —— 获取当前对话/发言人的QQ号及会话信息
@@ -822,7 +747,6 @@ struct MaintenanceTurn {
         g_maintenanceMode = true;
         g_activeUnit = unit;
         g_activeConv = target.conversation;
-        g_activeMemoryPerson = target.personInternalId;
         g_activeSenderId = target.conversation.scope == ConversationScope::Private
                                ? target.conversation.id
                                : std::string{};
@@ -838,7 +762,6 @@ struct MaintenanceTurn {
         g_maintenanceMode = false;
         g_activeUnit = nullptr;
         g_activeConv = {};
-        g_activeMemoryPerson.clear();
         g_activeSenderId.clear();
         g_activeSenderName.clear();
         g_activePlatform.clear();
@@ -925,24 +848,6 @@ void Runtime::noteMessage(const ConversationKey& conversation,
     state_.activeConversation = conversation;
 }
 
-std::string Runtime::resolveMemoryPerson(const IncomingMessage& msg) const {
-    // 私聊 → 对话者 internalId：私密记忆跨会话跟随本人（同人跨平台可召回）；
-    // 群聊 → 空：没有单一归属人，群记忆按 conv_key 在会话内共享
-    if (msg.conversation.scope != ConversationScope::Private) return "";
-    if (const auto p = graph_.platformContact(msg.platform, msg.senderId); p)
-        return p->internalId;
-    return "";
-}
-
-void Runtime::onSummaryProduced(const SummaryOutcome& outcome) {
-    if (outcome.text.empty()) return;
-    // privateVerdict 语义：true = 私密 → 记忆 is_public 取反。
-    // 会话/归属读 thread_local（sink 由 summarizeWithVerdict 在 ingest
-    // 线程内同步触发，上下文必然就位）
-    memory_.remember(g_activeConv, g_activeMemoryPerson, outcome.text,
-                     !outcome.privateVerdict, std::time(nullptr));
-}
-
 BotReply Runtime::ingest(IncomingMessage message) {
     const std::int64_t now = std::time(nullptr);
 
@@ -989,7 +894,6 @@ BotReply Runtime::ingest(IncomingMessage message) {
 
     // 2) 设置当前线程的记忆归属与对话上下文（冷读取摘要 sink 在 route 内部同步触发）
     const auto& targetMsg = batch.rawMessages.back();
-    g_activeMemoryPerson = resolveMemoryPerson(targetMsg);
     g_activeConv = targetMsg.conversation;
     g_activeSenderId = targetMsg.senderId;
     g_activeSenderName = targetMsg.senderName;
@@ -1001,7 +905,6 @@ BotReply Runtime::ingest(IncomingMessage message) {
         ~ContextGuard() {
             g_activeUnit = nullptr;
             g_activeConv = {};
-            g_activeMemoryPerson.clear();
             g_activeSenderId.clear();
             g_activeSenderName.clear();
             g_activePlatform.clear();
