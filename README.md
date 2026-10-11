@@ -1,7 +1,5 @@
 # MIO（澪）
 
-QQ 引用/@ 消息与通讯录工具的参数说明见 [使用说明](docs/qq-messages-and-contacts.md)；回复可靠性回归测试见 [测试说明](tests/README.md) 与 [验证记录](docs/testing/reply-reliability.tdd.md)。
-
 <div align="center">
 
 **面向低成本 · 追求高拟人的现代化 C++17 聊天机器人框架**
