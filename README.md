@@ -3,7 +3,7 @@
 <div align="center">
 
 **面向低成本 · 追求高拟人的现代化 C++17 聊天机器人框架**
-
+**最新功能详见dev分支**
 [![C++17](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![Build Tool](https://img.shields.io/badge/Build-xmake-red.svg)](https://xmake.io)
 [![Protocol](https://img.shields.io/badge/Protocol-OneBot%2011%20(NapCat)-green.svg)](https://github.com/NapNeko/NapCatQQ)
