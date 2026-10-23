@@ -381,21 +381,11 @@ bool Runtime::emit(const ConversationKey& conv, const OutgoingMessage& message) 
     }
 
     if (bubbles.empty()) return false;
-    const auto generation = g_activeUnit ? g_activeUnit->generation() : 0;
-    const auto stillCurrent = [generation] {
-        return !g_activeUnit || g_activeUnit->generation() == generation;
-    };
     for (std::size_t i = 0; i < bubbles.size(); ++i) {
         if (i > 0 && splitter.enabled) {
             int delayMs = calculateDelayMs(bubbles[i - 1], splitter);
-            // 分片等待：被新消息打断时立刻停止连发，不再等满整个打字延迟
-            for (int slept = 0; slept < delayMs; slept += kSplitterSleepSliceMs) {
-                if (!stillCurrent()) return false;
-                std::this_thread::sleep_for(std::chrono::milliseconds(
-                    std::min(kSplitterSleepSliceMs, delayMs - slept)));
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
         }
-        if (!stillCurrent()) return false;
         OutgoingMessage bubble{bubbles[i], {}, {}};
         if (i == 0) {
             bubble.mentionUserIds = message.mentionUserIds;
@@ -945,7 +935,6 @@ BotReply Runtime::ingest(IncomingMessage message) {
             if (buf) buf->decrementProcessing();
         }
     } procGuard{buffer};
-    buffer->incrementProcessing();
 
     // 2) 设置当前线程的记忆归属与对话上下文（冷读取摘要 sink 在 route 内部同步触发）
     const auto& targetMsg = batch.rawMessages.back();
@@ -979,14 +968,14 @@ BotReply Runtime::ingest(IncomingMessage message) {
     }
     g_activeUnit = unit;
 
-    // 递增代际编号，宣告新消息到达（如果当前 unit 上有正在运行的旧 LLM 任务，将在此处触发其协作中断）
-    const std::uint64_t myGen = unit->bumpGeneration();
-
     ChatResponse resp;
     bool reColdStarted = false;
     {
         // 上下文级锁：同 unit 串行（含 LLM 往返），跨 unit 并行
         std::lock_guard<std::mutex> lock(unit->mtx);
+
+        // 递增代际编号，宣告本轮开始（在此之后到达的新消息将在此处触发协作中断）
+        const std::uint64_t myGen = unit->bumpGeneration();
 
         // 4) 批次内所有原始消息分别落入物理会话的真实档案
         for (const auto& raw : batch.rawMessages) {
@@ -1060,11 +1049,10 @@ BotReply Runtime::ingest(IncomingMessage message) {
                                 achieve_.append(conv, m);
                                 unit->append(m);
                             });
-        if (unit->generation() != myGen) {
+        if (resp.text.empty() && unit->generation() != myGen) {
             resp.finishReason = "interrupted";
-            resp.text.clear();
         }
-        if (resp.finishReason != "interrupted") {
+        if (resp.finishReason != "interrupted" || !resp.text.empty()) {
             if (g_activeKeepSilent) {
                 resp.text.clear();
             } else if (!resp.text.empty() && hasMessageSender()) {
@@ -1078,19 +1066,14 @@ BotReply Runtime::ingest(IncomingMessage message) {
                     log::info("Runtime", "模型回复仅含空白或分段符，本轮按静默处理");
                     resp.text.clear();
                 } else if (!emit(batch.conversation, targetMsg.senderId, resp.text)) {
-                    if (unit->generation() != myGen) {
-                        resp.finishReason = "interrupted";
-                        resp.text.clear();
-                    } else throw std::runtime_error("平台回复发送失败");
+                    throw std::runtime_error("平台回复发送失败");
                 }
             }
-            if (resp.finishReason != "interrupted") {
-                if (completion) {
-                    achieve_.append(batch.conversation, *completion);
-                    unit->append(*completion);
-                }
-                unit->stripEphemeralParts();
+            if (completion) {
+                achieve_.append(batch.conversation, *completion);
+                unit->append(*completion);
             }
+            unit->stripEphemeralParts();
         }
     }
     // 8) 锁外：状态快照 + 审计 + Facts 重建
@@ -1104,7 +1087,7 @@ BotReply Runtime::ingest(IncomingMessage message) {
         refreshFactsNow("reColdStart", diary_.consume());
     }
 
-    if (resp.finishReason == "interrupted") {
+    if (resp.finishReason == "interrupted" && resp.text.empty()) {
         log::info("Runtime", "会话 " + batch.conversation.toString() +
                               " 的回复被新消息打断，丢弃过时输出");
         return BotReply{batch.conversation, "", /*interrupted=*/true};

@@ -93,16 +93,19 @@ BufferedBatch InputBuffer::waitForBatch() {
     std::unique_lock<std::mutex> lock(mtx_);
 
     for (;;) {
+        // 如果当前该物理会话有任务正在处理，等待其处理完成以合流成单次批次
+        if (processingTasks_ > 0) {
+            cv_.wait(lock, [this] { return processingTasks_ == 0; });
+            continue;
+        }
+
         const auto now = std::chrono::steady_clock::now();
         const auto totalElapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(now - firstMsgTime_).count();
         const auto idleElapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(now - lastMsgTime_).count();
 
-        const bool isProc = processingTasks_ > 0;
-        const int activeDebounce = (isProc && cfg_.interruptedDebounceMs > 0)
-                                       ? cfg_.interruptedDebounceMs
-                                       : cfg_.debounceMs;
+        const int activeDebounce = cfg_.debounceMs;
 
         // 配置为 0 时不延迟，立即触发
         if (activeDebounce <= 0 || cfg_.maxDelayMs <= 0) {
@@ -134,6 +137,10 @@ BufferedBatch InputBuffer::waitForBatch() {
     pendingRaw_.clear();
     pendingTurns_.clear();
     hasLeader_ = false;
+
+    if (!batch.empty()) {
+        ++processingTasks_;
+    }
 
     return batch;
 }

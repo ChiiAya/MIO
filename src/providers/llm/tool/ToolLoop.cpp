@@ -138,7 +138,7 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
     ChatResponse last;
 
     for (int step = 1; step <= opt.maxSteps; ++step) {
-        if (opt.shouldInterrupt && opt.shouldInterrupt()) {
+        if (step > 1 && opt.shouldInterrupt && opt.shouldInterrupt()) {
             log::info("ToolLoop", "在第 " + std::to_string(step) + " 步前检测到中断信号，提前退出");
             last.finishReason = "interrupted";
             last.text.clear();
@@ -151,9 +151,9 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
         // 护栏 4：空输出短重试（连续 2 次空输出则报错）
         for (int attempt = 0; attempt < 2; ++attempt) {
             resp = llm.chat(req);
-            if (opt.shouldInterrupt && opt.shouldInterrupt()) {
+            if (resp.text.empty() && resp.toolCalls.empty() &&
+                opt.shouldInterrupt && opt.shouldInterrupt()) {
                 resp.finishReason = "interrupted";
-                resp.text.clear();
                 return resp;
             }
             if (!resp.text.empty() || !resp.toolCalls.empty()) {
@@ -168,8 +168,9 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
             throw std::runtime_error("模型连续返回空输出（无文本也无工具调用）");
         last = resp;
 
-        // LLM 调用返回后立即检查是否被新消息打断
-        if (opt.shouldInterrupt && opt.shouldInterrupt()) {
+        // LLM 调用返回后：若无有效文本且无工具调用，且检测到中断信号，才丢弃
+        if (resp.text.empty() && resp.toolCalls.empty() &&
+            opt.shouldInterrupt && opt.shouldInterrupt()) {
             log::info("ToolLoop", "LLM 调用返回后检测到中断信号，丢弃当前响应");
             last.finishReason = "interrupted";
             last.text.clear();
@@ -271,7 +272,7 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
         if (attempt == 1) throw std::runtime_error("模型强制总结连续返回空输出");
     }
 
-    if (opt.shouldInterrupt && opt.shouldInterrupt()) {
+    if (last.text.empty() && opt.shouldInterrupt && opt.shouldInterrupt()) {
         log::info("ToolLoop", "强制总结 LLM 调用后检测到中断信号，丢弃当前响应");
         last.finishReason = "interrupted";
         last.text.clear();
