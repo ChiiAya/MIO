@@ -18,8 +18,8 @@
 > 
 > 本项目当前处于 **Alpha 早期实验与验证阶段**，核心架构和模块仍在持续迭代演进：
 > - **接口与架构易变**：内部 API、上下文组织策略、长期记忆与图谱数据结构未来可能发生破坏性变更（Breaking Changes），暂不保证版本向后兼容性。
-> - **未历经大规模生产验证**：当前本地 SQLite 向量检索、关系图谱及会话管理主要在小规模与本地测试环境下运行，尚未经过高并发、超大规模数据集的长期压测与生产验证。
-> - **大模型输出不确定性**：日记提炼、话题推断、公开/私密性判定以及记忆检索依赖底层大模型的理解与遵循能力，不同模型效果差异较大，可能出现判定偏差、幻觉或非预期工具调用。
+> - **未历经大规模生产验证**：MCP 外部工具、关系图谱及会话管理目前主要在小规模与本地测试环境下运行，尚未经过高并发、超大规模数据集的长期压测与生产验证。
+> - **大模型与外部服务不确定性**：话题推断、公开/私密性判定、工具调用以及长期记忆读写依赖底层大模型与外部 MCP Server，不同模型和服务效果差异较大，可能出现判定偏差、幻觉或非预期工具调用。
 > - **部署安全提醒**：使用 OneBot 11 反向 WebSocket 接入时，请务必配置访问令牌（Token），并妥善配置防火墙以限制网络暴露范围。测试期间请做好重要数据的定期备份。
 
 ---
@@ -32,7 +32,7 @@
 - [🧠 关键技术机制深度解析](#-关键技术机制深度解析)
   - [1. Prompt Cache 前缀缓存优先设计](#1-prompt-cache-前缀缓存优先设计)
   - [2. 会话融合（Conversation Fusion）与跨平台身份归一](#2-会话融合conversation-fusion与跨平台身份归一)
-  - [3. 两段式长期记忆系统（SELECT & RECALL）](#3-两段式长期记忆系统select--recall)
+  - [3. MCP 长期记忆与动态工具](#3-mcp-长期记忆与动态工具)
   - [4. 潜意识层与动态关系图谱（RelationshipGraph）](#4-潜意识层与动态关系图谱relationshipgraph)
   - [5. 工具循环与执行护栏（ToolLoop）](#5-工具循环与执行护栏toolloop)
 - [📦 依赖与构建](#-依赖与构建)
@@ -48,8 +48,8 @@
 
 **MIO（澪）** 是一个采用现代 **C++17** 构建的聊天机器人框架，旨在探索解决 AI 聊天机器人落地中的两大常见难题：
 
-1. **成本控制（Low-Cost 导向）**：针对传统 Bot 粗暴拼接全量历史与上下文导致 Token 消耗过快的问题，MIO 尝试通过 **Prompt Cache 前缀命中优先**、**轻量级本地嵌入与向量匹配**、**按需自主检索** 与 **分级滚动摘要**，在系统架构层面降低长会话的 Token 消耗与计算开销。
-2. **拟人化与连续性（High-Anthropomorphism 导向）**：针对传统 Bot 在私聊与群聊之间信息割裂、不同平台身份分散的问题，MIO 设计了 **跨平台同人身份归一**、**关系图谱（亲密与信任衰减）**、**基于路由的跨会话动态融合（Fusion）** 以及 **认知日记沉淀**，尝试提升机器人的连续记忆感与社交交互体验。
+1. **成本控制（Low-Cost 导向）**：针对传统 Bot 粗暴拼接全量历史与上下文导致 Token 消耗过快的问题，MIO 尝试通过 **Prompt Cache 前缀命中优先**、**分级滚动摘要**、**MCP 长期记忆按需检索** 与 **稳定事实层注入**，在系统架构层面降低长会话的 Token 消耗与计算开销。
+2. **拟人化与连续性（High-Anthropomorphism 导向）**：针对传统 Bot 在私聊与群聊之间信息割裂、不同平台身份分散的问题，MIO 设计了 **跨平台同人身份归一**、**关系图谱（亲密与信任衰减）**、**基于路由的跨会话动态融合（Fusion）** 以及 **MCP 长期记忆桥接**，尝试提升机器人的连续记忆感与社交交互体验。
 
 ---
 
@@ -57,24 +57,30 @@
 
 - ⚡ **Prompt Cache 前缀缓存优先**：
   - 上下文遵循三段式组织（稳定 System 前缀 + 追加式历史 + 当前回合），减少易变环境数据对前缀的破坏，提升大模型前缀缓存命中概率。
-  - 会话超出设定水位线后触发增量滚动摘要与日记消费，前缀重构与摘要时机结合。
+  - 每轮用户消息只追加稳定的 `[time:YYYY-MM-DD HH:MM]` 标签，历史部分逐字节不变；通讯录与认知变更折叠到明确的刷新边界，避免频繁重建 System Prompt。
 - 🌐 **会话融合（Conversation Fusion 即路由）**：
   - **私聊按人归一**：同一用户在不同平台接入均映射至统一内部 ID，便于同人跨端同步上下文。
   - **跨会话自适应融合**：当两人熟悉度高、相互信任、当前话题相近且处于非私密状态时，系统可将相关上下文摘要追加重定向，探索打破群聊与私聊的信息壁垒。
-- 🧠 **两段式长期记忆系统（SELECT & RECALL）**：
-  - **SQLite 原生向量存储**：无需引入独立的重型向量数据库服务，将向量序列化为 BLOB 与摘要文本共同落库。
-  - **两段式检索流程**：第一阶段在 SQLite 层面通过元数据索引进行权限过滤预裁剪；第二阶段在内存通过 **C++ SIMD 硬件加速（AVX-512 / AVX2 / SSE2 / NEON 编译期分派）** 计算余弦点积与时间衰减得分。
-  - **模型自主按需召回**：注册为 `recall_memory` 工具，由模型根据对话意图自主发起历史检索，避免每轮无差别盲目注入。
+- 🧩 **MCP 动态工具与长期记忆**：
+  - 运行时通过 stdio JSON-RPC 启动并管理外部 MCP Server，自动发现工具并合并进 `ToolRegistry`，支持工具名前缀隔离。
+  - 滚动摘要经后台 `SummaryBridge` 写入 MCP 长期记忆工具（如 `graphiti_add_memory`），不阻塞会话线程；仓库不再内置 SQLite 向量记忆。
+- 📥 **输入缓冲与可靠回复**：
+  - 对用户连续发送的多条消息做防抖聚合，同一轮只触发一次回复；支持代际打断，避免旧回合覆盖新回合。
+  - 模型可通过 `send_message` 主动发送消息、用 `[SEP]` 拆分多气泡、按节奏调用 `wait`，或用 `keepsilent` 已读不回。
 - 👥 **动态人际关系图谱（RelationshipGraph）**：
   - 节点包含用户和 MIO 自身，边记录亲密熟悉度（`intimacy`）与有向信任度（`trust`）。
   - 引入简单的时间衰减机制（$e^{-\Delta t/\tau}$），长时间未互动的对象在提示词注入名单中的排序自然回落。
+  - 提供 `list_contacts` / `upsert_contact` / `set_notes` 通讯录工具；称呼变更工具 `set_nickname` 已停用，避免模型在轮次间漂移称呼。
+- ⏰ **配置、维护任务与热重载**：
+  - `config.json` 支持局部覆盖、C++ 风格注释、`--config` 指定路径与运行中热重载。
+  - Scheduler 支持 `once` / `daily` / `interval` 维护任务：日界刷新 Facts，或对当天活跃会话执行隐藏维护回合整理长期记忆。
 - 🛡 **基础 Agent 护栏机制**：
   - 工具调用参数白名单校验，过滤未声明的幻觉字段。
   - 支持同名同参连续调用检测、工具结果超限截断、步数耗尽强制总结等容错保护。
 - 🔌 **主流模型与平台适配**：
   - 基于抽象 LLM 语义契约，兼容各类 OpenAI 兼容端点（如 DeepSeek、Qwen、小米 MiMo、SiliconFlow、Ollama、vLLM 等）。
   - 支持推理模型思维链（`reasoning_content`）透传与持久化。
-  - 支持 OneBot 11 反向 WebSocket 协议（NapCatQQ），并内置本地控制台 REPL 交互。
+  - 支持 OneBot 11 反向 WebSocket 协议（NapCatQQ），包含图片、语音、视频、文件处理与可选 ASR；同时保留本地控制台 REPL 交互。
 
 ---
 
@@ -96,7 +102,7 @@ MIO 遵循 **“组合根（Runtime）统一协调，底层接口只暴露语义
 │   2. 会话档案持久化 ────────────────────────► Achieve (每会话纯追加 jsonl 存储，无策略)               │
 │   3. 上下文构建与组装 ──────────────────────► ContextBuilder (水位超限触发重新冷启动压缩)              │
 │   4. 潜意识与事实层 ────────────────────────► Facts & RelationshipGraph (人设+Top-K人物+日记认知)     │
-│   5. 长期记忆两段式检索 ────────────────────► MemoryManager (SQLite 预过滤 + 内存 SIMD 点积 + 衰减)   │
+│   5. MCP 动态工具与长期记忆 ───────────────► McpManager / ToolRegistry / SummaryBridge              │
 │   6. 工具循环与护栏 ────────────────────────► ToolLoop & ToolRegistry (白名单/死循环自愈/截断保护)   │
 └───────────────────────────────────────────────┬───────────────────────────────────────────────────┘
                                                 │ ChatRequest (标准化请求)
@@ -125,10 +131,10 @@ MIO 遵循 **“组合根（Runtime）统一协调，底层接口只暴露语义
          │
   [ 历史对话流 ]        严格追加式增长；首条可为阶段性滚动摘要（isSummary=true）
          │
-  [ 本轮回合与工具 ]    用户本轮发言 + 间隔 ≥30min 时的轻量时间戳，承担新鲜上下文
+  [ 本轮回合与工具 ]    用户本轮发言 + 每条用户消息的稳定时间标签，承担新鲜上下文
   ```
 - **避免在 System 中渲染高频易变数据**：
-  - 不在 System Prompt 中直接硬编码实时时间（避免每次请求都破坏前缀缓存）；模型需要获取时间时，由模型调用内置工具 `get_current_time`。
+  - 不在 System Prompt 中直接硬编码实时时间（避免每次请求都破坏前缀缓存）；模型需要精确时间时可调用内置工具 `get_current_time`。
   - 不在 System 中渲染实时变化的消息计数或频繁波动的分数，仅渲染阶段性冻结的列表。
 - **重构时机天然重合**：
   - 仅在会话**冷启动（Cold Start）** 或 **上下文超出 85% 水位触发滚动摘要** 时，才重新拉取人物权重并消费日记归档。此时由于截断前缀本身即发生改变，同步更新 System Prompt 不会带来额外的缓存惩罚。
@@ -156,35 +162,26 @@ MIO 遵循 **“组合根（Runtime）统一协调，底层接口只暴露语义
 - **融合执行**：
   触发融合时，系统将短上下文提取摘要后重定向追加至目标上下文末尾。
 
-### 3. 两段式长期记忆系统（SELECT & RECALL）
+### 3. MCP 长期记忆与动态工具
 
-针对每轮无脑拼接 RAG 消耗 Token 且容易稀释注意力的问题，MIO 采用 **“模型主动召回 + 两段式混合检索”** 的尝试性方案：
+MIO 将长期记忆和大量外围能力交给 **MCP（Model Context Protocol）**，自身只保留稳定的会话、上下文与工具编排职责：
 
 ```
-[写入流]
-冷读取 / 融合重定向 / 重新冷启动 产出摘要
-   │
-   ▼
-SummaryManager.onSummary 统一入口
-   │
-   ▼ 归属解析 (私聊归内部 ID / 群聊按会话共享)
-Embedding 向量化 + L2 归一化
-   │
-   ▼ 原生 4096 字节 BLOB
-INSERT OR IGNORE INTO memories (conv_key, summary 幂等去重)
-
-[检索流]
-模型主动调用 recall_memory(query)
-   │
-   ├─► 第一段：SQLite 索引预过滤 (WHERE is_public=1 OR person_id=:viewer OR conv_key=:conv)
-   │         按权限裁剪出候选条目 (LIMIT ≤ 256)
-   │
-   └─► 第二段：C++ 内存 SIMD 运算 (AVX-512 / AVX2 / SSE2 / NEON 硬件加速点积)
-             计算余弦相似度 × 时间衰减 exp(-Δt / τ) 复合得分
-             Top-K 结果以 Tool 消息回喂给模型
+[外部 MCP Server]  graphiti / filesystem / search / 自定义服务 ...
+       │  stdio JSON-RPC
+       ▼
+McpManager ──► McpClient ──► ToolRegistry (工具名前缀隔离)
+                                  │
+                                  ├─► ToolLoop：模型按需调用
+                                  │
+                                  └─► SummaryBridge：滚动摘要直接写入长期记忆
 ```
 
-- **容错降级机制**：若向量端点出现网络超时或错误，记忆系统设计有冷却机制，60 秒内不再频繁发起无效请求，尽量避免辅助记忆模块故障直接打断主聊天流程。
+- **动态挂载**：`mcp.servers` 里的每个 Server 由子进程启动，通过 stdio JSON-RPC 完成初始化、工具发现与调用；`toolPrefix` 可避免外部工具与内置工具重名。
+- **摘要写入链路**：冷读取、融合重定向与重新冷启动产生的累计摘要，会在 ingest 线程中只做入队；后台 `SummaryBridge` 调用 `memoryBridge.tool` 指定的 MCP 工具（默认 `graphiti_add_memory`）。每个会话只保留最新一条待写入摘要，相同文本不会重复写。
+- **参数映射**：`memoryBridge.textField` 指定摘要文本的字段名；`extraArgs` 中的字符串支持 `{text}`、`{topic}`、`{conv}`、`{group}`、`{private}` 占位符，适配不同 MCP 记忆服务的参数结构。
+- **按需检索**：长期记忆的查询、事实搜索与节点搜索同样由 MCP 工具暴露给模型，由模型根据对话意图主动调用，而不是每轮无差别注入。
+- **迁移提示**：内置 SQLite 记忆与 `recall_memory` / `remember` 工具已移除，旧 `data/memory.db` 不会自动迁移；需要保留历史记忆时，请在升级前自行导出并写入外部 MCP 服务。
 
 ### 4. 潜意识层与动态关系图谱（RelationshipGraph）
 
@@ -195,7 +192,7 @@ MIO 在短期上下文之外维护轻量的事实层：
 - **时间衰减**：
   $$\text{Weight} = \sum e^{-\frac{\Delta t}{\tau}} \quad (\tau \approx 3\text{天})$$
   长时间缺乏互动的对象权重自然回落，从 Top-K 注入名单中淡出，但图谱节点与历史数据依然保留，重新互动时可再次激活。
-- **认知日记（Diary）**：模型在对话中通过 `write_diary` 记录阶段性事实或认知，日记在内存中缓冲，仅在摘要重构时批量消费并归档。
+- **事实刷新边界**：System Prompt 只在校启动、配置重载、`refresh_facts` 定时任务或重新冷启动时重建；通讯录变更只置脏标记，留到刷新边界统一消费，保护 prompt cache 前缀。
 
 ### 5. 工具循环与执行护栏（ToolLoop）
 
@@ -211,20 +208,24 @@ MIO 提供基础的 Agent 执行闭环与保护护栏：
 
 #### 🔧 内置工具列表
 
-> 长期记忆（存取/召回）已从内置模块迁出，改由 MCP 提供（如 `graphiti_add_memory`
-> / `graphiti_search_memory_facts` / `graphiti_search_nodes`）；下表中的 `remember`
-> / `recall_memory` 已随内置记忆系统一并移除。
+> 长期记忆（存取/召回）由外部 MCP Server 提供（如 `graphiti_add_memory`
+> / `graphiti_search_memory_facts` / `graphiti_search_nodes`）；内置的
+> `remember` / `recall_memory` 已随 SQLite 记忆系统移除。MCP 工具会按配置自动追加到工具表。
 
 | 工具名称 | 参数 | 职责说明 |
 |---|---|---|
-| `get_current_time` | `{}` | 获取当前本地时间（精确到分钟），避免在 System 中写死时间 |
-| `set_nickname` | `{"current": string, "nickname": string}` | **已停用**（模型改称呼会造成混乱，代码保留注释以便恢复） |
-| `set_notes` | `{"person": string, "notes": string}` | 补充对某人的特点、喜好或印象描述 |
-| `set_public` | `{"is_public": bool, "reason": string}` | 模型根据对话敏感程度，标记当前上下文是否允许融合 |
+| `get_current_time` | `{}` | 获取当前本地日期与时间（精确到分钟），避免在 System 中写死时间 |
+| `set_public` | `{"is_public": bool, "reason": string}` | 根据对话敏感程度标记当前上下文是否允许融合 |
 | `update_topic` | `{"topic": string}` | 上报当前对话主题，为会话融合提供语义判定依据 |
 | `get_current_user_qq` | `{}` | 获取当前对话用户的 QQ 号、昵称及会话信息 |
-| `list_contacts` | `{"query"?: string}` | 查询通讯录（按称呼/QQ/internal_id，缺省列出全部联系人） |
+| `list_contacts` | `{"query"?: string}` | 查询通讯录（按称呼 / QQ / internal_id，缺省列出全部联系人） |
 | `upsert_contact` | `{"name": string, "qq"?: string, "platform"?: string, "user_id"?: string, "notes"?: string}` | 登记新联系人；已登记账号不会被覆盖称呼 |
+| `set_notes` | `{"person": string, "notes": string}` | 更新某人的特点、喜好或印象备注 |
+| `send_message` | `{"text": string, "target"?: string, "mention_user_ids"?: string[], "reply_to_message_id"?: string}` | 主动发送消息，`text` 中可用 `[SEP]` 拆成多气泡，支持 QQ 群聊 @ 与引用 |
+| `wait` / `sleep` | `{"seconds": number, "reason"?: string}` | 等待指定秒数后继续思考，用于模拟真人节奏 |
+| `keepsilent` / `keep_silent` / `stay_silent` | `{"reason": string}` | 保持沉默、已读不回 |
+
+> `set_nickname` 已停用：模型自行改称呼会造成跨轮次身份漂移；底层能力保留在注释中，后续可评估恢复。
 
 #### 🕒 每轮对话的时间标签
 
@@ -267,13 +268,9 @@ wire 层会给**每一轮**用户消息附一个 `[time:YYYY-MM-DD HH:MM]`（取
 - **操作系统**：Linux / macOS / Windows
 - **C++ 编译器**：支持 **C++17** 的现代编译器（GCC 8+, Clang 7+, MSVC 2019+）
 - **构建工具**：[xmake](https://xmake.io/)
-- **系统依赖**：`sqlite3`（包含头文件与库）
-  - Ubuntu/Debian: `sudo apt install libsqlite3-dev`
-  - CentOS/RHEL: `sudo yum install sqlite-devel`
-  - Arch Linux: `sudo pacman -S sqlite`
-  - Windows: 安装系统 sqlite3 或由 xmake 管理
+- **可选运行依赖**：如果需要使用 MCP 工具，请准备对应 MCP Server 的运行环境（如 Python、Node.js/npx）及服务配置。
 
-其他依赖（`cpr`、`nlohmann_json`、`ixwebsocket`）均由 `xmake.lua` 自动拉取与配置。
+C++ 依赖（`cpr`、`nlohmann_json`、`ixwebsocket`）均由 `xmake.lua` 自动拉取与配置。项目已不再依赖 `sqlite3`。
 
 ### 2. 构建命令
 
@@ -301,17 +298,22 @@ xmake
 
 ### 1. 控制台交互模式（Console REPL）
 
-本地测试可直接运行控制台交互界面，配置 OpenAI 兼容接口即可运行：
+推荐从完整样板复制配置文件，按需修改模型、平台与工具设置：
 
 ```bash
-# 配置大模型端点（以 DeepSeek 或本地 Ollama 为例）
-export MIO_BASE_URL="https://api.deepseek.com/v1"
-export MIO_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxx"
-export MIO_MODEL="deepseek-chat"
+# 1. 生成配置文件
+cp config.example.json config.json
 
-# 启动 MIO
-xmake run MIO
+# 2. 至少修改 openai.baseUrl / openai.apiKey / openai.model
+#    可选：platform、napcat、mcp、maintenance、memoryBridge
+
+# 3. 构建并以配置文件启动
+xmake f -m release
+xmake
+./build/linux/x86_64/release/MIO --config config.json
 ```
+
+也可以直接使用 `xmake run MIO -- --config config.json`，或通过 `MIO_CONFIG_PATH` 指定配置文件。未提供配置文件时，程序会回退到环境变量配置。
 
 #### 🕹 控制台支持指令：
 
@@ -320,6 +322,7 @@ xmake run MIO
 | `/chat <内容>` | `/chat 你好呀！`（简易私聊：固定发给模拟用户 `0d00`） |
 | `/msg <类型> <会话ID> <发送者ID> <内容>` | `/msg private 10001 userA 吃了没？`<br>`/msg group 20001 userB 大家好` |
 | `/state` | 打印当前运行态快照（已处理消息数、活跃会话、活跃用户等） |
+| `/reload [path]` | 热重载配置；不传 path 时读取 `config.json` |
 | `/help` | 查看控制台指令帮助 |
 | `/quit` | 退出程序 |
 
@@ -330,83 +333,111 @@ xmake run MIO
 MIO 原生支持通过 **OneBot 11** 反向 WebSocket 接入 [NapCatQQ](https://github.com/NapNeko/NapCatQQ)：
 
 #### ① NapCat 侧配置（反向 WebSocket 客户端）
-在 NapCat 的 `onebot11_<QQ号>.json` 配置文件中，找到 `websocketClients` 字段，添加配置：
+在 NapCat 的 `onebot11_<QQ号>.json` 配置文件中，找到 `websocketClients` 字段，添加配置。`url` 的端口必须与 MIO 的 `napcat.listenPort` 一致（样板默认 `8082`）：
 ```json
 {
   "enable": true,
-  "url": "ws://127.0.0.1:6199",
+  "url": "ws://127.0.0.1:8082",
   "reportSelfMessage": false,
   "messagePostFormat": "array",
   "token": "your_secure_token"
 }
 ```
 
-#### ② 启动 MIO
-指定平台为 `napcat` 并配置监听端口与 Token：
+#### ② 配置并启动 MIO
+在 `config.json` 中启用 NapCat 平台，并填写与 NapCat 相同的 Token：
+
+```json
+{
+  "platform": "napcat",
+  "napcat": {
+    "listenHost": "0.0.0.0",
+    "listenPort": 8082,
+    "token": "your_secure_token"
+  }
+}
+```
 
 ```bash
-# 启用 NapCat 平台适配器
-export MIO_PLATFORM=napcat
-
-# 大语言模型配置
-export MIO_BASE_URL="https://api.deepseek.com/v1"
-export MIO_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxx"
-export MIO_MODEL="deepseek-chat"
-
-# 向量模型配置（可选，未配置时自动回退至 MIO_BASE_URL）
-export MIO_EMBED_BASE_URL="https://api.siliconflow.cn/v1"
-export MIO_EMBED_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxx"
-export MIO_EMBED_MODEL="BAAI/bge-m3"
-
-# NapCat 反向 WebSocket 服务端监听配置
-export MIO_NAPCAT_HOST="0.0.0.0"
-export MIO_NAPCAT_PORT=6199
-export MIO_NAPCAT_TOKEN="your_secure_token"
-
-# 运行 MIO
-xmake run MIO
+./build/linux/x86_64/release/MIO --config config.json
 ```
+
+入站图片、语音、视频与文件的处理开关、缓存目录和 ASR 参数位于 `config.example.json` 第 8 节 `napcat.media`。`MIO_PLATFORM` 环境变量仍可临时覆盖配置文件中的平台选择。
 
 ---
 
 ## ⚙️ 配置与环境变量参考
 
-所有环境变量均有默认配置，可按需覆盖：
+### 1. 配置文件
 
-### 1. LLM 核心配置
+MIO 以 `config.json` 为主配置来源，完整样板见 [`config.example.json`](config.example.json)。支持通过以下方式指定：
+
+```bash
+./MIO --config /path/to/config.json
+./MIO -c /path/to/config.json
+MIO_CONFIG_PATH=/path/to/config.json ./MIO
+```
+
+配置文件支持 C++ 风格 `//` 注释；未填写的字段自动使用默认值，热重载时只覆盖 JSON 中出现的字段。主要配置段：
+
+| 配置段 | 作用 |
+|---|---|
+| 顶层字段 | 机器人名称、人设、数据目录、平台、Admin 端口等 |
+| `openai` | OpenAI 兼容对话端点、模型、采样参数、超时与重试 |
+| `embedding` | 话题语义匹配使用的向量端点；未配置时可回退到 `openai` |
+| `inputBuffer` | 输入防抖、最大聚合等待、批大小与文本上限 |
+| `fusion` | 亲密度、信任度与话题相似度融合阈值 |
+| `contextBuilder` | Token 预算、压缩水位与话题预热轮数 |
+| `napcat` | 反向 WebSocket 监听、Token 与富媒体/ASR 配置 |
+| `splitter` | `[SEP]` 多气泡分段与拟人打字延迟 |
+| `mcp` | 外部 MCP Server 列表、启动命令、工具前缀与超时 |
+| `maintenance` | `once` / `daily` / `interval` 维护任务表 |
+| `memoryBridge` | 滚动摘要写入哪个 MCP 长期记忆工具及参数字段 |
+
+内置 Admin Server 默认监听 `adminPort`（样板为 `6188`），提供：
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| `GET` | `/api/status` | 查看运行状态 |
+| `GET` | `/api/config` | 获取当前配置快照 |
+| `POST` | `/api/config` | 提交 JSON 局部更新并热重载 |
+| `POST` | `/api/reload` | 从 `config.json` 重新加载 |
+
+### 2. 环境变量回退
+
+设置 `MIO_NO_CONFIG=1`，或当前目录不存在 `config.json` 且未指定 `--config` 时，程序会回退到环境变量配置。常用变量如下：
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `MIO_BASE_URL` | `http://127.0.0.1:8080` | OpenAI 兼容服务地址（填至 `/v1` 之前即可） |
-| `MIO_API_KEY` | *(空)* | API 密钥 |
-| `MIO_MODEL` | `local-model` | 模型名称（如 `deepseek-chat`, `mimo-v2.5`） |
-| `MIO_MAX_TOKENS` | `512` | 单次生成最大 Token 数上限 |
-| `MIO_MODEL_REASONING_EFFORT` | *(空)* | 推理努力程度（`low`, `medium`, `high`） |
-| `MIO_THINKING` | *(空)* | 思考输出开关（`enabled` / `disabled`） |
-| `MIO_LLM_BACKEND` | `openai` | 大模型协议类型（当前实现兼容 `openai` 接口） |
-
-### 2. 向量嵌入（Embedding）与记忆配置
-
-| 环境变量 | 默认值 | 说明 |
-|---|---|---|
-| `MIO_EMBED_BASE_URL` | 回退到 `MIO_BASE_URL` | 向量化服务地址（支持独立第三方服务） |
+| `MIO_CONFIG_PATH` | *(空)* | 配置文件路径；存在时优先加载 |
+| `MIO_NO_CONFIG` | *(空)* | 非空时强制使用环境变量配置 |
+| `MIO_BOT_NAME` | `Mio` | 机器人名称 |
+| `MIO_DATA_DIR` | `data` | 会话档案与运行数据目录 |
+| `MIO_PLATFORM` | `console` | 运行平台：`console` 或 `napcat` |
+| `MIO_BASE_URL` | `http://127.0.0.1:8080` | OpenAI 兼容对话端点 |
+| `MIO_API_KEY` | *(空)* | 对话 API 密钥 |
+| `MIO_MODEL` | `local-model` | 对话模型名称 |
+| `MIO_MAX_TOKENS` | `512` | 单次生成最大 Token 数 |
+| `MIO_MODEL_REASONING_EFFORT` | *(空)* | 推理努力程度：`low` / `medium` / `high` / `xhigh` / `max` |
+| `MIO_THINKING` | *(空)* | 思考模式：`enabled` / `disabled` |
+| `MIO_LLM_BACKEND` | `openai` | LLM 协议后端 |
+| `MIO_EMBED_BASE_URL` | 回退到 `MIO_BASE_URL` | 向量化服务地址 |
 | `MIO_EMBED_API_KEY` | 回退到 `MIO_API_KEY` | 向量化 API 密钥 |
-| `MIO_EMBED_MODEL` | `BAAI/bge-m3` | 向量化模型名称（默认 1024 维） |
-
-### 3. 平台适配器配置
-
-| 环境变量 | 默认值 | 说明 |
-|---|---|---|
-| `MIO_PLATFORM` | `console` | 运行平台：`console`（控制台）或 `napcat`（NapCatQQ） |
-| `MIO_NAPCAT_HOST` | `127.0.0.1` | 反向 WebSocket 监听 IP |
+| `MIO_EMBED_MODEL` | `BAAI/bge-m3` | 向量化模型名称 |
+| `MIO_NAPCAT_HOST` | `127.0.0.1` | 反向 WebSocket 监听地址 |
 | `MIO_NAPCAT_PORT` | `6199` | 反向 WebSocket 监听端口 |
-| `MIO_NAPCAT_TOKEN` | *(空)* | OneBot 11 访问令牌（Access Token，留空不校验） |
+| `MIO_NAPCAT_TOKEN` | *(空)* | OneBot 11 Access Token |
+| `MIO_MEDIA_ENABLED` | `true` | 是否启用入站媒体处理 |
+| `MIO_MEDIA_CACHE_DIR` | `data/media` | 媒体缓存目录 |
+| `MIO_MEDIA_MAX_BYTES` | `8388608` | 单文件大小上限 |
+| `MIO_ASR_ENABLED` | `false` | 是否启用语音转写 |
+| `MIO_ASR_BASE_URL` | 回退到 `MIO_BASE_URL` | ASR 服务地址 |
+| `MIO_ASR_API_KEY` | 回退到 `MIO_API_KEY` | ASR API 密钥 |
+| `MIO_ASR_MODEL` | `whisper-1` | ASR 模型名称 |
+| `MIO_ASR_LANGUAGE` | *(空)* | 识别语言，留空自动识别 |
+| `MIO_LOG_LEVEL` | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
 
-### 4. 日志系统配置
-
-| 环境变量 | 默认值 | 说明 |
-|---|---|---|
-| `MIO_LOG_LEVEL` | `info` | 日志级别：`debug`、`info`、`warn`、`error` |
+> 配置文件模式是推荐用法；环境变量回退主要用于容器、本地调试或临时覆盖。
 
 ---
 
@@ -416,35 +447,47 @@ xmake run MIO
 src/
 ├── adapters/                     # 平台适配器
 │   ├── console/                  # 控制台 REPL 交互实现 (ConsoleAdapter)
-│   └── napcat/                   # NapCat OneBot 11 反向 WS 服务端与协议解析
-├── config/                       # 配置加载器
-│   ├── embedding/                # 向量嵌入端点配置解析 (EmbeddingConfig)
-│   └── openai/                   # OpenAI 兼容端点配置解析 (OpenaiConfig)
+│   └── napcat/                   # OneBot 11 反向 WS、消息解析、富媒体下载与 ASR
+├── admin/                        # 内置 HTTP 管理服务 (AdminServer)
+├── config/                       # 配置加载与热重载
+│   ├── ConfigManager.*           # 线程安全配置快照与文件/环境重载
+│   ├── AppConfig.*               # 顶层配置模型
+│   ├── asr/                      # ASR 配置
+│   ├── embedding/                # 向量嵌入配置
+│   ├── mcp/                      # MCP Server 配置
+│   └── openai/                   # OpenAI 兼容端点配置
 ├── context/                      # 上下文管理与装配
 │   ├── achieve/                  # 会话历史冷读取与落盘 (Achieve)
 │   ├── contextBuilder/           # 请求上下文装配与水位监控压缩 (ContextBuilder)
 │   ├── conversationFusion/       # 会话融合路由与单元 (FusionRouter, FusionContext)
 │   ├── costEstimator/            # Token 估算与安全截断 (Tokens)
+│   ├── inputBuffer/              # 输入防抖、批处理与代际控制 (InputBuffer)
 │   └── summarizor/               # 经历滚动摘要器 (SummaryManager)
 ├── core/                         # 核心领域实体
 │   ├── conversation/             # 会话标识定义 (ConversationKey)
 │   ├── event/                    # 领域事件定义 (Event)
 │   ├── eventlog/                 # 事件审计日志存储 (EventLog)
-│   └── message/                  # 中性统一消息模型 (Msg, Role, ToolCall)
-├── diary/                        # 认知日记模块 (Diary)
-├── llm/                          # 大语言模型与 Agent 抽象
-│   ├── openai/                   # OpenAI 兼容协议客户端与嵌入实现
-│   ├── tool/                     # 工具注册表 (ToolRegistry) 与护栏循环 (ToolLoop)
-│   ├── Embedding.h               # 向量化抽象接口
-│   └── Llm.h                     # LLM 补全抽象契约
+│   ├── math/                     # 向量数学工具 (VectorMath)
+│   ├── message/                  # 中性消息模型与历史视图 (Msg, Role, History)
+│   └── time/                     # 本地时间工具 (LocalTime)
+├── diary/                        # 封存式认知条目存储 (Diary)
 ├── log/                          # 格式化日志输出 (Log)
-├── memory/                       # 长期记忆检索系统
-│   ├── manager/                  # 记忆两段式检索编排 (MemoryManager)
-│   ├── store/                    # SQLite 原生 BLOB 存储与预过滤 (MemoryStore)
-│   └── VectorMath.h              # SIMD 硬件加速向量点积 (AVX-512/AVX2/NEON/SSE2)
 ├── mind/                         # 潜意识与事实层
 │   ├── facts/                    # 稳定 System Prompt 组装 (Facts)
 │   └── graph/                    # 人际动态关系图谱 (RelationshipGraph)
-├── runtime/                      # 运行时组合根 (Runtime 状态与生命周期调度)
-└── main.cpp                      # 应用程序入口 (main)
+├── providers/                    # 外部能力抽象与实现
+│   ├── asr/                      # 语音识别抽象与 OpenAI 兼容实现
+│   ├── embedding/                # 向量化抽象与 OpenAI 兼容实现
+│   ├── llm/                      # LLM 抽象、OpenAI 兼容客户端、工具循环
+│   │   ├── openai/               # Chat Completions / 推理内容 / 多模态请求
+│   │   └── tool/                 # ToolRegistry 与 ToolLoop 护栏
+│   ├── mcp/                      # MCP 客户端、Server 管理、JSON-RPC 与 stdio 传输
+│   └── memory/                   # 长期记忆 Provider 接口（由外部实现）
+├── runtime/                      # 运行时组合根
+│   ├── Runtime.*                 # 状态、生命周期、上下文锁与工具接线
+│   ├── ContactTools.*            # 通讯录工具
+│   ├── MessageTools.*            # send_message / 多气泡发送
+│   └── SummaryBridge.*           # 滚动摘要 → MCP 长期记忆
+├── scheduler/                    # 定时任务调度器 (Scheduler)
+└── main.cpp                      # 应用程序入口
 ```
