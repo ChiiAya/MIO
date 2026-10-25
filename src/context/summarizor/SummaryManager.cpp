@@ -1,5 +1,6 @@
 #include "context/summarizor/SummaryManager.h"
 
+#include <optional>
 #include <sstream>
 
 #include "context/costEstimator/Tokens.h"
@@ -7,6 +8,26 @@
 namespace mio {
 
 namespace {
+
+// 解析单行 "标签：值"。返回 nullopt = 这行不是标记行（标签后没有紧跟冒号）；
+// 返回空串 = 确实是标记行，只是值为空。两者语义不同，调用方分别处理。
+std::optional<std::string> markerValue(const std::string& line,
+                                       const std::string& label) {
+    std::string value = line.substr(label.size());
+    const auto begin = value.find_first_not_of(" \t");
+    if (begin == std::string::npos) return std::nullopt;
+    value.erase(0, begin);
+    if (value.rfind("：", 0) == 0)
+        value.erase(0, std::string("：").size());
+    else if (value.rfind(":", 0) == 0)
+        value.erase(0, 1);
+    else
+        return std::nullopt;
+    const auto first = value.find_first_not_of(" \t\r");
+    if (first == std::string::npos) return std::string{};  // 标记行，值为空
+    const auto last = value.find_last_not_of(" \t\r");
+    return value.substr(first, last - first + 1);
+}
 
 std::string renderHistoryText(const std::vector<Msg>& msgs, int maxChars) {
     std::ostringstream s;
@@ -32,8 +53,8 @@ std::string renderHistoryText(const std::vector<Msg>& msgs, int maxChars) {
 
 } // namespace
 
-SummaryManager::SummaryManager(int maxSummaryChars,Llm& llm)
-    : maxSummaryChars_(maxSummaryChars),llm_(llm) {}
+SummaryManager::SummaryManager(int maxSummaryChars, std::shared_ptr<Llm> llm)
+    : maxSummaryChars_(maxSummaryChars), llm_(std::move(llm)) {}
 
 SummaryOutcome SummaryManager::summarizeWithVerdict(const std::vector<Msg>& material) const {
     ChatRequest req;
@@ -57,7 +78,8 @@ SummaryOutcome SummaryManager::summarizeWithVerdict(const std::vector<Msg>& mate
     req.messages.push_back(std::move(m));
 
     SummaryOutcome out;
-    const ChatResponse resp = llm_.chat(req);
+    if (!llm_) return out;
+    const ChatResponse resp = llm_->chat(req);
     const std::string full = cutUtf8(resp.text,
                                      static_cast<std::size_t>(maxSummaryChars_ * 2) + 32);
 
@@ -81,23 +103,16 @@ SummaryOutcome SummaryManager::summarizeWithVerdict(const std::vector<Msg>& mate
 
         bool marker = false;
         if (line.rfind("私密性判断", 0) == 0) {
-            const auto colon = line.find_first_of("：:");
-            if (colon != std::string::npos) {
-                out.privateVerdict =
-                    line.substr(colon + 1).find("私密") != std::string::npos;
+            if (const auto value = markerValue(line, "私密性判断")) {
+                // 只有明确公开才放宽隐私；值为空或含义不明（"不公开"/"保密"…）
+                // 一律保持私密。判定行整行缺失时用结构体默认值（也是私密）。
+                out.privateVerdict = *value != "公开";
                 marker = true;
             }
         } else if (line.rfind("话题", 0) == 0) {
-            const auto colon = line.find_first_of("：:");
-            if (colon != std::string::npos) {
-                // 话题供 Router 语义匹配用，宜短；截断并去尾部空白
-                std::string topic = line.substr(colon + 1);
-                while (!topic.empty() &&
-                       (topic.back() == ' ' || topic.back() == '\r' ||
-                        topic.back() == '\t'))
-                    topic.pop_back();
-                out.topic = cutUtf8(topic, 50);
-                marker = true;
+            if (const auto value = markerValue(line, "话题")) {
+                if (!value->empty()) out.topic = cutUtf8(*value, 50);
+                marker = true;  // 空值也算标记行消费掉，别落进摘要正文
             }
         }
         if (!marker) break;  // 正文行：标记区结束

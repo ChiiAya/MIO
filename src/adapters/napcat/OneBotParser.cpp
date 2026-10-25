@@ -1,5 +1,6 @@
 #include "adapters/napcat/OneBotParser.h"
 
+#include <algorithm>
 #include <cctype>
 #include <limits>
 #include <sstream>
@@ -57,11 +58,12 @@ std::string segmentText(const nlohmann::json& seg) {
     if (type == "text") return stringValue(data, "text");
     if (type == "at") {
         const std::string qq = idToString(data.value("qq", nlohmann::json()));
-        return qq == "all" ? "@全体成员" : "@" + qq;
+        // Keep a boundary when the following text starts with digits/letters.
+        return qq == "all" ? "@全体成员 " : (qq.empty() ? "" : "@" + qq + " ");
     }
-    // IncomingMessage is text-only today; retain a readable marker for rich
-    // segments so image/file/voice messages are not silently discarded when
-    // they also carry no caption text.
+    // 富媒体段：文本侧保留可读标记（保证纯媒体消息也有正文），
+    // 结构化的 url/path/时长等由 appendMediaAttachment 另存，
+    // 交给适配器 MediaResolver 决定是送视觉模型、ASR 还是仅缓存。
     if (type == "image") return "[图片]";
     if (type == "record") return "[语音]";
     if (type == "video") return "[视频]";
@@ -69,6 +71,124 @@ std::string segmentText(const nlohmann::json& seg) {
     if (type == "face" || type == "mface") return "[表情]";
     if (type == "reply") return "[回复]";
     return "";
+}
+
+// image/record/video/file 段 -> 结构化媒体元数据（只解析，不下载）
+void appendMediaAttachment(OneBotEvent& ev, const OneBotMessageSegment& seg) {
+    MediaAttachment a;
+    if (seg.type == "image") {
+        a.kind = MediaKind::Image;
+    } else if (seg.type == "record") {
+        a.kind = MediaKind::Audio;
+    } else if (seg.type == "video") {
+        a.kind = MediaKind::Video;
+    } else if (seg.type == "file") {
+        a.kind = MediaKind::File;
+    } else {
+        return;
+    }
+
+    const nlohmann::json& d = seg.data;
+    a.url = stringValue(d, "url");
+    a.fileId = stringValue(d, "file_id");
+    a.fileName = stringValue(d, "file_name");
+    if (a.fileName.empty()) a.fileName = stringValue(d, "name");
+    if (a.fileName.empty()) a.fileName = stringValue(d, "file");
+    a.mimeType = stringValue(d, "mime_type");
+    if (a.mimeType.empty()) a.mimeType = stringValue(d, "mime");
+    a.sizeBytes = int64Value(d.value("file_size", nlohmann::json()));
+    if (a.sizeBytes <= 0) a.sizeBytes = int64Value(d.value("size", nlohmann::json()));
+    a.durationSec = int64Value(d.value("duration", nlohmann::json()));
+
+    // NapCat 与 MIO 同机部署时，file/path 常是可直接读取的绝对路径（或 file:/// 协议路径）；
+    // 远程部署时这里为空，只能靠 url（或后续再走 OneBot 文件接口）。
+    for (const char* key : {"path", "file"}) {
+        std::string value = stringValue(d, key);
+        if (value.rfind("file://", 0) == 0) {
+            value = value.substr(7);
+        }
+        if (!value.empty() && value[0] == '/') {
+            a.localPath = value;
+            break;
+        }
+    }
+
+    ev.attachments.push_back(std::move(a));
+}
+
+std::string decodeCqEntities(const std::string& text, bool parameter) {
+    std::string result;
+    result.reserve(text.size());
+    // Consume the original input once: &amp;#91; must remain &#91;.
+    for (std::size_t i = 0; i < text.size();) {
+        if (text.compare(i, 5, "&amp;") == 0) {
+            result += '&';
+            i += 5;
+        } else if (text.compare(i, 5, "&#91;") == 0) {
+            result += '[';
+            i += 5;
+        } else if (text.compare(i, 5, "&#93;") == 0) {
+            result += ']';
+            i += 5;
+        } else if (parameter && text.compare(i, 5, "&#44;") == 0) {
+            result += ',';
+            i += 5;
+        } else {
+            result += text[i++];
+        }
+    }
+    return result;
+}
+
+void appendSegment(OneBotEvent& ev, OneBotMessageSegment segment) {
+    appendMediaAttachment(ev, segment);
+    ev.text += segmentText({{"type", segment.type}, {"data", segment.data}});
+    ev.segments.push_back(std::move(segment));
+}
+
+void parseCqMessage(OneBotEvent& ev, const std::string& text) {
+    auto appendText = [&](std::size_t first, std::size_t length) {
+        if (length == 0) return;
+        appendSegment(ev, {"text", {{"text", decodeCqEntities(text.substr(first, length), false)}}});
+    };
+    std::size_t position = 0;
+    std::size_t literalStart = 0;
+    while ((position = text.find("[CQ:", position)) != std::string::npos) {
+        const auto end = text.find(']', position + 4);
+        if (end == std::string::npos) break;
+        const std::string body = text.substr(position + 4, end - position - 4);
+        const auto comma = body.find(',');
+        const std::string type = body.substr(0, comma);
+        auto identifier = [](const std::string& value) {
+            return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char c) {
+                return std::isalnum(c) || c == '_' || c == '-';
+            });
+        };
+        bool valid = identifier(type);
+        nlohmann::json data = nlohmann::json::object();
+        if (comma != std::string::npos) {
+            std::size_t fieldStart = comma + 1;
+            while (valid && fieldStart <= body.size()) {
+                const auto next = body.find(',', fieldStart);
+                const std::string field = body.substr(fieldStart, next - fieldStart);
+                const auto equals = field.find('=');
+                if (equals == std::string::npos || !identifier(field.substr(0, equals))) {
+                    valid = false;
+                    break;
+                }
+                data[field.substr(0, equals)] = decodeCqEntities(field.substr(equals + 1), true);
+                if (next == std::string::npos) break;
+                fieldStart = next + 1;
+            }
+        }
+        if (valid) {
+            appendText(literalStart, position - literalStart);
+            appendSegment(ev, {type, std::move(data)});
+            literalStart = end + 1;
+        }
+        position = end + 1;
+    }
+    appendText(literalStart, text.size() - literalStart);
 }
 
 OneBotPostType postTypeFromString(const std::string& s) {
@@ -144,17 +264,20 @@ OneBotEvent parseOneBotEvent(const nlohmann::json& raw) {
                     s.data = *dataIt;
                 else
                     s.data = nlohmann::json::object();
-                ev.segments.push_back(s);
-                ev.text += segmentText(seg);
+                appendSegment(ev, std::move(s));
             }
         } else if (it != raw.end()) {
-            ev.text = idToString(*it);
+            parseCqMessage(ev, idToString(*it));
         } else {
-            ev.text = ev.rawMessage;
+            parseCqMessage(ev, ev.rawMessage);
         }
         // NapCat may provide an empty/unsupported segment array while still
         // retaining a useful raw_message fallback (notably string format).
-        if (ev.text.empty() && !ev.rawMessage.empty()) ev.text = ev.rawMessage;
+        if (ev.text.empty() && !ev.rawMessage.empty()) {
+            ev.segments.clear();
+            ev.attachments.clear();
+            parseCqMessage(ev, ev.rawMessage);
+        }
         break;
     }
     case OneBotPostType::Notice: {
@@ -196,8 +319,7 @@ OneBotEvent parseOneBotEvent(const nlohmann::json& raw) {
 std::optional<IncomingMessage> eventToIncomingMessage(const OneBotEvent& ev) {
     if (!ev.isMessageEvent) return std::nullopt;
     if (ev.userId.empty() || ev.userId == ev.selfId) return std::nullopt;
-    // Runtime::IncomingMessage is text-only; rich segments are represented by
-    // readable markers by segmentText so they are not silently lost.
+    // 富媒体消息至少会有 [图片]/[语音] 之类的标记，不会在这里被丢弃
     if (ev.text.empty()) return std::nullopt;
 
     IncomingMessage msg;
@@ -212,8 +334,25 @@ std::optional<IncomingMessage> eventToIncomingMessage(const OneBotEvent& ev) {
     }
 
     msg.senderId = ev.userId;
+    // NapCat 传入的昵称：群名片优先，无群名片则取 QQ 昵称
+    msg.senderName = !ev.sender.card.empty() ? ev.sender.card : ev.sender.nickname;
     msg.text = ev.text;
     msg.platform = "qq";
+    msg.attachments = ev.attachments;
+    msg.messageId = ev.messageId;
+
+    // 提取 @ 提及的 QQ 号列表
+    for (const auto& seg : ev.segments) {
+        if (seg.type == "at") {
+            const std::string qq = idToString(seg.data.value("qq", nlohmann::json()));
+            if (!qq.empty() && qq != "all" &&
+                std::find(msg.atUserIds.begin(), msg.atUserIds.end(), qq) == msg.atUserIds.end()) {
+                msg.atUserIds.push_back(qq);
+            }
+        } else if (seg.type == "reply" && msg.replyToMessageId.empty()) {
+            msg.replyToMessageId = idToString(seg.data.value("id", nlohmann::json()));
+        }
+    }
     return msg;
 }
 

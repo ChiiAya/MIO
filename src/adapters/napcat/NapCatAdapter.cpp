@@ -1,3 +1,4 @@
+#include "adapters/napcat/OneBotMessage.h"
 // ============================================================================
 // NapCatQQ 适配器实现（反向 WebSocket）
 //
@@ -14,8 +15,10 @@
 // ============================================================================
 
 #include "adapters/napcat/NapCatAdapter.h"
-
+#include "adapters/napcat/MediaResolver.h"
 #include "adapters/napcat/OneBotParser.h"
+#include "providers/asr/openai/OpenAiAsr.h"
+#include "runtime/Runtime.h"
 
 #include <ixwebsocket/IXWebSocket.h>
 #include <ixwebsocket/IXWebSocketServer.h>
@@ -222,19 +225,8 @@ bool callAction(const std::shared_ptr<ix::WebSocket>& ws, PendingActions& pendin
 }
 
 bool sendReply(const std::shared_ptr<ix::WebSocket>& ws, PendingActions& pending,
-               const ConversationKey& conversation, const std::string& senderId,
-               const std::string& text) {
-    nlohmann::json params{{"message", text}};
-    if (conversation.scope == ConversationScope::Group) {
-        // NapCat's documented unified API is send_msg. It accepts the same
-        // payload as send_group_msg while making the target type explicit.
-        params["message_type"] = "group";
-        params["group_id"] = idToJson(conversation.id);
-    } else {
-        params["message_type"] = "private";
-        params["user_id"] = idToJson(senderId);
-    }
-    return callAction(ws, pending, "send_msg", std::move(params));
+               const ConversationKey& conversation, const OutgoingMessage& message) {
+    return callAction(ws, pending, "send_msg", napcat::buildSendParams(conversation, message));
 }
 
 // --- 连接与 worker ---------------------------------------------------------------
@@ -244,34 +236,58 @@ struct NapCatConnection {
 };
 
 void workerLoop(Runtime& runtime, NapCatConnection& conn, PendingActions& pending,
+                const MediaResolver& mediaResolver,
                 std::deque<IncomingMessage>& queue, std::mutex& queueMtx,
                 std::condition_variable& queueCv, const std::atomic<bool>& running) {
+    std::atomic<int> activeTasks{0};
+    std::mutex taskMtx;
+    std::condition_variable taskCv;
+
     for (;;) {
         std::unique_lock<std::mutex> lock(queueMtx);
         queueCv.wait(lock, [&] { return !queue.empty() || !running; });
-        if (queue.empty()) return;
+        if (queue.empty()) {
+            std::unique_lock<std::mutex> tlock(taskMtx);
+            taskCv.wait(tlock, [&] { return activeTasks == 0; });
+            return;
+        }
         IncomingMessage message = std::move(queue.front());
         queue.pop_front();
         lock.unlock();
 
-        const ConversationKey conversation = message.conversation;
-        const std::string senderId = message.senderId;
-        log::info(kTag, "处理 " + conversation.toString() + " 来自 " + senderId);
+        activeTasks++;
+        std::thread([&runtime, &conn, &pending, &mediaResolver, &activeTasks,
+                     &taskMtx, &taskCv,
+                     message = std::move(message)]() mutable {
+            const ConversationKey conversation = message.conversation;
+            const std::string senderId = message.senderId;
+            log::info(kTag, "处理 " + conversation.toString() + " 来自 " + senderId);
 
-        try {
-            const BotReply reply = runtime.ingest(std::move(message));
-            if (reply.text.empty()) continue;
-
-            std::shared_ptr<ix::WebSocket> ws;
-            {
-                std::lock_guard<std::mutex> connLock(conn.mtx);
-                ws = conn.current;
+            try {
+                // 媒体解析放在 worker 线程：下载/ASR 都是阻塞 I/O，
+                // 且不能占用 WebSocket 回调线程（那会卡住 action 响应）。
+                const std::size_t attachmentCount = message.attachments.size();
+                mediaResolver.resolve(message);
+                if (attachmentCount > 0) {
+                    log::info(kTag, "媒体解析完成 count=" +
+                                        std::to_string(attachmentCount) +
+                                        " parts=" +
+                                        std::to_string(message.parts.size()));
+                }
+                const BotReply reply = runtime.ingest(std::move(message));
+                if (!reply.text.empty()) {
+                    log::info(kTag, "已回复 → " + conversation.toString());
+                }
+            } catch (const std::exception& error) {
+                log::error(kTag, std::string("处理消息失败: ") + error.what());
             }
-            if (sendReply(ws, pending, conversation, senderId, reply.text))
-                log::info(kTag, "已回复 → " + conversation.toString());
-        } catch (const std::exception& error) {
-            log::error(kTag, std::string("处理消息失败: ") + error.what());
-        }
+
+            {
+                std::lock_guard<std::mutex> tlock(taskMtx);
+                activeTasks--;
+            }
+            taskCv.notify_one();
+        }).detach();
     }
 }
 
@@ -283,20 +299,40 @@ NapCatConfig NapCatConfig::fromEnvironment() {
     if (auto v = env("MIO_NAPCAT_HOST")) cfg.listenHost = *v;
     if (auto v = envInt("MIO_NAPCAT_PORT")) cfg.listenPort = *v;
     if (auto v = env("MIO_NAPCAT_TOKEN")) cfg.token = *v;
+    cfg.media = MediaConfig::fromEnvironment();
     return cfg;
 }
 
 void runNapCat(Runtime& runtime, const NapCatConfig& config) {
     PendingActions pending;
     NapCatConnection conn;
+    // ASR 只在配置启用时构造；未启用时 MediaResolver 仅缓存音频文件
+    std::shared_ptr<AsrProvider> asr;
+    if (config.media.enabled && config.media.audio && config.media.asr.enabled) {
+        asr = std::make_shared<OpenAiAsr>(config.media.asr);
+    }
+    const MediaResolver mediaResolver(config.media, std::move(asr));
+
     std::deque<IncomingMessage> queue;
     std::mutex queueMtx;
     std::condition_variable queueCv;
     std::atomic<bool> running{true};
 
+    runtime.setStructuredMessageSender([&conn, &pending](const ConversationKey& conv,
+                                              const OutgoingMessage& message) -> bool {
+        std::shared_ptr<ix::WebSocket> ws;
+        {
+            std::lock_guard<std::mutex> connLock(conn.mtx);
+            ws = conn.current;
+        }
+        if (!ws) return false;
+        return sendReply(ws, pending, conv, message);
+    });
+
     std::thread worker(workerLoop, std::ref(runtime), std::ref(conn),
-                       std::ref(pending), std::ref(queue), std::ref(queueMtx),
-                       std::ref(queueCv), std::cref(running));
+                       std::ref(pending), std::cref(mediaResolver),
+                       std::ref(queue), std::ref(queueMtx), std::ref(queueCv),
+                       std::cref(running));
     auto stopWorker = [&] {
         running = false;
         queueCv.notify_all();

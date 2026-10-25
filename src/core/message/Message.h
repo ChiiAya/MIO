@@ -68,8 +68,18 @@ struct Msg {
     std::string senderName;
     std::string platform;
     std::string groupId;
+    std::string messageId;          // 平台消息 ID，用于引用；不跨会话复用
+    std::string replyToMessageId;
+    std::vector<std::string> atUserIds;
 
     bool isTextOnly() const { return parts.empty(); }
+};
+
+// 平台发送语义。文本保持字面值，@/引用由适配器转成协议消息段。
+struct OutgoingMessage {
+    std::string text;
+    std::vector<std::string> mentionUserIds;
+    std::string replyToMessageId;
 };
 
 // ---- 内部持久化格式（自有格式，稳定可版本化）---------------------------------

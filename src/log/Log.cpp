@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <ctime>
 #include <mutex>
-#include <utility>
 
 namespace mio {
 namespace log {
@@ -59,7 +58,11 @@ void write(Level lvl, std::string_view tag, const std::string& message) {
     // 本地时间戳，只精确到秒（日志是用来排障的，不是计时器）
     const std::time_t t = std::time(nullptr);
     std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
     localtime_r(&t, &tm);
+#endif
     char stamp[16];
     std::snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d",  //
                   tm.tm_hour, tm.tm_min, tm.tm_sec);

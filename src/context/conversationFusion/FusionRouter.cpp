@@ -7,11 +7,15 @@
 #include "context/conversationFusion/FusionRouter.h"
 
 #include <algorithm>
+#include <cctype>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
 #include <utility>
 
 #include "context/costEstimator/Tokens.h"
 #include "log/Log.h"
-#include "memory/VectorMath.h"
+#include "core/math/VectorMath.h"
 
 namespace mio {
 
@@ -38,14 +42,74 @@ std::string hexEncode(const std::string& s) {
 } // namespace
 
 FusionRouter::FusionRouter(RelationshipGraph& graph, Achieve& achieve,
-                           SummaryManager& summary, FusionConfig cfg,
-                           const Embedding* embedding)
-    : graph_(graph), achieve_(achieve), summary_(summary), cfg_(cfg),
-      embedding_(embedding) {}
+                           std::shared_ptr<SummaryManager> summary, FusionConfig cfg,
+                           std::shared_ptr<Embedding> embedding)
+    : graph_(graph), achieve_(achieve), summary_(std::move(summary)), cfg_(cfg),
+      embedding_(std::move(embedding)) {}
+
+void FusionRouter::update(FusionConfig cfg, std::shared_ptr<SummaryManager> summary,
+                          std::shared_ptr<Embedding> embedding) {
+    std::lock_guard<std::mutex> lock(mapMtx_);
+    cfg_ = cfg;
+    summary_ = std::move(summary);
+    embedding_ = std::move(embedding);
+    topicVecCache_.clear();
+}
+
+void FusionRouter::updateConfig(FusionConfig cfg) {
+    std::lock_guard<std::mutex> lock(mapMtx_);
+    cfg_ = cfg;
+}
+
+void FusionRouter::updateDependencies(std::shared_ptr<SummaryManager> summary,
+                                      std::shared_ptr<Embedding> embedding) {
+    std::lock_guard<std::mutex> lock(mapMtx_);
+    summary_ = std::move(summary);
+    embedding_ = std::move(embedding);
+    topicVecCache_.clear();
+}
 
 std::size_t FusionRouter::unitCount() const {
     std::lock_guard<std::mutex> lock(mapMtx_);
     return units_.size();
+}
+
+std::vector<FusionRouter::UnitSnapshot> FusionRouter::activeUnitsSince(
+    std::int64_t since) const {
+    // 两阶段快照：第一阶段只在 mapMtx_ 下取指针与来源 key（不碰 unit 锁），
+    // 第二阶段逐个取 unit 锁拷贝上下文。反过来同时持 mapMtx_ + unit->mtx 会和
+    // ingest 的 unit->mtx → mapMtx_（set_public 等工具回调 Router）形成反向锁序。
+    // units_ 从不 erase（融合只产生孤儿 unit），所以第二阶段的裸指针仍然有效。
+    struct Ref {
+        FusionUnit* unit = nullptr;
+        ConversationKey conversation;
+    };
+    std::vector<Ref> refs;
+    {
+        std::lock_guard<std::mutex> lock(mapMtx_);
+        refs.reserve(units_.size());
+        for (const auto& entry : units_) {
+            const auto& unit = entry.second;
+            if (!unit || unit->inDegree().empty()) continue;
+            Ref ref;
+            ref.unit = unit.get();
+            ref.conversation = unit->inDegree().front();
+            refs.push_back(std::move(ref));
+        }
+    }
+
+    std::vector<UnitSnapshot> out;
+    for (auto& ref : refs) {
+        std::lock_guard<std::mutex> unitLock(ref.unit->mtx);
+        UnitSnapshot snapshot;
+        snapshot.conversation = ref.conversation;
+        snapshot.context = ref.unit->context();
+        snapshot.topic = ref.unit->topic();
+        if (!snapshot.context.empty())
+            snapshot.lastAt = snapshot.context.back().createdAt;
+        if (snapshot.lastAt >= since) out.push_back(std::move(snapshot));
+    }
+    return out;
 }
 
 FusionUnit* FusionRouter::findUnit(const IncomingMessage& msg) const {
@@ -71,7 +135,12 @@ FusionUnit* FusionRouter::findUnit(const IncomingMessage& msg) const {
 FusionUnit* FusionRouter::createFromColdRead(const IncomingMessage& msg,
                                              std::time_t now) {
     // 首次遇见来源：Achieve 冷读取（摘要前20条 + 原文5条）→ 创建 FusionUnit
-    const ColdRead cold = achieve_.coldRead(msg.conversation, summary_);
+    ColdRead cold;
+    if (summary_) {
+        cold = achieve_.coldRead(msg.conversation, *summary_);
+    } else {
+        cold.msgs = achieve_.load(msg.conversation);
+    }
     auto unit = std::make_unique<FusionUnit>(msg.conversation, cold.msgs);
     unit->setIsPublic(cold.isPublic);
     if (!cold.topic.empty()) unit->setTopic(cold.topic);  // 话题随摘要同步更新
@@ -289,7 +358,8 @@ FusionUnit* FusionRouter::fuse(FusionUnit& a, FusionUnit& b,
     }
 
     // 短者 beRedirected（摘要前20 + 近5原文）→ 追加到长者末尾
-    const std::vector<Msg> redirected = short_->beRedirected(summary_);
+    const std::vector<Msg> redirected = summary_ ? short_->beRedirected(*summary_)
+                                                 : short_->beRedirected();
     for (const auto& m : redirected) long_->append(m);
 
     const std::string shortKey = short_->inDegree().front().toString();
@@ -325,21 +395,43 @@ FusionUnit* FusionRouter::route(const IncomingMessage& msg, std::time_t now) {
     std::lock_guard<std::mutex> lock(mapMtx_);
 
     // 1) 身份映射：先确保身份存在（首次遇见分配 internalId、权重累积），
-    //    再按来源/人查找当前 unit；首次遇见 → 冷读取创建
-    graph_.onSeen(msg.platform, msg.senderId, msg.senderId, now);
+    //    若为系统未记录个体，注入 nameHint = senderId(senderName)
+    const std::string nameHint = (!msg.senderName.empty() && msg.senderName != msg.senderId)
+                                     ? msg.senderId + "(" + msg.senderName + ")"
+                                     : msg.senderId;
+    graph_.onSeen(msg.platform, msg.senderId, nameHint, now);
     FusionUnit* unit = findUnit(msg);
     if (!unit) unit = createFromColdRead(msg, now);
 
     // 群消息：登记成员 + 共同出现 → 两人亲密累积
-    if (msg.conversation.scope == ConversationScope::Group) {
+    const PersonNode* senderNode = graph_.findByPlatform(msg.platform, msg.senderId);
+    if (msg.conversation.scope == ConversationScope::Group && !unit->inDegree().empty()) {
         const std::string unitKey = unit->inDegree().front().toString();
-        if (const PersonNode* p = graph_.findByPlatform(msg.platform, msg.senderId);
-            p != nullptr) {
+        if (senderNode != nullptr) {
             auto& members = unitMembers_[unitKey];
             for (const auto& m : members)
-                if (m != p->internalId)
-                    graph_.bumpIntimacy(p->internalId, m, 0.05, now);
-            members.insert(p->internalId);
+                if (m != senderNode->internalId)
+                    graph_.bumpIntimacy(senderNode->internalId, m, 0.05, now);
+            members.insert(senderNode->internalId);
+        }
+    }
+
+    // @ 关系映射：结构化 mention 优先，纯文本只接收有独立边界的 QQ 号。
+    // 将其映射为认识的人，并在群聊中计入成员并累积与发言者的亲密度
+    const auto atIds = mentionedUserIds(msg);
+    for (const auto& atId : atIds) {
+        if (atId.empty() || atId == "all" || atId == msg.senderId) continue;
+        graph_.onSeen(msg.platform, atId, atId, now);
+        if (msg.conversation.scope == ConversationScope::Group && !unit->inDegree().empty()) {
+            const std::string unitKey = unit->inDegree().front().toString();
+            if (const PersonNode* atNode = graph_.findByPlatform(msg.platform, atId);
+                atNode != nullptr) {
+                auto& members = unitMembers_[unitKey];
+                members.insert(atNode->internalId);
+                if (senderNode != nullptr && senderNode->internalId != atNode->internalId) {
+                    graph_.bumpIntimacy(senderNode->internalId, atNode->internalId, 0.05, now);
+                }
+            }
         }
     }
 
@@ -364,12 +456,76 @@ FusionUnit* FusionRouter::route(const IncomingMessage& msg, std::time_t now) {
     return unit;
 }
 
+std::vector<std::string> FusionRouter::mentionedUserIds(const IncomingMessage& msg) {
+    std::vector<std::string> ids;
+    const bool qq = msg.platform == "qq" || msg.platform == "napcat" ||
+                    msg.platform == "onebot";
+    auto append = [&](const std::string& id) {
+        if (id.empty() || id == "all") return;
+        if (qq && !std::all_of(id.begin(), id.end(), [](unsigned char c) {
+                return std::isdigit(c);
+            })) return;
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+    };
+    for (const auto& id : msg.atUserIds) append(id);
+    if (!qq) return ids;
+
+    auto identifierChar = [](unsigned char c) {
+        return c < 128 && (std::isalnum(c) || c == '_');
+    };
+    for (std::size_t pos = 0; (pos = msg.text.find('@', pos)) != std::string::npos; ++pos) {
+        if (pos > 0) {
+            const unsigned char prev = msg.text[pos - 1];
+            if (identifierChar(prev) || prev == '.' || prev == '+' ||
+                prev == '-' || prev == '%' || prev == '@') continue;
+        }
+        std::size_t end = pos + 1;
+        while (end < msg.text.size() && std::isdigit(static_cast<unsigned char>(msg.text[end]))) ++end;
+        if (end == pos + 1) continue;
+        if (end < msg.text.size() && identifierChar(static_cast<unsigned char>(msg.text[end]))) continue;
+        if (end + 1 < msg.text.size() && msg.text[end] == '.' &&
+            identifierChar(static_cast<unsigned char>(msg.text[end + 1]))) continue;
+        append(msg.text.substr(pos + 1, end - pos - 1));
+    }
+    return ids;
+}
+
+std::string FusionRouter::mentionContext(const std::vector<std::string>& ids,
+                                        const std::string& platform) const {
+    std::ostringstream result;
+    std::set<std::string> rendered;
+    for (const auto& id : ids) {
+        if (id.empty() || id == "all" || !rendered.insert(id).second) continue;
+        std::optional<PersonNode> person;
+        try {
+            person = graph_.resolveContact(RelationshipGraph::platformTag(platform, id));
+        } catch (const std::invalid_argument&) {
+            // An unknown mention remains visible with its original platform ID.
+        }
+        if (result.tellp() == std::streampos(0)) result << "[提及对象]";
+        result << " @" << id;
+        if (person) {
+            result << "=" << person->name << " (internal_id=" << person->internalId << ")";
+        } else {
+            result << " (尚无称呼记录)";
+        }
+        result << ';';
+    }
+    return result.str();
+}
+
 std::string FusionRouter::displayName(const IncomingMessage& msg) const {
     // 统一身份码在图谱中有对应身份 → 用昵称；否则回退原始 senderId
-    if (const PersonNode* p =
-            graph_.findByPlatform(msg.platform, msg.senderId);
-        p != nullptr && !p->name.empty())
+    if (const auto p = graph_.platformContact(msg.platform, msg.senderId);
+        p && !p->name.empty()) {
+        if (p->name == msg.senderId && !msg.senderName.empty() && msg.senderName != msg.senderId) {
+            return msg.senderId + "(" + msg.senderName + ")";
+        }
         return p->name;
+    }
+    if (!msg.senderName.empty() && msg.senderName != msg.senderId) {
+        return msg.senderId + "(" + msg.senderName + ")";
+    }
     return msg.senderId;
 }
 

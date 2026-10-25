@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -78,11 +79,31 @@ public:
     // 按 [platform][id] 匹配；旧数据的裸 id 回退兼容
     const PersonNode* findByPlatform(const std::string& platform,
                                      const std::string& platformId) const;
+    std::optional<PersonNode> platformContact(const std::string& platform,
+                                               const std::string& platformId) const;
     const PersonNode* findById(const std::string& internalId) const;
     // 名称（无则回退 internalId）；Fusion 标签等用
     std::string nameOf(const std::string& internalId) const;
     // Facts 渲染用：按权重降序取前 K（返回的指针在下次写操作前有效）
     std::vector<const PersonNode*> topK(std::size_t k) const;
+    // 获取除 MIO 外所有已记录的认识的人（工具查询等用）
+    std::vector<const PersonNode*> allPersons() const;
+
+    // 通讯录工具使用值快照，避免离开锁后与其他会话更新同一节点发生竞争。
+    std::vector<PersonNode> contacts() const;
+    std::vector<PersonNode> topKSnapshot(std::size_t k) const;
+    // 支持 internalId、QQ、平台复合键或唯一称呼；重名时拒绝猜测。
+    PersonNode resolveContact(const std::string& person) const;
+    PersonNode upsertContact(const std::string& name, const std::string& platform,
+                             const std::string& platformId,
+                             const std::optional<std::string>& notes,
+                             std::int64_t now);
+    PersonNode updateContact(const std::string& person,
+                             const std::optional<std::string>& name,
+                             const std::optional<std::string>& notes);
+
+    // 辅助工具：从 PersonNode 的 platformIds 提取 QQ 号（无则返回空串）
+    static std::string extractQq(const PersonNode& node);
 
     // ---- 边 ----
     // 亲密熟悉度（时间衰减 + 增量，上限 1.0；无则创建）
@@ -98,10 +119,15 @@ public:
     void save();
 
 private:
+    // 被动路径（消息路由自动登记/亲密度累加）的写盘失败只记日志：磁盘抖动
+    // 不该打断整轮对话；显式的通讯录工具调用仍由 save() 抛异常上报给模型。
+    void savePassive();
+
     // 无锁内部函数：调用方必须已持有 mtx_
     PersonNode* findNode(const std::string& internalId);
     const PersonNode* findNode(const std::string& internalId) const;
     const PersonNode* findByNameLocked(const std::string& name) const;
+    const PersonNode* resolveContactLocked(const std::string& person) const;
     // 复合 tag 精确匹配；未命中且带平台时回退裸 id（旧数据兼容）
     const PersonNode* findByPlatformLocked(const std::string& platform,
                                            const std::string& platformId) const;

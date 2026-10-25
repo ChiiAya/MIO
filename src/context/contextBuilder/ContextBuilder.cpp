@@ -2,22 +2,26 @@
 
 #include "context/contextBuilder/ContextBuilder.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "context/costEstimator/Tokens.h"
+#include "core/message/History.h"
 #include "log/Log.h"
 
 namespace mio {
 
-ContextBuilder::ContextBuilder(ContextBuilderConfig cfg, SummaryManager& summary)
-    : cfg_(cfg), summary_(summary) {}
+ContextBuilder::ContextBuilder(ContextBuilderConfig cfg,
+                               std::shared_ptr<SummaryManager> summary)
+    : cfg_(cfg), summary_(std::move(summary)) {}
 
 BuildResult ContextBuilder::build(const BuildInput& in) {
     if (!in.unit) throw std::runtime_error("ContextBuilder: unit 为空");
     FusionUnit& unit = *in.unit;
 
     // 完整候选 = unit 上下文（当前回合已由调用方 append 进来，勿重复加入）
-    std::vector<Msg> msgs = unit.context();
+    std::vector<Msg> msgs = history::repairToolHistory(unit.context());
+    history::stripCompletedMedia(msgs);
     std::int64_t estimated =
         estimateTokens(msgs) + estimateTokens(in.systemPrompt);
 
@@ -25,10 +29,11 @@ BuildResult ContextBuilder::build(const BuildInput& in) {
     const bool overBudget =
         estimated >
         static_cast<std::int64_t>(cfg_.budgetTokens * cfg_.watermark);
-    if (overBudget && !unit.context().empty()) {
+    if (overBudget && !unit.context().empty() && summary_) {
         // 上下文不够 → 对 unit 重新冷启动（[摘要前20 + 近5原文]）后重建
-        unit.reColdStart(summary_);
-        msgs = unit.context();
+        unit.reColdStart(*summary_);
+        msgs = history::repairToolHistory(unit.context());
+        history::stripCompletedMedia(msgs);
         estimated = estimateTokens(msgs) + estimateTokens(in.systemPrompt);
         r.reColdStarted = true;
         log::info("ContextBuilder", "上下文超水位，触发重新冷启动");

@@ -6,11 +6,12 @@
 // ============================================================================
 
 #include <ctime>
+#include <memory>
 #include <string>
 
 #include "context/conversationFusion/FusionContext.h"
 #include "context/summarizor/SummaryManager.h"
-#include "llm/Llm.h"
+#include "providers/llm/Llm.h"
 #include "core/message/Message.h"
 
 namespace mio {
@@ -35,14 +36,14 @@ struct BuildResult {
 
 class ContextBuilder {
 public:
-    ContextBuilder(ContextBuilderConfig cfg, SummaryManager& summary);
+    ContextBuilder(ContextBuilderConfig cfg, std::shared_ptr<SummaryManager> summary);
 
     // 构建请求；上下文超水位且 unit 非空时 → 重新冷启动压缩
     BuildResult build(const BuildInput& in);
 
 private:
     ContextBuilderConfig cfg_;
-    SummaryManager& summary_;
+    std::shared_ptr<SummaryManager> summary_;
 };
 
 } // namespace mio
