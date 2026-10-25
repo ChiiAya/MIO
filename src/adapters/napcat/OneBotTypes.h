@@ -14,6 +14,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/event/Event.h"
+
 namespace mio {
 namespace napcat {
 
@@ -78,6 +80,7 @@ struct OneBotEvent {
     std::string rawMessage;         // raw_message
     std::string text;               // 拼接后的纯文本（text 段 + @qq）
     std::vector<OneBotMessageSegment> segments;
+    std::vector<MediaAttachment> attachments; // image/record/video/file 段的结构化元数据
     OneBotSender sender;
     std::optional<OneBotAnonymous> anonymous;
 

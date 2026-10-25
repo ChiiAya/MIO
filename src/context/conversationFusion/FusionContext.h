@@ -14,6 +14,8 @@
 #include "core/conversation/Conversation.h"
 #include "core/message/Message.h"
 
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -51,6 +53,10 @@ public:
 
     void append(Msg msg);  // 追加上下文
 
+    // 剥离已完结回合中的临时片段（如图片 base64、临时注入的 ephemeral part），
+    // 避免在多轮对话中向视觉模型重复上送历史图片造成冻结，并防止内存与上下文膨胀
+    void stripEphemeralParts();
+
     // 重新冷启动（contextBuilder 触发）：压缩自身为 [摘要前20 + 近5原文]
     void reColdStart(SummaryManager& summaryManager);
 
@@ -76,6 +82,14 @@ public:
         fusion_.context = std::move(context);
     }
 
+    // 代际计数器（用于检测并在新消息到达时协作打断正在进行的 LLM 回复）
+    std::uint64_t generation() const {
+        return generation_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t bumpGeneration() {
+        return generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
     std::mutex mtx;  // 上下文级锁：同 unit 串行、跨 unit 并行
 
 private:
@@ -86,6 +100,7 @@ private:
                                    int summaryCount, int rawKeep);
 
     FusionContext fusion_;
+    std::atomic<std::uint64_t> generation_{0};
 };
 
 } // namespace mio

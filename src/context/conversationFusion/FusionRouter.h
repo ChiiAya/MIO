@@ -34,7 +34,7 @@
 #include "context/achieve/Achieve.h"
 #include "context/conversationFusion/FusionContext.h"
 #include "context/summarizor/SummaryManager.h"
-#include "llm/Embedding.h"
+#include "providers/embedding/Embedding.h"
 #include "mind/graph/RelationshipGraph.h"
 
 namespace mio {
@@ -48,10 +48,28 @@ struct FusionConfig {
 
 class FusionRouter {
 public:
+    // 维护任务（每日经历整理）用的只读快照：unit 的主来源 + 上下文副本。
+    // 上下文是副本、已脱离 unit 锁，调用方可以慢慢处理而不阻塞正常会话。
+    struct UnitSnapshot {
+        ConversationKey conversation;   // unit 的主来源（inDegree 第一个）
+        std::vector<Msg> context;       // 上下文副本
+        std::string topic;
+        std::int64_t lastAt = 0;        // 上下文中最后一条消息的时间
+    };
+    // 最后活动时间 >= since 的 unit 快照
+    std::vector<UnitSnapshot> activeUnitsSince(std::int64_t since) const;
+
     // embedding 为可空依赖：为空 / 失败 / 关闭时话题判断退化为精确匹配
     FusionRouter(RelationshipGraph& graph, Achieve& achieve,
-                 SummaryManager& summary, FusionConfig cfg = {},
-                 const Embedding* embedding = nullptr);
+                 std::shared_ptr<SummaryManager> summary, FusionConfig cfg = {},
+                 std::shared_ptr<Embedding> embedding = nullptr);
+
+    // 动态更新配置与依赖（线程安全）
+    void update(FusionConfig cfg, std::shared_ptr<SummaryManager> summary,
+                std::shared_ptr<Embedding> embedding);
+    void updateConfig(FusionConfig cfg);
+    void updateDependencies(std::shared_ptr<SummaryManager> summary,
+                            std::shared_ptr<Embedding> embedding);
 
     // 路由一条消息：身份映射 → 首次遇见冷读取建 unit → 融合判断（可能 redirect）
     // → 返回目标 unit（调用方随后持 unit->mtx 处理消息）
@@ -60,6 +78,13 @@ public:
     // 身份注入：统一身份码在图谱中有对应身份 → 返回其昵称，否则返回原始
     // senderId（wire 层标签渲染用；档案/身份归一仍用原始 senderId）
     std::string displayName(const IncomingMessage& msg) const;
+
+    // Merge explicit mentions with boundary-checked textual @QQ references.
+    static std::vector<std::string> mentionedUserIds(const IncomingMessage& msg);
+    // Per-request identity hints: keep raw IDs and expose the graph's current
+    // names without waiting for the cached system prompt to be rebuilt.
+    std::string mentionContext(const std::vector<std::string>& ids,
+                               const std::string& platform) const;
 
     // 模型工具入口：设置当前来源对应 unit 的公开/私密状态。
     // 直接修改当前 unit 的 isPublic，不触发拆融合/冷启动。
@@ -102,9 +127,9 @@ private:
 
     RelationshipGraph& graph_;
     Achieve& achieve_;
-    SummaryManager& summary_;
+    std::shared_ptr<SummaryManager> summary_;
     FusionConfig cfg_;
-    const Embedding* embedding_ = nullptr;  // 非拥有；Runtime 组合根注入
+    std::shared_ptr<Embedding> embedding_;
 };
 
 } // namespace mio

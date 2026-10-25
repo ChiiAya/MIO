@@ -65,7 +65,15 @@ inline std::int64_t estimateTokens(const std::string& text) {
 
 inline std::int64_t estimateTokens(const Msg& m) {
     std::int64_t t = estimateTokens(m.text) + estimateTokens(m.reasoningContent);
-    for (const auto& p : m.parts) t += estimateTokens(p.text);
+    for (const auto& p : m.parts) {
+        // 图片 part 的 text 是 base64 data-uri，按文本估会得出天量 token，
+        // 直接触发"上下文超限 -> 压缩"。这里按一次视觉输入粗略计费。
+        if (p.kind == Part::Kind::Image) {
+            t += 1024;
+            continue;
+        }
+        t += estimateTokens(p.text);
+    }
     return t;
 }
 

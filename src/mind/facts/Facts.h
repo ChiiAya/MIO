@@ -15,8 +15,10 @@
 namespace mio {
 
 struct Persona {
-    std::string botName = "MIO";
-    std::string character;  // 完整人设文本；将来从配置文件/管理界面来
+    std::string botName = "Mio";
+    std::string character;  // 完整人设文本；从配置文件来
+    std::string systemPromptPrefix;  // 身份引导前缀（可填，支持 {botName} 宏；空则走默认）
+    std::string systemPromptNotice;  // 注意事项与行为规范（可填；空则走默认）
 };
 
 // 渲染稳定 system 块：人设 + 认识的人(top-K, ≤maxPeopleTokens) + 日记认知

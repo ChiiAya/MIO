@@ -26,19 +26,23 @@
 // 启用方式：MIO_PLATFORM=napcat（其余平台走控制台，见 main.cpp）。
 // ============================================================================
 
-#include "runtime/Runtime.h"
-
 #include <string>
 
+#include "adapters/napcat/MediaConfig.h"
+
 namespace mio {
+
+class Runtime;
 
 struct NapCatConfig {
     std::string listenHost = "127.0.0.1";
     int listenPort = 6199;
     std::string token;  // OneBot 11 access token（空 = 不鉴权）
+    MediaConfig media;  // 入站图片/语音/视频/文件处理策略
 
     // 从环境变量读取（不存在则用默认值）：
     //   MIO_NAPCAT_HOST / MIO_NAPCAT_PORT / MIO_NAPCAT_TOKEN
+    //   媒体相关见 MediaConfig::fromEnvironment（MIO_MEDIA_* / MIO_ASR_*）
     static NapCatConfig fromEnvironment();
 };
 

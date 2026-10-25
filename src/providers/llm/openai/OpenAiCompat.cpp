@@ -1,0 +1,425 @@
+// ============================================================================
+// OpenAI 兼容适配器实现
+//
+// 实现按函数拆解：
+//   1. resolveChatEndpoint  —— baseUrl 宽容归一化
+//   2. toWireMessages       —— 内部 Msg -> OpenAI 消息方言（唯一出口）
+//   3. buildPayload         —— 请求体组装（模型参数、工具注入、厂商怪癖修正）
+//   4. chat 的重试循环       —— 哪些错误值得重试
+//   5. parseResponse        —— 响应解析 + Usage 记账（cached 单独记！）
+//
+// cpr 用法备忘：
+//   cpr::Post(Url, Headers, Body, Timeout...) 同步阻塞，返回 Response{
+//     .status_code, .text, .error }；
+//   网络层失败时 status_code 为 0 且 error.code != OK —— 必须同时判断两者。
+// ============================================================================
+
+#include "providers/llm/openai/OpenAiCompat.h"
+
+#include <cpr/cpr.h>
+
+#include "context/costEstimator/Tokens.h"
+#include "core/time/LocalTime.h"
+#include "log/Log.h"
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <thread>
+
+namespace mio {
+
+namespace {
+
+std::string trimSlash(std::string s) {
+    while (!s.empty() && s.back() == '/') s.pop_back();
+    return s;
+}
+
+bool endsWith(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// --- baseUrl 归一化 -------------------------------------------------------
+// OpenAiConfig 约定：baseUrl 只填到 /v1 之前（用户最容易填错的地方）。
+// 规则：已带 /chat/completions → 原样；以 /v1 结尾 → 补路径；
+//      其他 → 一律补 /v1/chat/completions。
+std::string resolveChatEndpoint(const std::string& baseUrl) {
+    std::string base = trimSlash(baseUrl);
+    if (endsWith(base, "/chat/completions")) return base;
+    if (endsWith(base, "/v1")) return base + "/chat/completions";
+    return base + "/chat/completions";
+}
+
+// --- wire 格式翻译 ---------------------------------------------------------
+// 将内部 Msg 转换为 OpenAI 协议的 messages 数组（唯一出口）
+
+// 用户消息来源标签：[平台][private]（私聊）或 [平台][group:群号]（群聊），
+// 再接 [sender:人]。"人" = Router 注入的昵称（senderName），未命中回退原始
+// senderId；让模型知道"这句话从哪个平台、哪个会话、谁"说的；无身份
+// （旧历史/系统内部请求）则不打。
+// withTime：是否附 [time:YYYY-MM-DD HH:MM]。时间取自消息自己的 createdAt
+// （不是"现在"），所以历史部分逐字节稳定，不会打断 prompt cache 前缀。
+std::string senderTag(const Msg& m, bool withTime) {
+    std::string clock;
+    if (withTime && m.createdAt > 0) clock = "[time:" + formatLocalTime(m.createdAt) + "]";
+    if (m.platform.empty()) return clock.empty() ? "" : clock + " ";
+    const std::string& who =
+        !m.senderName.empty() ? m.senderName : m.senderId;
+    if (who.empty()) return clock.empty() ? "" : clock + " ";
+    const std::string conv =
+        m.groupId.empty() ? "private" : "group:" + m.groupId;
+    std::string tag = "[" + m.platform + "][" + conv + "][sender:" + who + "]";
+    if (!m.messageId.empty()) tag += "[message_id:" + m.messageId + "]";
+    if (!m.replyToMessageId.empty()) tag += "[reply_to_message_id:" + m.replyToMessageId + "]";
+    return tag + clock + " ";
+}
+
+nlohmann::json toWireMessages(const ChatRequest& req) {
+    auto wire = nlohmann::json::array();
+
+    // system 放最前。内容必须逐字稳定 —— 它是 prompt cache 前缀的头部，
+    // 每次变动 = 整段历史重新计价。
+    if (!req.systemPrompt.empty())
+        wire.push_back({{"role", "system"}, {"content", req.systemPrompt}});
+
+    // 每轮对话只打一次时间：同一个输入缓冲区（同一轮）里的多条用户消息共享
+    // createdAt，只有本轮第一条带 [time:...]；新的一轮（前面是助手消息，或
+    // 时间戳变了）则重新打。
+    bool prevWasUser = false;
+    std::int64_t lastUserAt = 0;
+
+    for (const auto& m : req.messages) {
+        nlohmann::json j{{"role", nullptr}};
+        if (m.role != Role::User) prevWasUser = false;
+        switch (m.role) {
+        case Role::System:
+            j["role"] = "system";
+            j["content"] = m.text; // 内部 history 不存 system，这里只是兜底
+            break;
+
+        case Role::User: {
+            j["role"] = "user";
+            const bool withTime = !prevWasUser || m.createdAt != lastUserAt;
+            const std::string tag = senderTag(m, withTime);
+            prevWasUser = true;
+            lastUserAt = m.createdAt;
+            if (m.isTextOnly()) {
+                j["content"] = tag + m.text;
+            } else {
+                auto parts = nlohmann::json::array();
+                // 正文（含来源标签）先作为第一个 text 段：多模态消息仍然
+                // 以 m.text 为唯一文本来源，parts 只补充媒体内容
+                const std::string head = tag + m.text;
+                if (!head.empty()) {
+                    parts.push_back({{"type", "text"}, {"text", head}});
+                }
+                for (const auto& p : m.parts) {
+                    if (p.kind == Part::Kind::Image) {
+                        parts.push_back({
+                            {"type", "image_url"},
+                            {"image_url", {{"url", p.text}}},
+                        });
+                    } else if (!p.text.empty()) {
+                        parts.push_back({{"type", "text"}, {"text", p.text}});
+                    }
+                }
+                if (parts.empty()) {
+                    parts.push_back({{"type", "text"}, {"text", ""}});
+                }
+                j["content"] = std::move(parts);
+            }
+            break;
+        }
+
+        case Role::Assistant: {
+            j["role"] = "assistant";
+            j["content"] = m.text.empty() ? nlohmann::json(nullptr) : nlohmann::json(m.text);
+            // DeepSeek / MiMo 等推理系要求带 tool_calls 的历史 assistant 消息
+            // 原样回传 reasoning_content；这里统一渲染，非空才带上。
+            if (!m.reasoningContent.empty())
+                j["reasoning_content"] = m.reasoningContent;
+            if (!m.toolCalls.empty()) {
+                auto calls = nlohmann::json::array();
+                for (const auto& tc : m.toolCalls) {
+                    calls.push_back({{"id", tc.id},
+                                     {"type", "function"},
+                                     {"function",
+                                      {{"name", tc.name},
+                                       {"arguments", tc.argumentsJson}}}});
+                }
+                j["tool_calls"] = std::move(calls);
+            }
+            break;
+        }
+
+        case Role::Tool:
+            // 工具结果必须是纯字符串 content；tool_call_id 回指调用
+            j["role"] = "tool";
+            j["tool_call_id"] = m.toolCallId;
+            j["content"] = m.text;
+            break;
+        }
+        wire.push_back(std::move(j));
+    }
+    return wire;
+}
+
+// --- 重试分类表 -------------------------------------------------------------
+// 可重试：网络层失败、408 超时、429 限流、所有 5xx。
+// 不可重试：其余 4xx —— payload/鉴权错误重试无意义。
+bool retryableHttp(long code) {
+    return code == 408 || code == 429 || (code >= 500 && code <= 599);
+}
+
+bool hasImageParts(const ChatRequest& req) {
+    for (const auto& m : req.messages)
+        for (const auto& p : m.parts)
+            if (p.kind == Part::Kind::Image) return true;
+    return false;
+}
+
+// 去掉图片片段的副本：端点不支持多模态时的降级形态。
+// 只在真正降级时才调用，避免 happy path 白拷贝一次大消息体。
+ChatRequest withoutImageParts(const ChatRequest& req) {
+    ChatRequest out = req;
+    for (auto& m : out.messages) {
+        m.parts.erase(
+            std::remove_if(m.parts.begin(), m.parts.end(),
+                           [](const Part& p) { return p.kind == Part::Kind::Image; }),
+            m.parts.end());
+    }
+    return out;
+}
+
+std::string bodySnippet(const std::string& body, std::size_t max = 400) {
+    return cutUtf8(body, max); // cutUtf8 见 context/costEstimator/Tokens.h，防中文截半截变乱码
+}
+
+std::string toString(ReasoningEffort e) {
+    switch (e) {
+    case ReasoningEffort::Low: return "low";
+    case ReasoningEffort::Medium: return "medium";
+    case ReasoningEffort::High: return "high";
+    case ReasoningEffort::XHigh: return "xhigh";
+    case ReasoningEffort::Max: return "max";
+    }
+    throw std::runtime_error("invalid reasoning effort");
+}
+
+std::string toString(Thinking t) {
+    switch (t) {
+    case Thinking::Enabled: return "enabled";
+    case Thinking::Disabled: return "disabled";
+    }
+    throw std::runtime_error("invalid thinking");
+}
+
+} // namespace
+
+OpenAiCompat::OpenAiCompat(OpenAiConfig cfg) : cfg_(std::move(cfg)) {}
+
+void OpenAiCompat::normalizeQuirks(nlohmann::json& p) const {
+    //  * DeepSeek-V4 / MiMo 推理系：assistant 历史必须带 reasoning_content 字段
+    //  * Gemini 原生 API：tool 结果要包成 JSON 对象
+    //  * 部分端点拒绝 content 为 null 的 assistant 消息 → 可在此替换为 ""
+    const bool isReasoningFamily =
+        cfg_.baseUrl == "https://api.xiaomimimo.com/v1/chat/completions" ||
+        cfg_.baseUrl == "https://api.deepseek.com/chat/completions";
+    if (isReasoningFamily && p.contains("tools")) {
+        // reasoning_content 已在 toWireMessages() 中随每条 assistant 消息原样写入，
+        // 这里只保留确认日志，便于排查 DeepSeek/MiMo 的回传链路。
+        log::debug("OpenAiCompat::normalizeQuirks", "已随历史消息回传 reasoning_content");
+    } else {
+        log::debug("OpenAiCompat::normalizeQuirks", cfg_.baseUrl + "非特殊处理对象");
+    }
+}
+
+ChatResponse OpenAiCompat::chat(const ChatRequest& req) {
+    const std::string endpoint = resolveChatEndpoint(cfg_.baseUrl);
+    const bool multiModal = hasImageParts(req);
+    const ChatRequest* activeReq = &req;         // 当前实际发送的请求（可能已降级）
+    std::optional<ChatRequest> textOnlyReq;      // 仅在降级时构造
+    nlohmann::json payload = buildPayload(*activeReq);
+
+    const int maxAttempts = cfg_.maxRetries + 1;
+    // 纯文本降级只允许一次，且不占用瞬时故障的重试预算
+    int degradeBudget = multiModal ? 1 : 0;
+    long lastStatus = 0;
+    std::string lastBody;
+    cpr::Error lastErr{};
+
+    int attempt = 0;       // 已消耗的重试次数
+    bool backoff = false;  // 下次发送前是否需要指数退避
+    while (attempt < maxAttempts) {
+        if (backoff) {
+            // 指数退避 + 上限保护；真实限流场景下首退避要给足（>=1s）
+            double delayMs =
+                std::min<double>(cfg_.retryInitialDelayMs *
+                                     std::pow(cfg_.retryBackoffFactor, attempt - 1),
+                                 30'000.0);
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(static_cast<long long>(delayMs)));
+            payload = buildPayload(*activeReq); // 重试保留原始多模态内容
+            backoff = false;
+        }
+
+        cpr::Response r = cpr::Post(
+            cpr::Url{endpoint},
+            cpr::Header{{"Content-Type", "application/json"},
+                        {"Authorization", "Bearer " + cfg_.apiKey}},
+            cpr::Body{payload.dump()},
+            cpr::Timeout{std::chrono::milliseconds(cfg_.httpTimeoutMs)},
+            cpr::ConnectTimeout{std::chrono::milliseconds(10'000)});
+        log::debug("OpenAiCompat", "POST " + payload.dump());
+
+        if (r.error.code == cpr::ErrorCode::OK && r.status_code >= 200 &&
+            r.status_code < 300) {
+            log::debug("OpenAiCompat",
+                       "响应(" + std::to_string(r.status_code) + ") " + r.text);
+            return parseResponse(r.text);
+        }
+
+        lastStatus = r.status_code;
+        lastBody = r.text;
+        lastErr = r.error;
+
+        const bool transportFailed = r.error.code != cpr::ErrorCode::OK;
+        if (transportFailed || retryableHttp(r.status_code)) {
+            const std::string why =
+                transportFailed ? r.error.message
+                                : "HTTP " + std::to_string(r.status_code);
+            ++attempt;
+            backoff = true;
+            log::warn("OpenAiCompat", "请求失败(" + why +
+                          ")，将进行第 " + std::to_string(attempt + 1) + " 次尝试");
+            // 瞬时网络/限流/服务端故障不表示模型不支持视觉，重试保留图片。
+            continue; // 再试
+        }
+
+        // 不可重试的 4xx：最常见的原因是端点/模型不支持多模态。
+        // 降级为纯文本立刻再试一次，避免整轮对话失败、图片永远滞留在
+        // 待处理状态；这次降级不计入上面的重试预算。
+        if (degradeBudget > 0) {
+            --degradeBudget;
+            textOnlyReq = withoutImageParts(req);
+            activeReq = &*textOnlyReq;
+            payload = buildPayload(*activeReq);
+            log::warn("OpenAiCompat",
+                      "多模态请求被端点拒绝(HTTP " + std::to_string(r.status_code) +
+                          ")，降级为纯文本重试（图片退化为 [图片] 文本标记）");
+            continue;
+        }
+        break; // 4xx 业务错误：立刻失败，把服务端的话带给调用者
+    }
+
+    std::ostringstream msg;
+    msg << "LLM 请求失败 ";
+    if (lastErr.code != cpr::ErrorCode::OK)
+        msg << "(传输层: " << lastErr.message << ")";
+    else
+        msg << "(HTTP " << lastStatus << ")";
+    msg << ": " << bodySnippet(lastBody);
+    throw std::runtime_error(msg.str());
+}
+
+nlohmann::json OpenAiCompat::buildPayload(const ChatRequest& req) const {
+    nlohmann::json p;
+    p["model"] = !req.modelOverride.empty() ? req.modelOverride : cfg_.model;
+    p["messages"] = toWireMessages(req);
+
+    if (!req.tools.empty()) {
+        auto tools = nlohmann::json::array();
+        auto defs = req.tools;
+        std::sort(defs.begin(), defs.end(),
+                  [](const ToolDef& a, const ToolDef& b) { return a.name < b.name; });
+        for (const auto& d : defs) {
+            tools.push_back({{"type", "function"},
+                             {"function",
+                              {{"name", d.name},
+                               {"description", d.description},
+                               {"parameters", d.parametersJsonSchema}}}});
+        }
+        p["tools"] = std::move(tools);
+    }
+
+    if (cfg_.reasoningEffort) p["reasoning_effort"] = toString(*cfg_.reasoningEffort);
+    if (cfg_.thinking) p["thinking"] = toString(*cfg_.thinking);
+    if (cfg_.topP) p["top_p"] = *cfg_.topP;
+    if (cfg_.temperature) p["temperature"] = *cfg_.temperature;
+    if (cfg_.maxTokens) p["max_tokens"] = *cfg_.maxTokens;
+
+    normalizeQuirks(p);
+    return p;
+}
+
+ChatResponse OpenAiCompat::parseResponse(const std::string& bodyText) {
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(bodyText);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("LLM 响应不是合法 JSON: ") + e.what() +
+                                 " | body=" + bodySnippet(bodyText, 200));
+    }
+
+    if (body.contains("error"))
+        throw std::runtime_error("LLM 返回错误: " +
+                                 bodySnippet(body["error"].dump()));
+
+    if (!body.contains("choices") || body["choices"].empty())
+        throw std::runtime_error("LLM 响应缺少 choices | body=" +
+                                 bodySnippet(bodyText));
+
+    ChatResponse out;
+    const auto& choice = body["choices"][0];
+    const auto& message = choice.value("message", nlohmann::json::object());
+
+    if (auto it = message.find("content"); it != message.end() && it->is_string())
+        out.text = it->get<std::string>();
+    if (auto it = message.find("reasoning_content"); it != message.end() && it->is_string())
+        out.reasoning = it->get<std::string>();
+
+    if (auto it = message.find("tool_calls"); it != message.end() && it->is_array()) {
+        for (const auto& tc : *it) {
+            ToolCall call;
+            call.id = tc.value("id", "");
+            call.name = tc["function"].value("name", "");
+            // arguments 是 JSON 字符串；个别实现直接给对象，宽容处理两种情况
+            if (auto a = tc["function"].find("arguments");
+                a != tc["function"].end() && a->is_string()) {
+                call.argumentsJson = a->get<std::string>();
+            } else if (a != tc["function"].end()) {
+                call.argumentsJson = a->dump();
+            } else {
+                call.argumentsJson = "{}";
+            }
+            out.toolCalls.push_back(std::move(call));
+        }
+    }
+
+    out.finishReason = choice.value("finish_reason", "");
+
+    // --- Usage 记账（inputCached 单独记，低价供应商普遍支持前缀缓存）---
+    if (auto u = body.find("usage"); u != body.end()) {
+        out.usage.inputOther = u->value("prompt_tokens", 0);
+        out.usage.output = u->value("completion_tokens", 0);
+        if (auto det = u->find("prompt_tokens_details"); det != u->end() && det->is_object()) {
+            out.usage.inputCached = det->value("cached_tokens", 0);
+            // 防御供应商侧脏数据：cached 理论上是 prompt 的子集（OpenAI/DeepSeek
+            // 风格），超了就钳住 —— 不然像本次联调一样会记出负数账
+            out.usage.inputCached =
+                std::min(out.usage.inputCached, out.usage.inputOther);
+            // 注意 cached_tokens 已含在 prompt_tokens 里，不重复计数
+        }
+    }
+
+    out.raw = std::move(body);
+    return out;
+}
+
+} // namespace mio

@@ -3,9 +3,11 @@
 #include "context/conversationFusion/FusionContext.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <utility>
 
 #include "context/summarizor/SummaryManager.h"
+#include "core/message/History.h"
 #include "log/Log.h"
 
 namespace mio {
@@ -64,27 +66,31 @@ void FusionUnit::removeInDegree(const ConversationKey& key) {
 CompressResult FusionUnit::compress(SummaryManager& summaryManager,
                                     const std::vector<Msg>& context,
                                     int summaryCount, int rawKeep) {
-    const std::size_t n = context.size();
+    const auto full = history::repairToolHistory(context);
+    const auto tailStart = history::safeTailStart(full, rawKeep);
     CompressResult result;
-    if (n <= static_cast<std::size_t>(rawKeep)) {
-        // 不足 rawKeep 条：只保留原文，不调用 LLM 摘要
-        result.msgs = context;
+    if (tailStart == 0 || summaryCount <= 0) {
+        result.msgs = full;
         return result;
     }
-    // 摘要前 summaryCount 条（与近 rawKeep 不重叠），近 rawKeep 条原文保留
     const std::size_t summarizeN =
-        std::min<std::size_t>(static_cast<std::size_t>(summaryCount),
-                              n - static_cast<std::size_t>(rawKeep));
-    std::vector<Msg> toSummarize(context.begin(),
-                                 context.begin() + summarizeN);
-    const SummaryOutcome outcome =
-        summaryManager.summarizeWithVerdict(toSummarize);
+        std::min<std::size_t>(static_cast<std::size_t>(summaryCount), tailStart);
+    std::vector<Msg> toSummarize(full.begin(), full.begin() + summarizeN);
+    SummaryOutcome outcome;
+    try {
+        outcome = summaryManager.summarizeWithVerdict(toSummarize);
+        if (outcome.text.empty()) throw std::runtime_error("摘要为空");
+    } catch (const std::exception& error) {
+        log::warn("FusionUnit", std::string("上下文摘要失败，保留原历史: ") + error.what());
+        result.msgs = full;
+        return result;
+    }
 
     Msg summaryMsg;
     summaryMsg.role = Role::User;
     summaryMsg.text = outcome.text;
     result.msgs.push_back(std::move(summaryMsg));
-    result.msgs.insert(result.msgs.end(), context.end() - rawKeep, context.end());
+    result.msgs.insert(result.msgs.end(), full.begin() + tailStart, full.end());
     // privateVerdict = true 表示私密，isPublic 取反。
     result.isPublic = !outcome.privateVerdict;
     result.topic = outcome.topic;
@@ -101,16 +107,25 @@ std::vector<Msg> FusionUnit::beRedirected(SummaryManager& summaryManager) {
 }
 
 std::vector<Msg> FusionUnit::beRedirected() {
-    // 无 LLM 的降级：仅返回近 5 条原文
-    const std::size_t keep = std::min(fusion_.context.size(),
-                                      static_cast<std::size_t>(kRawKeep));
-    return std::vector<Msg>(fusion_.context.end() -
-                                static_cast<long>(keep),
-                            fusion_.context.end());
+    const auto full = history::repairToolHistory(fusion_.context);
+    const auto start = history::safeTailStart(full, kRawKeep);
+    return std::vector<Msg>(full.begin() + start, full.end());
 }
 
 void FusionUnit::append(Msg msg) {
     fusion_.context.push_back(std::move(msg));
+}
+
+void FusionUnit::stripEphemeralParts() {
+    for (auto& msg : fusion_.context) {
+        if (msg.parts.empty()) continue;
+        msg.parts.erase(
+            std::remove_if(msg.parts.begin(), msg.parts.end(),
+                           [](const Part& p) {
+                               return p.ephemeral || p.kind == Part::Kind::Image;
+                           }),
+            msg.parts.end());
+    }
 }
 
 void FusionUnit::reColdStart(SummaryManager& summaryManager) {
