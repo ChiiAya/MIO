@@ -387,45 +387,6 @@ void Runtime::registerBuiltinTools() {
                       return "当前时间: " + nowTimeString();
                   }, ToolLayer::Builtin);
 
-    ToolDef curUserDef;
-    curUserDef.name = "get_current_user_qq";
-    curUserDef.description =
-        "获取当前正在对话/发言用户的QQ号、昵称及会话信息（如私聊或群号）。";
-    curUserDef.parametersJsonSchema = {
-        {"type", "object"},
-        {"properties", nlohmann::json::object()}};
-    registry_.add(std::move(curUserDef),
-                  [this](const nlohmann::json&) -> std::string {
-                      if (g_activeActorId.empty() && g_activeChannelId.empty()) {
-                          return "error: 当前无可用的对话上下文";
-                      }
-                      nlohmann::json info;
-                      info["platform"] = g_activeSource;
-                      info["user_id"] = g_activeActorId;
-                      info["nickname"] = g_activeActorName;
-                      info["channel_id"] = g_activeChannelId;
-                      std::string qq = (g_activeSource == "qq" ||
-                                        g_activeSource == "napcat" ||
-                                        g_activeSource == "onebot")
-                                           ? g_activeActorId
-                                           : "";
-                      if (const auto p = graph_.platformContact(
-                              g_activeSource, g_activeActorId); p) {
-                          info["graph_name"] = p->name;
-                          if (qq.empty()) {
-                              qq = RelationshipGraph::extractQq(*p);
-                          }
-                      }
-                      info["qq"] = qq.empty() ? "未知" : qq;
-                      const bool isGroup = g_activeChannelId.rfind("group:", 0) == 0;
-                      info["scope"] = isGroup ? "group" : "private";
-                      if (isGroup) {
-                          info["group_id"] = g_activeChannelId.substr(6);
-                      }
-                      return info.dump();
-                  },
-                  ToolLayer::Builtin);
-
     ToolDef keepSilentDef;
     keepSilentDef.name = "keepsilent";
     keepSilentDef.description =

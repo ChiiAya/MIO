@@ -2,10 +2,10 @@
 
 #include "core/message/Message.h"
 #include "plugin/HostApi.h"
+#include "plugin/OutboundRouter.h"
 
 #include <atomic>
 #include <condition_variable>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -41,6 +41,8 @@ public:
     void unregisterChannelsByOwner(const std::string& owner);
     bool sendOutbound(const Outbound& outbound);
 
+    OutboundRouter& outboundRouter() { return outboundRouter_; }
+    const OutboundRouter& outboundRouter() const { return outboundRouter_; }
     Runtime& runtime() { return runtime_; }
 
 private:
@@ -51,19 +53,10 @@ private:
         bool started = false;
     };
 
-    struct ChannelBinding {
-        std::string owner;
-        std::string source;
-        mio_channel_vtbl vtbl{};
-        void* user = nullptr;
-    };
-
     Runtime& runtime_;
+    OutboundRouter outboundRouter_;
     std::vector<LoadedPlugin> plugins_;
     mutable std::mutex mtx_;
-
-    std::map<std::string, ChannelBinding> channels_;
-    mutable std::mutex channelMtx_;
 
     std::atomic<bool> shutdownRequested_{false};
     std::mutex shutdownMtx_;

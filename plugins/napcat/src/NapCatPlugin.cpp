@@ -169,6 +169,30 @@ public:
         }
         mediaResolver_ = std::make_unique<MediaResolver>(config_.media, std::move(asr));
         host_.registerChannel("napcat", this);
+
+        nlohmann::json toolDef = {
+            {"name", "get_current_user_qq"},
+            {"description", "获取最近一次在 QQ/NapCat 发言的用户的 QQ 号、昵称及会话信息（如私聊或群号）。"},
+            {"parameters", {{"type", "object"}, {"properties", nlohmann::json::object()}}}
+        };
+        host_.registerTool(toolDef, [this](const nlohmann::json&) -> std::string {
+            std::lock_guard<std::mutex> lock(lastUserMtx_);
+            if (lastUserId_.empty() && lastChannelId_.empty()) {
+                return "error: 当前暂无可用的 QQ 对话上下文";
+            }
+            nlohmann::json info;
+            info["platform"] = "napcat";
+            info["user_id"] = lastUserId_;
+            info["qq"] = lastUserId_;
+            info["nickname"] = lastNickname_;
+            info["channel_id"] = lastChannelId_;
+            const bool isGroup = !lastGroupId_.empty();
+            info["scope"] = isGroup ? "group" : "private";
+            if (isGroup) {
+                info["group_id"] = lastGroupId_;
+            }
+            return info.dump();
+        });
     }
 
     ~NapCatPlugin() override {
@@ -351,6 +375,13 @@ private:
                 case napcat::OneBotPostType::Notice:
                 case napcat::OneBotPostType::Request: {
                     if (auto mioEv = napcat::oneBotEventToMioEvent(ev)) {
+                        if (ev.postType == napcat::OneBotPostType::Message) {
+                            std::lock_guard<std::mutex> lock(lastUserMtx_);
+                            lastUserId_ = ev.userId;
+                            lastNickname_ = mioEv->title;
+                            lastChannelId_ = mioEv->channelId;
+                            lastGroupId_ = ev.groupId;
+                        }
                         QueuedOneBotItem item;
                         item.mioEvent = std::move(*mioEv);
                         item.attachments = ev.attachments;
@@ -428,6 +459,12 @@ private:
     std::atomic<bool> running_{false};
     std::thread worker_;
     std::unique_ptr<ix::WebSocketServer> server_;
+
+    std::mutex lastUserMtx_;
+    std::string lastUserId_;
+    std::string lastNickname_;
+    std::string lastChannelId_;
+    std::string lastGroupId_;
 };
 
 } // namespace

@@ -80,7 +80,8 @@ int hostRegisterTool(void* rawCtx, mio_str def_json, mio_tool_fn fn, void* user)
                 fn(user, strToMio(dumped), &out, &sdk::detail::stringSinkWrite);
                 return out;
             },
-            ToolLayer::Dynamic);
+            ToolLayer::Dynamic,
+            ctx->owner);
         return 0;
     } catch (const std::exception& e) {
         log::warn(ctx->pluginId, std::string("register_tool 失败: ") + e.what());
@@ -88,9 +89,12 @@ int hostRegisterTool(void* rawCtx, mio_str def_json, mio_tool_fn fn, void* user)
     }
 }
 
-int hostUnregisterTool(void* /*rawCtx*/, mio_str /*name*/) {
-    // Step 2 接入 ToolRegistry::remove / removeByOwner
-    return 0;
+int hostUnregisterTool(void* rawCtx, mio_str name) {
+    auto* ctx = static_cast<PluginHostContext*>(rawCtx);
+    if (!ctx || !ctx->runtime) return -1;
+    const std::string toolName = strFromMio(name);
+    if (toolName.empty()) return -1;
+    return ctx->runtime->toolRegistry().remove(toolName, ctx->owner) ? 0 : -1;
 }
 
 int hostRegisterChannel(void* rawCtx, mio_str source, const mio_channel_vtbl* vt, void* user) {
@@ -280,6 +284,7 @@ void PluginManager::stopAll() {
         }
         if (it->hostCtx) {
             unregisterChannelsByOwner(it->hostCtx->owner);
+            runtime_.toolRegistry().removeByOwner(it->hostCtx->owner);
         }
         if (it->instance && it->desc && it->desc->destroy) {
             it->desc->destroy(it->instance);
@@ -303,70 +308,15 @@ bool PluginManager::registerChannel(const std::string& owner,
                                     const std::string& source,
                                     const mio_channel_vtbl* vt,
                                     void* user) {
-    if (source.empty() || !vt || !vt->send) return false;
-    std::lock_guard<std::mutex> lock(channelMtx_);
-    ChannelBinding binding;
-    binding.owner = owner;
-    binding.source = source;
-    binding.vtbl = *vt;
-    binding.user = user;
-    channels_[source] = std::move(binding);
-    log::info("PluginManager", "已注册出站通道: source=" + source + " (" + owner + ")");
-    return true;
+    return outboundRouter_.registerChannel(owner, source, vt, user);
 }
 
 void PluginManager::unregisterChannelsByOwner(const std::string& owner) {
-    std::lock_guard<std::mutex> lock(channelMtx_);
-    for (auto it = channels_.begin(); it != channels_.end(); ) {
-        if (it->second.owner == owner) {
-            it = channels_.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    outboundRouter_.unregisterByOwner(owner);
 }
 
 bool PluginManager::sendOutbound(const Outbound& outbound) {
-    ChannelBinding target;
-    {
-        std::lock_guard<std::mutex> lock(channelMtx_);
-        if (channels_.empty()) {
-            log::warn("PluginManager", "无可用出站通道，无法发送: " + outbound.text);
-            return false;
-        }
-        auto it = channels_.find(outbound.source);
-        if (it == channels_.end()) {
-            it = channels_.begin();
-        }
-        target = it->second;
-    }
-
-    nlohmann::json j = {
-        {"source", outbound.source},
-        {"channelId", outbound.channelId},
-        {"text", outbound.text},
-        {"replyTo", outbound.replyTo},
-        {"mentions", outbound.mentions}
-    };
-    if (!outbound.parts.empty()) {
-        auto arr = nlohmann::json::array();
-        for (const auto& p : outbound.parts) {
-            arr.push_back({
-                {"kind", partKindToString(p.kind)},
-                {"data", p.data},
-                {"mimeType", p.mimeType}
-            });
-        }
-        j["parts"] = std::move(arr);
-    }
-
-    const std::string dumped = j.dump();
-    std::string err;
-    const int rc = target.vtbl.send(target.user, strToMio(dumped), &err, &sdk::detail::stringSinkWrite);
-    if (rc != 0 && !err.empty()) {
-        log::warn("PluginManager", "通道 " + target.source + " 发送失败: " + err);
-    }
-    return rc == 0;
+    return outboundRouter_.sendBubble(outbound);
 }
 
 } // namespace mio
