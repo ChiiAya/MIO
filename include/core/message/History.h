@@ -68,10 +68,7 @@ inline std::size_t safeTailStart(const std::vector<Msg>& messages, int rawKeep) 
 inline void stripCompletedMedia(std::vector<Msg>& messages) {
     const auto end = pendingTurnStart(messages);
     for (std::size_t i = 0; i < end; ++i) {
-        auto& parts = messages[i].parts;
-        parts.erase(std::remove_if(parts.begin(), parts.end(), [](const Part& part) {
-            return part.ephemeral || part.kind == Part::Kind::Image;
-        }), parts.end());
+        messages[i].parts.clear();
     }
 }
 
