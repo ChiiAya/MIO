@@ -10,8 +10,8 @@ target("MIO")
     add_defines("MIO_PLUGIN_STATIC")
     -- **.cpp 递归匹配所有子目录的源文件（包含核心 src/ 与内置静态插件 plugins/）
     add_files("src/**.cpp", "plugins/**/src/**.cpp")
-    -- 统一以 include/ 与 sdk/include/ 为 include 根
-    add_includedirs("include", "sdk/include")
+    -- 统一以 include/ 与 sdk/include/ 为 include 根（插件私有头文件在 plugins/*/include）
+    add_includedirs("include", "sdk/include", "plugins/napcat/include")
     add_packages("cpr", "nlohmann_json", "ixwebsocket")
 --
 -- If you want to known more usage about xmake, please see https://xmake.io

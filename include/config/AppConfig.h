@@ -1,6 +1,5 @@
 #pragma once
 
-#include "adapters/napcat/NapCatAdapter.h"
 #include "config/embedding/EmbeddingConfig.h"
 #include "config/openai/OpenaiConfig.h"
 #include "context/achieve/Achieve.h"
@@ -11,6 +10,7 @@
 
 #include <nlohmann/json.hpp>
 #include <string>
+#include <vector>
 
 namespace mio {
 
@@ -20,6 +20,13 @@ struct MessageSplitterConfig {
     int baseDelayMs = 400;      // 基础等待时间 (毫秒)
     int delayPerCharMs = 25;    // 每字符打字模拟延时 (毫秒)
     int maxDelayMs = 2000;      // 单次最大延迟上限 (毫秒)
+};
+
+struct PluginSpec {
+    std::string id;                                    // "napcat" / "console" / "lua-host"
+    bool enabled = true;
+    std::string path;                                  // 空串 = 内置静态插件或默认插件路径
+    nlohmann::json config = nlohmann::json::object();  // 原样透传给 create() 的 config_json
 };
 
 struct AppConfig {
@@ -43,16 +50,15 @@ struct AppConfig {
     EmbeddingConfig embedding;
     AchieveConfig achieve;
     ContextBuilderConfig contextBuilder;
-    NapCatConfig napcat;
     MessageSplitterConfig splitter;
     mcp::McpConfig mcp;
-    MaintenanceConfig maintenance;  // 定时事项（日界刷新 Facts / 维护 prompt）
+    MaintenanceConfig maintenance;   // 定时事项（日界刷新 Facts / 维护 prompt）
     MemoryBridgeConfig memoryBridge; // 滚动摘要 → MCP 长期记忆（graphiti 等）
+    std::vector<PluginSpec> plugins; // 启用的插件列表与各自配置
 
     static AppConfig fromEnvironment();
 };
 
-// nlohmann::json 序列化与反序列化（支持局部更新/不完全覆盖）
 void to_json(nlohmann::json& j, const OpenAiConfig& c);
 void from_json(const nlohmann::json& j, OpenAiConfig& c);
 
@@ -65,14 +71,13 @@ void from_json(const nlohmann::json& j, AchieveConfig& c);
 void to_json(nlohmann::json& j, const ContextBuilderConfig& c);
 void from_json(const nlohmann::json& j, ContextBuilderConfig& c);
 
-void to_json(nlohmann::json& j, const NapCatConfig& c);
-void from_json(const nlohmann::json& j, NapCatConfig& c);
-
 void to_json(nlohmann::json& j, const MessageSplitterConfig& c);
 void from_json(const nlohmann::json& j, MessageSplitterConfig& c);
+
+void to_json(nlohmann::json& j, const PluginSpec& c);
+void from_json(const nlohmann::json& j, PluginSpec& c);
 
 void to_json(nlohmann::json& j, const AppConfig& c);
 void from_json(const nlohmann::json& j, AppConfig& c);
 
 } // namespace mio
-

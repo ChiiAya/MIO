@@ -212,9 +212,9 @@ PluginManager::~PluginManager() {
 void PluginManager::loadAll() {
     std::lock_guard<std::mutex> lock(mtx_);
     auto cfg = runtime_.config();
-    std::string platform = cfg ? cfg->platform : "console";
-    if (const char* envPlatform = std::getenv("MIO_PLATFORM")) {
-        if (*envPlatform != '\0') platform = envPlatform;
+    std::string envPlatform;
+    if (const char* p = std::getenv("MIO_PLATFORM")) {
+        if (*p != '\0') envPlatform = p;
     }
 
     const auto& staticDescs = sdk::staticPluginRegistry();
@@ -226,14 +226,35 @@ void PluginManager::loadAll() {
         }
 
         const std::string id = desc->id;
-        // 兼容当前 platform 选择：支持单平台或 "all"/"both" 同时启用多插件
-        if (platform != "all" && platform != "both" && platform != id) {
-            continue;
+        bool enabled = false;
+        nlohmann::json pluginCfg = nlohmann::json::object();
+
+        if (!envPlatform.empty()) {
+            enabled = (envPlatform == "all" || envPlatform == "both" ||
+                       envPlatform == id || id == "lua-host");
+            if (cfg) {
+                for (const auto& spec : cfg->plugins) {
+                    if (spec.id == id) {
+                        pluginCfg = spec.config;
+                        break;
+                    }
+                }
+            }
+        } else if (cfg && !cfg->plugins.empty()) {
+            for (const auto& spec : cfg->plugins) {
+                if (spec.id == id) {
+                    enabled = spec.enabled;
+                    pluginCfg = spec.config;
+                    break;
+                }
+            }
+        } else {
+            const std::string plat = cfg ? cfg->platform : "console";
+            enabled = (plat == "all" || plat == "both" || plat == id || id == "lua-host");
         }
 
-        nlohmann::json pluginCfg = nlohmann::json::object();
-        if (cfg && id == "napcat") {
-            to_json(pluginCfg, cfg->napcat);
+        if (!enabled) {
+            continue;
         }
 
         auto hostCtx = std::make_unique<PluginHostContext>();

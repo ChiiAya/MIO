@@ -182,22 +182,6 @@ void from_json(const nlohmann::json& j, ContextBuilderConfig& c) {
     readIfExists(j, "watermark", c.watermark);
 }
 
-void to_json(nlohmann::json& j, const NapCatConfig& c) {
-    j = nlohmann::json{
-        {"listenHost", c.listenHost},
-        {"listenPort", c.listenPort},
-        {"token", c.token},
-        {"media", c.media}
-    };
-}
-
-void from_json(const nlohmann::json& j, NapCatConfig& c) {
-    readIfExists(j, "listenHost", c.listenHost);
-    readIfExists(j, "listenPort", c.listenPort);
-    readIfExists(j, "token", c.token);
-    readIfExists(j, "media", c.media);
-}
-
 void to_json(nlohmann::json& j, const MessageSplitterConfig& c) {
     j = nlohmann::json{
         {"enabled", c.enabled},
@@ -216,6 +200,24 @@ void from_json(const nlohmann::json& j, MessageSplitterConfig& c) {
     readIfExists(j, "maxDelayMs", c.maxDelayMs);
 }
 
+void to_json(nlohmann::json& j, const PluginSpec& c) {
+    j = nlohmann::json{
+        {"id", c.id},
+        {"enabled", c.enabled},
+        {"path", c.path},
+        {"config", c.config}
+    };
+}
+
+void from_json(const nlohmann::json& j, PluginSpec& c) {
+    readIfExists(j, "id", c.id);
+    readIfExists(j, "enabled", c.enabled);
+    readIfExists(j, "path", c.path);
+    if (j.contains("config") && j["config"].is_object()) {
+        c.config = j["config"];
+    }
+}
+
 void to_json(nlohmann::json& j, const AppConfig& c) {
     j = nlohmann::json{
         {"botName", c.botName},
@@ -231,11 +233,11 @@ void to_json(nlohmann::json& j, const AppConfig& c) {
         {"embedding", c.embedding},
         {"achieve", c.achieve},
         {"contextBuilder", c.contextBuilder},
-        {"napcat", c.napcat},
         {"splitter", c.splitter},
         {"mcp", c.mcp},
         {"maintenance", c.maintenance},
-        {"memoryBridge", c.memoryBridge}
+        {"memoryBridge", c.memoryBridge},
+        {"plugins", c.plugins}
     };
 }
 
@@ -262,9 +264,6 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     if (j.contains("contextBuilder") && j["contextBuilder"].is_object()) {
         from_json(j["contextBuilder"], c.contextBuilder);
     }
-    if (j.contains("napcat") && j["napcat"].is_object()) {
-        from_json(j["napcat"], c.napcat);
-    }
     if (j.contains("splitter") && j["splitter"].is_object()) {
         from_json(j["splitter"], c.splitter);
     }
@@ -276,6 +275,38 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     }
     if (j.contains("memoryBridge") && j["memoryBridge"].is_object()) {
         from_json(j["memoryBridge"], c.memoryBridge);
+    }
+    if (j.contains("plugins") && j["plugins"].is_array()) {
+        c.plugins.clear();
+        for (const auto& item : j["plugins"]) {
+            if (item.is_object()) {
+                PluginSpec spec;
+                from_json(item, spec);
+                if (!spec.id.empty()) {
+                    c.plugins.push_back(std::move(spec));
+                }
+            }
+        }
+    } else if (j.contains("napcat") && j["napcat"].is_object()) {
+        // 兼容旧版顶层 napcat 字段：自动更新到 plugins["napcat"].config
+        bool found = false;
+        for (auto& spec : c.plugins) {
+            if (spec.id == "napcat") {
+                spec.config = j["napcat"];
+                spec.enabled = (c.platform == "napcat" || c.platform == "all" || c.platform == "both");
+                found = true;
+            } else if (spec.id == "console") {
+                spec.enabled = (c.platform == "console" || c.platform == "all" || c.platform == "both");
+            }
+        }
+        if (!found) {
+            c.plugins.push_back(PluginSpec{
+                "napcat",
+                c.platform == "napcat" || c.platform == "all" || c.platform == "both",
+                "",
+                j["napcat"]
+            });
+        }
     }
 }
 
@@ -299,8 +330,15 @@ AppConfig AppConfig::fromEnvironment() {
     cfg.embedding = EmbeddingConfig::fromEnvironment();
     cfg.achieve = AchieveConfig{};
     cfg.contextBuilder = ContextBuilderConfig{};
-    cfg.napcat = NapCatConfig::fromEnvironment();
     cfg.splitter = MessageSplitterConfig{};
+
+    const bool enableConsole = (cfg.platform == "console" || cfg.platform == "all" || cfg.platform == "both");
+    const bool enableNapcat  = (cfg.platform == "napcat"  || cfg.platform == "all" || cfg.platform == "both");
+    cfg.plugins = {
+        PluginSpec{"console", enableConsole, "", nlohmann::json::object()},
+        PluginSpec{"napcat", enableNapcat, "", nlohmann::json::object()},
+        PluginSpec{"lua-host", true, "", nlohmann::json{{"dir", "plugins/lua"}}}
+    };
 
     return cfg;
 }

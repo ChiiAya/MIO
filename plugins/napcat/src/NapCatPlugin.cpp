@@ -154,6 +154,26 @@ NapCatConfig NapCatConfig::fromEnvironment() {
     return cfg;
 }
 
+void to_json(nlohmann::json& j, const NapCatConfig& c) {
+    j = nlohmann::json{
+        {"listenHost", c.listenHost},
+        {"listenPort", c.listenPort},
+        {"token", c.token},
+        {"media", c.media}
+    };
+}
+
+void from_json(const nlohmann::json& j, NapCatConfig& c) {
+    if (j.contains("listenHost") && j["listenHost"].is_string())
+        c.listenHost = j["listenHost"].get<std::string>();
+    if (j.contains("listenPort") && j["listenPort"].is_number_integer())
+        c.listenPort = j["listenPort"].get<int>();
+    if (j.contains("token") && j["token"].is_string())
+        c.token = j["token"].get<std::string>();
+    if (j.contains("media") && j["media"].is_object())
+        from_json(j["media"], c.media);
+}
+
 namespace {
 
 class NapCatPlugin final : public sdk::Plugin, public sdk::Channel {
