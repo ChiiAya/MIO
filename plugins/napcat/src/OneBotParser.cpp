@@ -352,7 +352,7 @@ std::optional<Event> oneBotEventToMioEvent(const OneBotEvent& ev) {
         if (ev.eventType == "group") {
             if (ev.groupId.empty()) return std::nullopt;
             out.channelId = "group:" + ev.groupId;
-            out.tier = mentionedSelf ? AttentionTier::DirectFull : AttentionTier::Preview;
+            out.tier = mentionedSelf ? AttentionTier::DirectFull : AttentionTier::Digest;
         } else if (ev.eventType == "private") {
             out.channelId = "private:" + ev.userId;
             out.tier = AttentionTier::DirectFull;
