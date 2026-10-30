@@ -48,6 +48,16 @@ struct Msg {
     bool isTextOnly() const { return parts.empty(); }
 };
 
+// 统一出站消息语义（取代旧的 ConversationKey + OutgoingMessage）
+struct Outbound {
+    std::string source;                  // 目标适配器源，如 "napcat", "console"
+    std::string channelId;               // 目标通道，如 "group:123456", "private:7890"
+    std::string text;                    // 单气泡或待拆分文本
+    std::string replyTo;                 // 可选引用消息 ID
+    std::vector<std::string> mentions;   // 可选 @ 用户 ID 列表
+    std::vector<Part> parts;             // 可选多模态附件
+};
+
 nlohmann::json msgToJson(const Msg& m);
 Msg msgFromJson(const nlohmann::json& j);
 

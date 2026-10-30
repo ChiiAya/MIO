@@ -1,5 +1,3 @@
-// ContextBuilder 实现（见 context/contextBuilder/ContextBuilder.h）
-
 #include "context/contextBuilder/ContextBuilder.h"
 
 #include <algorithm>
@@ -16,38 +14,42 @@ ContextBuilder::ContextBuilder(ContextBuilderConfig cfg,
     : cfg_(cfg), summary_(std::move(summary)) {}
 
 BuildResult ContextBuilder::build(const BuildInput& in) {
-    if (!in.unit) throw std::runtime_error("ContextBuilder: unit 为空");
-    FusionUnit& unit = *in.unit;
+    if (!in.context) throw std::runtime_error("ContextBuilder: context 为空");
+    std::vector<Msg>& ctx = *in.context;
 
-    // 完整候选 = unit 上下文（当前回合已由调用方 append 进来，勿重复加入）
-    std::vector<Msg> msgs = history::repairToolHistory(unit.context());
+    std::vector<Msg> msgs = history::repairToolHistory(ctx);
     history::stripCompletedMedia(msgs);
     std::int64_t estimated =
         estimateTokens(msgs) + estimateTokens(in.systemPrompt);
 
     BuildResult r;
     const bool overBudget =
-        estimated >
-        static_cast<std::int64_t>(cfg_.budgetTokens * cfg_.watermark);
-    if (overBudget && !unit.context().empty() && summary_) {
-        // 上下文不够 → 对 unit 重新冷启动（[摘要前20 + 近5原文]）后重建
-        unit.reColdStart(*summary_);
-        msgs = history::repairToolHistory(unit.context());
-        history::stripCompletedMedia(msgs);
-        estimated = estimateTokens(msgs) + estimateTokens(in.systemPrompt);
-        r.reColdStarted = true;
-        log::info("ContextBuilder", "上下文超水位，触发重新冷启动");
-    }
+        estimated > static_cast<std::int64_t>(cfg_.budgetTokens * cfg_.watermark);
 
-    // topic 空白期预热：unit 创建后的前 N 轮（topic 一经填写即停止提示），
-    // 请求末尾注入提醒，驱动模型尽快调用 update_topic
-    if (unit.topic().empty() &&
-        unit.turnsSinceCreation() <= cfg_.topicWarmupTurns) {
-        Msg reminder{Role::User};
-        reminder.text =
-            "[框架]本会话还没有话题记录：请立即调用 update_topic "
-            "工具，用一句话总结当前对话的话题。";
-        msgs.push_back(std::move(reminder));
+    if (overBudget && !msgs.empty() && summary_) {
+        const std::size_t tailStart = history::safeTailStart(msgs, cfg_.rawKeep);
+        if (tailStart > 0) {
+            std::vector<Msg> toSummarize(msgs.begin(),
+                                         msgs.begin() + static_cast<std::ptrdiff_t>(tailStart));
+            try {
+                SummaryOutcome outcome = summary_->summarizeWithVerdict(toSummarize);
+                if (!outcome.text.empty()) {
+                    std::vector<Msg> compacted;
+                    Msg summaryMsg{Role::User};
+                    summaryMsg.text = "[意识流历史摘要] " + outcome.text;
+                    compacted.push_back(std::move(summaryMsg));
+                    compacted.insert(compacted.end(),
+                                     msgs.begin() + static_cast<std::ptrdiff_t>(tailStart),
+                                     msgs.end());
+                    ctx = compacted;
+                    msgs = std::move(compacted);
+                    r.reColdStarted = true;
+                    log::info("ContextBuilder", "上下文超水位，已完成意识流摘要压缩");
+                }
+            } catch (const std::exception& e) {
+                log::warn("ContextBuilder", std::string("上下文压缩失败，保留原上下文: ") + e.what());
+            }
+        }
     }
 
     ChatRequest req;

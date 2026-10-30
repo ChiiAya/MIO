@@ -154,34 +154,32 @@ void from_json(const nlohmann::json& j, EmbeddingConfig& c) {
     readIfExists(j, "httpTimeoutMs", c.httpTimeoutMs);
 }
 
-void to_json(nlohmann::json& j, const FusionConfig& c) {
+void to_json(nlohmann::json& j, const AchieveConfig& c) {
     j = nlohmann::json{
-        {"intimacyThreshold", c.intimacyThreshold},
-        {"trustThreshold", c.trustThreshold},
-        {"topicSemanticMatch", c.topicSemanticMatch},
-        {"topicSimilarityThreshold", c.topicSimilarityThreshold}
+        {"enableColdSummary", c.enableColdSummary},
+        {"summaryCount", c.summaryCount},
+        {"rawKeep", c.rawKeep},
+        {"inlineMediaMaxBytes", c.inlineMediaMaxBytes}
     };
 }
 
-void from_json(const nlohmann::json& j, FusionConfig& c) {
-    readIfExists(j, "intimacyThreshold", c.intimacyThreshold);
-    readIfExists(j, "trustThreshold", c.trustThreshold);
-    readIfExists(j, "topicSemanticMatch", c.topicSemanticMatch);
-    readIfExists(j, "topicSimilarityThreshold", c.topicSimilarityThreshold);
+void from_json(const nlohmann::json& j, AchieveConfig& c) {
+    readIfExists(j, "enableColdSummary", c.enableColdSummary);
+    readIfExists(j, "summaryCount", c.summaryCount);
+    readIfExists(j, "rawKeep", c.rawKeep);
+    readIfExists(j, "inlineMediaMaxBytes", c.inlineMediaMaxBytes);
 }
 
 void to_json(nlohmann::json& j, const ContextBuilderConfig& c) {
     j = nlohmann::json{
         {"budgetTokens", c.budgetTokens},
-        {"watermark", c.watermark},
-        {"topicWarmupTurns", c.topicWarmupTurns}
+        {"watermark", c.watermark}
     };
 }
 
 void from_json(const nlohmann::json& j, ContextBuilderConfig& c) {
     readIfExists(j, "budgetTokens", c.budgetTokens);
     readIfExists(j, "watermark", c.watermark);
-    readIfExists(j, "topicWarmupTurns", c.topicWarmupTurns);
 }
 
 void to_json(nlohmann::json& j, const NapCatConfig& c) {
@@ -198,24 +196,6 @@ void from_json(const nlohmann::json& j, NapCatConfig& c) {
     readIfExists(j, "listenPort", c.listenPort);
     readIfExists(j, "token", c.token);
     readIfExists(j, "media", c.media);
-}
-
-void to_json(nlohmann::json& j, const InputBufferConfig& c) {
-    j = nlohmann::json{
-        {"maxDelayMs", c.maxDelayMs},
-        {"debounceMs", c.debounceMs},
-        {"interruptedDebounceMs", c.interruptedDebounceMs},
-        {"maxTextLength", c.maxTextLength},
-        {"maxBatchSize", c.maxBatchSize}
-    };
-}
-
-void from_json(const nlohmann::json& j, InputBufferConfig& c) {
-    readIfExists(j, "maxDelayMs", c.maxDelayMs);
-    readIfExists(j, "debounceMs", c.debounceMs);
-    readIfExists(j, "interruptedDebounceMs", c.interruptedDebounceMs);
-    readIfExists(j, "maxTextLength", c.maxTextLength);
-    readIfExists(j, "maxBatchSize", c.maxBatchSize);
 }
 
 void to_json(nlohmann::json& j, const MessageSplitterConfig& c) {
@@ -246,12 +226,12 @@ void to_json(nlohmann::json& j, const AppConfig& c) {
         {"systemPromptPrefix", c.systemPromptPrefix},
         {"systemPromptNotice", c.systemPromptNotice},
         {"adminPort", c.adminPort},
+        {"mindDebounceMs", c.mindDebounceMs},
         {"openai", c.openai},
         {"embedding", c.embedding},
-        {"fusion", c.fusion},
+        {"achieve", c.achieve},
         {"contextBuilder", c.contextBuilder},
         {"napcat", c.napcat},
-        {"inputBuffer", c.inputBuffer},
         {"splitter", c.splitter},
         {"mcp", c.mcp},
         {"maintenance", c.maintenance},
@@ -268,6 +248,7 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     readIfExists(j, "systemPromptPrefix", c.systemPromptPrefix);
     readIfExists(j, "systemPromptNotice", c.systemPromptNotice);
     readIfExists(j, "adminPort", c.adminPort);
+    readIfExists(j, "mindDebounceMs", c.mindDebounceMs);
 
     if (j.contains("openai") && j["openai"].is_object()) {
         from_json(j["openai"], c.openai);
@@ -275,17 +256,14 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     if (j.contains("embedding") && j["embedding"].is_object()) {
         from_json(j["embedding"], c.embedding);
     }
-    if (j.contains("fusion") && j["fusion"].is_object()) {
-        from_json(j["fusion"], c.fusion);
+    if (j.contains("achieve") && j["achieve"].is_object()) {
+        from_json(j["achieve"], c.achieve);
     }
     if (j.contains("contextBuilder") && j["contextBuilder"].is_object()) {
         from_json(j["contextBuilder"], c.contextBuilder);
     }
     if (j.contains("napcat") && j["napcat"].is_object()) {
         from_json(j["napcat"], c.napcat);
-    }
-    if (j.contains("inputBuffer") && j["inputBuffer"].is_object()) {
-        from_json(j["inputBuffer"], c.inputBuffer);
     }
     if (j.contains("splitter") && j["splitter"].is_object()) {
         from_json(j["splitter"], c.splitter);
@@ -312,14 +290,16 @@ AppConfig AppConfig::fromEnvironment() {
     if (auto v = env("MIO_ADMIN_PORT")) {
         try { cfg.adminPort = std::stoi(*v); } catch (...) {}
     }
+    if (auto v = env("MIO_MIND_DEBOUNCE_MS")) {
+        try { cfg.mindDebounceMs = std::stoi(*v); } catch (...) {}
+    }
     cfg.llmBackend = llmBackendFromEnvironment();
 
     cfg.openai = OpenAiConfig::fromEnvironment();
     cfg.embedding = EmbeddingConfig::fromEnvironment();
-    cfg.fusion = FusionConfig{};
+    cfg.achieve = AchieveConfig{};
     cfg.contextBuilder = ContextBuilderConfig{};
     cfg.napcat = NapCatConfig::fromEnvironment();
-    cfg.inputBuffer = InputBufferConfig{};
     cfg.splitter = MessageSplitterConfig{};
 
     return cfg;

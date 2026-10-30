@@ -1,5 +1,6 @@
 #include "adapters/console/ConsoleAdapter.h"
 
+#include <chrono>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -26,10 +27,10 @@ void printState(const Runtime& runtime, std::ostream& output) {
            << "botName: " << state.botName << "\n"
            << "version: " << state.version << "\n"
            << "lastEventSeq: " << state.lastEventSeq << "\n"
-           << "activeConversation: ";
+           << "activeChannel: ";
 
-    if (state.activeConversation.has_value()) {
-        output << state.activeConversation->toString();
+    if (state.activeChannel.has_value()) {
+        output << *state.activeChannel;
     } else {
         output << "none";
     }
@@ -38,7 +39,7 @@ void printState(const Runtime& runtime, std::ostream& output) {
            << "\n-----------------\n";
 }
 
-bool parseMessage(const std::string& input, IncomingMessage& message) {
+bool parseEvent(const std::string& input, Event& ev) {
     std::istringstream stream(input);
     std::string command;
     std::string scope;
@@ -54,7 +55,6 @@ bool parseMessage(const std::string& input, IncomingMessage& message) {
             return false;
         }
     } else if (command == "/chat") {
-        // 简易私聊：固定发给用户 0d00，免拼会话参数
         std::string text;
         std::getline(stream, text);
         if (!text.empty() && text.front() == ' ') {
@@ -63,12 +63,16 @@ bool parseMessage(const std::string& input, IncomingMessage& message) {
         if (text.empty()) {
             return false;
         }
-        message.conversation = ConversationKey::privateChat("0d00");
-        message.senderId = "0d00";
-        message.senderName = "0d00";
-        message.groupId = "";
-        message.text = text;
-        message.platform = "console";
+        ev.category = EventCategory::ExternalMessage;
+        ev.tier = AttentionTier::DirectFull;
+        ev.source = "console";
+        ev.channelId = "private:0d00";
+        ev.actorId = "0d00";
+        ev.title = "0d00";
+        ev.content = text;
+        ev.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
         return true;
     } else {
         return false;
@@ -84,29 +88,28 @@ bool parseMessage(const std::string& input, IncomingMessage& message) {
         return false;
     }
 
-    ConversationKey conversation;
-    if (scope == "private") {
-        conversation = ConversationKey::privateChat(conversationId);
-    } else if (scope == "group") {
-        conversation = ConversationKey::groupChat(conversationId);
-    } else {
+    if (scope != "private" && scope != "group") {
         return false;
     }
 
-    message.conversation = conversation;
-    message.senderId = senderId;
-    message.senderName = senderId;
-    message.groupId = scope == "group" ? conversationId : "";  // groupId：群聊时填，私聊留空
-    message.text = text;
-    message.platform = "console";
+    ev.category = EventCategory::ExternalMessage;
+    ev.tier = AttentionTier::DirectFull;
+    ev.source = "console";
+    ev.channelId = scope + ":" + conversationId;
+    ev.actorId = senderId;
+    ev.title = senderId;
+    ev.content = text;
+    ev.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
     return true;
 }
 
 } // namespace
 
 void runConsole(Runtime& runtime, std::istream& input, std::ostream& output) {
-    runtime.setMessageSender([&output](const ConversationKey& conv, const std::string& /*senderId*/, const std::string& text) -> bool {
-        output << "[" << conv.toString() << "] " << text << "\n";
+    runtime.setOutboundSender([&output](const Outbound& out) -> bool {
+        output << "[" << out.channelId << "] " << out.text << "\n";
         output.flush();
         return true;
     });
@@ -116,7 +119,7 @@ void runConsole(Runtime& runtime, std::istream& input, std::ostream& output) {
     std::string line;
     while (std::getline(input, line)) {
         if (line == "/quit") {
-            output << "已退出。事件状态尚未持久化，这是当前阶段的预期行为。\n";
+            output << "已退出。\n";
             return;
         }
 
@@ -138,12 +141,14 @@ void runConsole(Runtime& runtime, std::istream& input, std::ostream& output) {
                 output << "[Config] 热重载失败，已保持现有配置运行。\n";
             }
         } else {
-            IncomingMessage message;
-            if (parseMessage(line, message)) {
+            Event ev;
+            if (parseEvent(line, ev)) {
                 try {
-                    const BotReply reply = runtime.ingest(std::move(message));
+                    const std::string cid = ev.channelId;
+                    runtime.postEvent(std::move(ev));
+                    const BotReply reply = runtime.flushMindLoop();
                     if (reply.text.empty() && !reply.interrupted) {
-                        output << "[" << reply.conversation.toString() << "] (保持沉默/已读不回)\n";
+                        output << "[" << cid << "] (保持沉默/已读不回)\n";
                     }
                 } catch (const std::exception& error) {
                     output << "[LLM error] " << error.what() << "\n";

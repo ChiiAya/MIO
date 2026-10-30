@@ -33,7 +33,6 @@ std::string toLower(std::string s) {
     return s;
 }
 
-// 返回带点的小写后缀（".jpg"）；非法/过长返回空串
 std::string extensionOf(const std::string& name) {
     const std::size_t dot = name.find_last_of('.');
     if (dot == std::string::npos || dot + 1 >= name.size()) return "";
@@ -64,7 +63,7 @@ std::string mimeFromName(const std::string& name) {
     if (ext == ".webp") return "image/webp";
     if (ext == ".bmp") return "image/bmp";
     if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
-    return "image/jpeg";  // 视觉端多数支持 jpeg；未知后缀按 jpeg 兜底
+    return "image/jpeg";
 }
 
 std::string base64Encode(const std::vector<char>& data) {
@@ -148,7 +147,6 @@ const char* kindName(MediaKind kind) {
     return "媒体";
 }
 
-// 在消息正文后追加提示：保持 [图片]/[语音] 标记在最前，便于模型理解上下文
 void appendText(std::string& text, const std::string& note) {
     if (note.empty()) return;
     if (!text.empty()) text += " ";
@@ -212,21 +210,18 @@ std::string MediaResolver::download(const MediaAttachment& attachment) const {
     return path;
 }
 
-void MediaResolver::resolve(IncomingMessage& msg) const {
-    if (!cfg_.enabled || msg.attachments.empty()) return;
+void MediaResolver::resolve(const std::vector<MediaAttachment>& attachments, Event& ev) const {
+    if (!cfg_.enabled || attachments.empty()) return;
 
-    std::vector<Part> imageParts;
-
-    for (const auto& attachment : msg.attachments) {
+    for (const auto& attachment : attachments) {
         if (!kindEnabled(attachment.kind)) continue;
 
-        // 1) 同机部署时 NapCat 直接给绝对路径，省掉一次下载
         std::string path = attachment.localPath;
         if (!isRegularFile(path)) {
             path = download(attachment);
         }
         if (!isRegularFile(path)) {
-            appendText(msg.text,
+            appendText(ev.content,
                        std::string("[") + kindName(attachment.kind) +
                            "不可用：无本地路径且下载失败]");
             log::warn(kTag, std::string("附件无法落地: kind=") +
@@ -240,7 +235,7 @@ void MediaResolver::resolve(IncomingMessage& msg) const {
         case MediaKind::Image: {
             std::vector<char> bytes;
             if (!readFileBytes(path, cfg_.maxFileBytes, bytes)) {
-                appendText(msg.text, "[图片读取失败或超过大小上限]");
+                appendText(ev.content, "[图片读取失败或超过大小上限]");
                 log::warn(kTag, "图片读取失败: " + path);
                 break;
             }
@@ -251,46 +246,38 @@ void MediaResolver::resolve(IncomingMessage& msg) const {
                                          : attachment.mimeType;
             Part part;
             part.kind = Part::Kind::Image;
-            part.text = "data:" + mime + ";base64," + base64Encode(bytes);
-            // 默认不落档案：base64 会让 JSONL 体积膨胀若干倍
-            part.ephemeral = !cfg_.persistImages;
-            imageParts.push_back(std::move(part));
+            part.data = "data:" + mime + ";base64," + base64Encode(bytes);
+            part.mimeType = mime;
+            ev.parts.push_back(std::move(part));
             break;
         }
         case MediaKind::Audio: {
             if (!asr_) {
-                appendText(msg.text, "[语音已缓存: " + path +
-                                         "（未启用语音识别）]");
+                appendText(ev.content, "[语音已缓存: " + path +
+                                           "（未启用语音识别）]");
                 break;
             }
             try {
                 const std::string text = asr_->transcribeFile(path);
                 if (text.empty()) {
-                    appendText(msg.text, "[语音转写为空]");
+                    appendText(ev.content, "[语音转写为空]");
                 } else {
-                    appendText(msg.text, "[语音转写] " + text);
+                    appendText(ev.content, "[语音转写] " + text);
                 }
             } catch (const std::exception& e) {
-                appendText(msg.text, std::string("[语音转写失败: ") + e.what() +
-                                         "；音频已缓存: " + path + "]");
+                appendText(ev.content, std::string("[语音转写失败: ") + e.what() +
+                                           "；音频已缓存: " + path + "]");
                 log::warn(kTag, std::string("语音转写失败: ") + e.what());
             }
             break;
         }
         case MediaKind::Video:
-            appendText(msg.text, "[视频已缓存: " + path + "]");
+            appendText(ev.content, "[视频已缓存: " + path + "]");
             break;
         case MediaKind::File:
-            appendText(msg.text, "[文件已缓存: " + path + "]");
+            appendText(ev.content, "[文件已缓存: " + path + "]");
             break;
         }
-    }
-
-    if (!imageParts.empty()) {
-        std::vector<Part> parts;
-        parts.reserve(imageParts.size());
-        for (auto& part : imageParts) parts.push_back(std::move(part));
-        msg.parts = std::move(parts);
     }
 }
 

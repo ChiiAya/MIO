@@ -1,21 +1,23 @@
 #pragma once
 
-#include "core/conversation/Conversation.h"
+#include <functional>
+#include <string>
+#include <vector>
+
+#include "core/message/Message.h"
 #include "providers/llm/tool/ToolRegistry.h"
 
 namespace mio {
 
 struct MessageToolContext {
-    ConversationKey conversation;
-    std::string platform;
-    std::vector<std::string> replyableMessageIds;
+    std::string source;
+    std::string channelId;
 };
 
-using StructuredMessageSender =
-    std::function<bool(const ConversationKey&, const OutgoingMessage&)>;
+using OutboundSender = std::function<bool(const Outbound&)>;
 
 void registerMessageTools(ToolRegistry& registry,
                           std::function<MessageToolContext()> context,
-                          StructuredMessageSender send);
+                          OutboundSender send);
 
 } // namespace mio

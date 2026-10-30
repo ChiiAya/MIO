@@ -14,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "adapters/napcat/MediaConfig.h"
 #include "core/event/Event.h"
 
 namespace mio {

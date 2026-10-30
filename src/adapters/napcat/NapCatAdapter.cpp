@@ -1,17 +1,6 @@
 #include "adapters/napcat/OneBotMessage.h"
 // ============================================================================
 // NapCatQQ 适配器实现（反向 WebSocket）
-//
-// 模块边界：
-//   1. OneBotTypes / OneBotParser —— 事件 JSON -> 结构化 OneBotEvent / IncomingMessage；
-//      只做解析，不碰网络与 Runtime。
-//   2. 本文件 —— WebSocket 服务端、鉴权、action 下发/echo 匹配、消息队列、
-//      后台 worker 调度 Runtime::ingest。
-//
-// 事件处理策略：
-//   * message 事件：解析成 IncomingMessage 后入队交给 Runtime；
-//   * notice / request / meta_event：当前 Runtime 暂不消费，但会完整解析为
-//     OneBotEvent 并输出 Info 日志，结构化字段已保留供后续扩展。
 // ============================================================================
 
 #include "adapters/napcat/NapCatAdapter.h"
@@ -49,7 +38,6 @@ namespace {
 constexpr const char* kTag = "NapCat";
 constexpr int kActionTimeoutSec = 30;
 
-// --- 环境变量（与 OpenaiConfig.cpp 同款）------------------------------------
 std::optional<std::string> env(const char* name) {
     const char* v = std::getenv(name);
     if (v == nullptr || *v == '\0') return std::nullopt;
@@ -66,18 +54,6 @@ std::optional<int> envInt(const char* name) {
     return std::nullopt;
 }
 
-// QQ 号/群号发送时尽量按数字发送，部分 NapCat 版本只接受数字
-nlohmann::json idToJson(const std::string& id) {
-    try {
-        std::size_t consumed = 0;
-        const unsigned long long n = std::stoull(id, &consumed);
-        if (consumed == id.size() && !id.empty()) return n;
-    } catch (...) {
-    }
-    return id;
-}
-
-// --- 连入鉴权 -------------------------------------------------------------------
 std::string queryParam(const std::string& uri, const std::string& key) {
     const std::size_t question = uri.find('?');
     if (question == std::string::npos) return "";
@@ -87,8 +63,6 @@ std::string queryParam(const std::string& uri, const std::string& key) {
         const std::size_t eq = pair.find('=');
         if (eq != std::string::npos && pair.substr(0, eq) == key) {
             std::string value = pair.substr(eq + 1);
-            // Access tokens are commonly URL-encoded when supplied in the
-            // reverse-WebSocket URL. Decode the small subset needed here.
             std::string decoded;
             decoded.reserve(value.size());
             for (std::size_t i = 0; i < value.size(); ++i) {
@@ -130,7 +104,6 @@ bool handshakeAuthorized(const std::string& uri,
     return false;
 }
 
-// --- action 帧（echo 匹配）-------------------------------------------------------
 struct PendingActions {
     std::mutex mtx;
     std::map<std::string, std::shared_ptr<std::promise<nlohmann::json>>> map;
@@ -142,7 +115,7 @@ void resolveAction(PendingActions& pending, const nlohmann::json& resp) {
     {
         std::lock_guard<std::mutex> lock(pending.mtx);
         const auto it = pending.map.find(resp.value("echo", ""));
-        if (it == pending.map.end()) return;  // 超时清理后的迟到响应，丢弃
+        if (it == pending.map.end()) return;
         promise = it->second;
         pending.map.erase(it);
     }
@@ -225,75 +198,50 @@ bool callAction(const std::shared_ptr<ix::WebSocket>& ws, PendingActions& pendin
 }
 
 bool sendReply(const std::shared_ptr<ix::WebSocket>& ws, PendingActions& pending,
-               const ConversationKey& conversation, const OutgoingMessage& message) {
-    return callAction(ws, pending, "send_msg", napcat::buildSendParams(conversation, message));
+               const Outbound& outbound) {
+    return callAction(ws, pending, "send_msg", napcat::buildSendParams(outbound));
 }
 
-// --- 连接与 worker ---------------------------------------------------------------
 struct NapCatConnection {
     std::mutex mtx;
     std::shared_ptr<ix::WebSocket> current;
 };
 
-void workerLoop(Runtime& runtime, NapCatConnection& conn, PendingActions& pending,
-                const MediaResolver& mediaResolver,
-                std::deque<IncomingMessage>& queue, std::mutex& queueMtx,
-                std::condition_variable& queueCv, const std::atomic<bool>& running) {
-    std::atomic<int> activeTasks{0};
-    std::mutex taskMtx;
-    std::condition_variable taskCv;
+struct QueuedOneBotItem {
+    Event mioEvent;
+    std::vector<MediaAttachment> attachments;
+};
 
+void workerLoop(Runtime& runtime, const MediaResolver& mediaResolver,
+                std::deque<QueuedOneBotItem>& queue, std::mutex& queueMtx,
+                std::condition_variable& queueCv, const std::atomic<bool>& running) {
     for (;;) {
         std::unique_lock<std::mutex> lock(queueMtx);
         queueCv.wait(lock, [&] { return !queue.empty() || !running; });
         if (queue.empty()) {
-            std::unique_lock<std::mutex> tlock(taskMtx);
-            taskCv.wait(tlock, [&] { return activeTasks == 0; });
             return;
         }
-        IncomingMessage message = std::move(queue.front());
+        QueuedOneBotItem item = std::move(queue.front());
         queue.pop_front();
         lock.unlock();
 
-        activeTasks++;
-        std::thread([&runtime, &conn, &pending, &mediaResolver, &activeTasks,
-                     &taskMtx, &taskCv,
-                     message = std::move(message)]() mutable {
-            const ConversationKey conversation = message.conversation;
-            const std::string senderId = message.senderId;
-            log::info(kTag, "处理 " + conversation.toString() + " 来自 " + senderId);
-
-            try {
-                // 媒体解析放在 worker 线程：下载/ASR 都是阻塞 I/O，
-                // 且不能占用 WebSocket 回调线程（那会卡住 action 响应）。
-                const std::size_t attachmentCount = message.attachments.size();
-                mediaResolver.resolve(message);
-                if (attachmentCount > 0) {
-                    log::info(kTag, "媒体解析完成 count=" +
-                                        std::to_string(attachmentCount) +
-                                        " parts=" +
-                                        std::to_string(message.parts.size()));
-                }
-                const BotReply reply = runtime.ingest(std::move(message));
-                if (!reply.text.empty()) {
-                    log::info(kTag, "已回复 → " + conversation.toString());
-                }
-            } catch (const std::exception& error) {
-                log::error(kTag, std::string("处理消息失败: ") + error.what());
+        try {
+            if (!item.attachments.empty()) {
+                mediaResolver.resolve(item.attachments, item.mioEvent);
+                log::info(kTag, "媒体解析完成 count=" +
+                                    std::to_string(item.attachments.size()) +
+                                    " parts=" +
+                                    std::to_string(item.mioEvent.parts.size()));
             }
-
-            {
-                std::lock_guard<std::mutex> tlock(taskMtx);
-                activeTasks--;
-            }
-            taskCv.notify_one();
-        }).detach();
+            runtime.postEvent(std::move(item.mioEvent));
+        } catch (const std::exception& error) {
+            log::error(kTag, std::string("投递事件失败: ") + error.what());
+        }
     }
 }
 
 } // namespace
 
-// --- 配置 ------------------------------------------------------------------------
 NapCatConfig NapCatConfig::fromEnvironment() {
     NapCatConfig cfg;
     if (auto v = env("MIO_NAPCAT_HOST")) cfg.listenHost = *v;
@@ -306,44 +254,42 @@ NapCatConfig NapCatConfig::fromEnvironment() {
 void runNapCat(Runtime& runtime, const NapCatConfig& config) {
     PendingActions pending;
     NapCatConnection conn;
-    // ASR 只在配置启用时构造；未启用时 MediaResolver 仅缓存音频文件
     std::shared_ptr<AsrProvider> asr;
     if (config.media.enabled && config.media.audio && config.media.asr.enabled) {
         asr = std::make_shared<OpenAiAsr>(config.media.asr);
     }
     const MediaResolver mediaResolver(config.media, std::move(asr));
 
-    std::deque<IncomingMessage> queue;
+    std::deque<QueuedOneBotItem> queue;
     std::mutex queueMtx;
     std::condition_variable queueCv;
     std::atomic<bool> running{true};
 
-    runtime.setStructuredMessageSender([&conn, &pending](const ConversationKey& conv,
-                                              const OutgoingMessage& message) -> bool {
+    runtime.setOutboundSender([&conn, &pending](const Outbound& outbound) -> bool {
         std::shared_ptr<ix::WebSocket> ws;
         {
             std::lock_guard<std::mutex> connLock(conn.mtx);
             ws = conn.current;
         }
         if (!ws) return false;
-        return sendReply(ws, pending, conv, message);
+        return sendReply(ws, pending, outbound);
     });
 
-    std::thread worker(workerLoop, std::ref(runtime), std::ref(conn),
-                       std::ref(pending), std::cref(mediaResolver),
+    std::thread worker(workerLoop, std::ref(runtime),
+                       std::cref(mediaResolver),
                        std::ref(queue), std::ref(queueMtx), std::ref(queueCv),
                        std::cref(running));
     auto stopWorker = [&] {
         running = false;
         queueCv.notify_all();
-        worker.join();
+        if (worker.joinable()) worker.join();
     };
 
     ix::WebSocketServer server(config.listenPort, config.listenHost);
     server.enablePong();
     server.setOnConnectionCallback(
         [&](std::weak_ptr<ix::WebSocket> wsock,
-            std::shared_ptr<ix::ConnectionState> /*state*/) {
+            std::shared_ptr<ix::ConnectionState>) {
             const auto ws = wsock.lock();
             if (!ws) return;
 
@@ -371,7 +317,6 @@ void runNapCat(Runtime& runtime, const NapCatConfig& config) {
                             const nlohmann::json frame =
                                 nlohmann::json::parse(msg->str);
 
-                            // action 响应：带 echo 且没有 post_type
                             if (frame.contains("echo") &&
                                 !frame.contains("post_type")) {
                                 resolveAction(pending, frame);
@@ -381,13 +326,18 @@ void runNapCat(Runtime& runtime, const NapCatConfig& config) {
                             const auto ev = napcat::parseOneBotEvent(frame);
                             switch (ev.postType) {
                             case napcat::OneBotPostType::Message:
-                                if (auto message =
-                                        napcat::eventToIncomingMessage(ev)) {
+                            case napcat::OneBotPostType::Notice:
+                            case napcat::OneBotPostType::Request: {
+                                if (auto mioEv = napcat::oneBotEventToMioEvent(ev)) {
+                                    QueuedOneBotItem item;
+                                    item.mioEvent = std::move(*mioEv);
+                                    item.attachments = ev.attachments;
                                     std::lock_guard<std::mutex> lock(queueMtx);
-                                    queue.push_back(std::move(*message));
+                                    queue.push_back(std::move(item));
                                     queueCv.notify_one();
                                 }
                                 break;
+                            }
                             case napcat::OneBotPostType::MetaEvent:
                                 if (ev.eventType == "lifecycle") {
                                     log::info(kTag,
@@ -398,19 +348,6 @@ void runNapCat(Runtime& runtime, const NapCatConfig& config) {
                                                "meta_event: " +
                                                    napcat::describeOneBotEvent(ev));
                                 }
-                                break;
-                            case napcat::OneBotPostType::Notice:
-                            case napcat::OneBotPostType::Request:
-                                // 当前 Runtime 不消费 notice/request；
-                                // 已完整解析为 OneBotEvent，先 Info 记录现场。
-                                log::info(kTag,
-                                          "收到 " +
-                                              std::string(
-                                                  ev.postTypeName == "notice"
-                                                      ? "通知"
-                                                      : "请求") +
-                                              "事件: " +
-                                              napcat::describeOneBotEvent(ev));
                                 break;
                             case napcat::OneBotPostType::Unknown:
                                 log::warn(kTag,
@@ -431,7 +368,7 @@ void runNapCat(Runtime& runtime, const NapCatConfig& config) {
                         break;
                     }
                     default:
-                        break;  // Ping 由 ix 自动回 Pong；Error 随 Close 事件
+                        break;
                     }
                 });
         });
@@ -454,10 +391,7 @@ void runNapCat(Runtime& runtime, const NapCatConfig& config) {
         stopWorker();
         throw std::runtime_error(
             "反向 WS 端口监听失败: " + config.listenHost + ":" +
-            std::to_string(config.listenPort) + " (" + bound.second +
-            ")。MIO_NAPCAT_HOST 是 MIO 本机的监听地址（不是 NapCat 的地址），"
-            "必须已配置在本机某个网卡上；NapCat 在本机时保持默认 127.0.0.1，"
-            "跨机部署可用 0.0.0.0 监听全部网卡。用 ip addr 可查看本机地址。");
+            std::to_string(config.listenPort) + " (" + bound.second + ")");
     }
     server.start();
     server.wait();
