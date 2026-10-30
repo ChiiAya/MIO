@@ -325,77 +325,79 @@ std::optional<Event> oneBotEventToMioEvent(const OneBotEvent& ev) {
         Event out;
         out.category = EventCategory::ExternalMessage;
         out.source = "napcat";
-        out.timestamp = ev.time > 0 ? ev.time * 1000 : 0;
         out.actorId = ev.userId;
-        const std::string senderName =
-            !ev.sender.card.empty() ? ev.sender.card :
-            (!ev.sender.nickname.empty() ? ev.sender.nickname : ev.userId);
+        out.title = !ev.sender.card.empty() ? ev.sender.card : ev.sender.nickname;
+        if (out.title.empty()) out.title = ev.userId;
+        out.content = ev.text;
+        out.timestamp = ev.time > 0 ? ev.time * 1000 : 0;
 
-        bool mentionsSelf = false;
-        std::vector<std::string> atUserIds;
-        std::string replyToMessageId;
+        bool mentionedSelf = false;
+        std::vector<std::string> mentions;
+        std::string replyTo;
         for (const auto& seg : ev.segments) {
             if (seg.type == "at") {
                 const std::string qq = idToString(seg.data.value("qq", nlohmann::json()));
-                if (!qq.empty() && qq != "all") {
-                    if (qq == ev.selfId) mentionsSelf = true;
-                    if (std::find(atUserIds.begin(), atUserIds.end(), qq) == atUserIds.end()) {
-                        atUserIds.push_back(qq);
-                    }
+                if (!qq.empty() && qq == ev.selfId) {
+                    mentionedSelf = true;
                 }
-            } else if (seg.type == "reply" && replyToMessageId.empty()) {
-                replyToMessageId = idToString(seg.data.value("id", nlohmann::json()));
+                if (!qq.empty() && qq != "all" &&
+                    std::find(mentions.begin(), mentions.end(), qq) == mentions.end()) {
+                    mentions.push_back(qq);
+                }
+            } else if (seg.type == "reply" && replyTo.empty()) {
+                replyTo = idToString(seg.data.value("id", nlohmann::json()));
             }
         }
 
         if (ev.eventType == "group") {
             if (ev.groupId.empty()) return std::nullopt;
             out.channelId = "group:" + ev.groupId;
-            out.title = "group:" + ev.groupId + " - " + senderName;
-            out.tier = mentionsSelf ? AttentionTier::DirectFull : AttentionTier::Preview;
+            out.tier = mentionedSelf ? AttentionTier::DirectFull : AttentionTier::Preview;
         } else if (ev.eventType == "private") {
             out.channelId = "private:" + ev.userId;
-            out.title = senderName;
             out.tier = AttentionTier::DirectFull;
         } else {
             return std::nullopt;
         }
 
-        out.content = ev.text;
         out.data = {
             {"message_id", ev.messageId},
-            {"reply_to", replyToMessageId},
-            {"at", atUserIds},
-            {"self_id", ev.selfId},
             {"group_id", ev.groupId},
+            {"reply_to", replyTo},
+            {"mentions", mentions}
         };
         return out;
     }
 
     if (ev.postType == OneBotPostType::Notice || ev.postType == OneBotPostType::Request) {
-        if (!ev.userId.empty() && ev.userId == ev.selfId && ev.operatorId == ev.selfId) {
-            return std::nullopt;
-        }
         Event out;
         out.category = EventCategory::PluginNotice;
         out.source = "napcat";
-        out.timestamp = ev.time > 0 ? ev.time * 1000 : 0;
-        out.actorId = !ev.userId.empty() ? ev.userId : ev.operatorId;
-        out.channelId = !ev.groupId.empty() ? ("group:" + ev.groupId)
-                                            : (!out.actorId.empty() ? ("private:" + out.actorId) : "napcat:notice");
+        out.actorId = ev.userId;
         out.title = ev.postTypeName + ":" + ev.eventType +
-                    (ev.subType.empty() ? "" : ("/" + ev.subType));
+                    (ev.subType.empty() ? "" : ("." + ev.subType));
         out.content = describeOneBotEvent(ev);
-        if (ev.postType == OneBotPostType::Request) {
+        out.timestamp = ev.time > 0 ? ev.time * 1000 : 0;
+        out.channelId = !ev.groupId.empty() ? ("group:" + ev.groupId)
+                                            : (!ev.userId.empty() ? ("private:" + ev.userId) : "");
+
+        if (ev.eventType == "notify" && ev.subType == "poke" && ev.targetId == ev.selfId) {
             out.tier = AttentionTier::DirectFull;
-        } else if (ev.subType == "poke" && ev.targetId == ev.selfId) {
-            out.tier = AttentionTier::DirectFull;
-        } else if (ev.noticeType == "group_upload") {
-            out.tier = AttentionTier::Digest;
-        } else {
+        } else if (ev.postType == OneBotPostType::Request) {
             out.tier = AttentionTier::Preview;
+        } else {
+            out.tier = AttentionTier::Digest;
         }
-        out.data = ev.rawJson;
+
+        out.data = {
+            {"post_type", ev.postTypeName},
+            {"event_type", ev.eventType},
+            {"sub_type", ev.subType},
+            {"group_id", ev.groupId},
+            {"user_id", ev.userId},
+            {"target_id", ev.targetId},
+            {"flag", ev.flag}
+        };
         return out;
     }
 

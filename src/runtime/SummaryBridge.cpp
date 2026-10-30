@@ -10,6 +10,8 @@ namespace mio {
 namespace {
 
 constexpr const char* kTag = "SummaryBridge";
+
+// 攒批窗口：把"冷启动风暴"里同一波摘要合并成一次批量写入
 constexpr int kGatherMs = 800;
 
 } // namespace
@@ -49,18 +51,19 @@ std::size_t SummaryBridge::pending() const {
 
 void SummaryBridge::push(Entry entry) {
     if (entry.text.empty()) return;
-    const std::string key = entry.channelId.empty() ? "mind" : entry.channelId;
+    const std::string key = entry.channelId;
     std::lock_guard<std::mutex> lock(mtx_);
     if (const auto it = written_.find(key);
         it != written_.end() && it->second == entry.text) {
-        return;
+        return;  // 累计摘要与上次写出去的一模一样：没必要再写一次
     }
     if (const auto it = pending_.find(key);
         it != pending_.end() && it->second.entry.text == entry.text) {
-        return;
+        return;  // 队列里已有的还是同一份文本
     }
     const auto limit = static_cast<std::size_t>(std::max(config_.maxPending, 1));
     if (pending_.size() >= limit && pending_.find(key) == pending_.end()) {
+        // 满了：丢最早入队的一条（按 seq，不是 map 的 key 序）
         auto oldest = pending_.begin();
         for (auto it = pending_.begin(); it != pending_.end(); ++it)
             if (it->second.seq < oldest->second.seq) oldest = it;
@@ -78,6 +81,8 @@ void SummaryBridge::loop() {
             cv_.wait(lock);
             continue;
         }
+        // 攒够一个固定窗口再取。注意不能用一次 wait_for —— 每次 push 的 notify
+        // 都会把它提前唤醒，那就退化成"来一条写一条"（同一份累计摘要会重复写）。
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(kGatherMs);
         while (!stopping_ && std::chrono::steady_clock::now() < deadline) {
@@ -98,6 +103,7 @@ void SummaryBridge::loop() {
                     lock.lock();
                     written_[key] = entry.text;
                     writtenOrder_.emplace_back(key, entry.text);
+                    // LRU 上界：只保留最近 256 条，避免长跑进程无限增长
                     while (writtenOrder_.size() > 256) {
                         const auto& front = writtenOrder_.front();
                         if (const auto it = written_.find(front.first);
@@ -116,6 +122,7 @@ void SummaryBridge::loop() {
         lock.lock();
     }
 }
+
 
 void to_json(nlohmann::json& j, const MemoryBridgeConfig& c) {
     j = nlohmann::json{{"enabled", c.enabled},

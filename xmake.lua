@@ -7,10 +7,11 @@ add_requires("ixwebsocket v12.0.1")  -- NapCat 适配器：反向 WebSocket 服�
 
 target("MIO")
     set_kind("binary")
-    -- **.cpp 递归匹配所有子目录的源文件（旧的 src/*.cpp 漏掉了子目录）
-    add_files("src/**.cpp")
-    -- 统一以 include/ 为 include 根，代码里写 #include "providers/llm/Llm.h"
-    add_includedirs("include")
+    add_defines("MIO_PLUGIN_STATIC")
+    -- **.cpp 递归匹配所有子目录的源文件（包含核心 src/ 与内置静态插件 plugins/）
+    add_files("src/**.cpp", "plugins/**/src/**.cpp")
+    -- 统一以 include/ 与 sdk/include/ 为 include 根
+    add_includedirs("include", "sdk/include")
     add_packages("cpr", "nlohmann_json", "ixwebsocket")
 --
 -- If you want to known more usage about xmake, please see https://xmake.io
