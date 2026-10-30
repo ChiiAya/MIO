@@ -227,7 +227,7 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
         }
 
         if (shouldTerminate) {
-            log::info("ToolLoop", "检测到终结性工具调用 (如 keepsilent)，提前结束工具循环");
+            log::info("ToolLoop", "检测到终结性工具调用，提前结束工具循环");
             Msg silent{Role::Assistant};
             silent.text = "(本轮已读并选择保持沉默，未发送回复)";
             if (sink) sink(silent);

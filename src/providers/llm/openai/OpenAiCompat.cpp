@@ -19,7 +19,6 @@
 #include <cpr/cpr.h>
 
 #include "context/costEstimator/Tokens.h"
-#include "core/time/LocalTime.h"
 #include "log/Log.h"
 
 #include <algorithm>
@@ -57,82 +56,65 @@ std::string resolveChatEndpoint(const std::string& baseUrl) {
 }
 
 // --- wire 格式翻译 ---------------------------------------------------------
-// 将内部 Msg 转换为 OpenAI 协议的 messages 数组（唯一出口）
-
-// 用户消息来源标签：[平台][private]（私聊）或 [平台][group:群号]（群聊），
-// 再接 [sender:人]。"人" = Router 注入的昵称（senderName），未命中回退原始
-// senderId；让模型知道"这句话从哪个平台、哪个会话、谁"说的；无身份
-// （旧历史/系统内部请求）则不打。
-// withTime：是否附 [time:YYYY-MM-DD HH:MM]。时间取自消息自己的 createdAt
-// （不是"现在"），所以历史部分逐字节稳定，不会打断 prompt cache 前缀。
-std::string senderTag(const Msg& m, bool withTime) {
-    std::string clock;
-    if (withTime && m.createdAt > 0) clock = "[time:" + formatLocalTime(m.createdAt) + "]";
-    if (m.platform.empty()) return clock.empty() ? "" : clock + " ";
-    const std::string& who =
-        !m.senderName.empty() ? m.senderName : m.senderId;
-    if (who.empty()) return clock.empty() ? "" : clock + " ";
-    const std::string conv =
-        m.groupId.empty() ? "private" : "group:" + m.groupId;
-    std::string tag = "[" + m.platform + "][" + conv + "][sender:" + who + "]";
-    if (!m.messageId.empty()) tag += "[message_id:" + m.messageId + "]";
-    if (!m.replyToMessageId.empty()) tag += "[reply_to_message_id:" + m.replyToMessageId + "]";
-    return tag + clock + " ";
-}
-
 nlohmann::json toWireMessages(const ChatRequest& req) {
     auto wire = nlohmann::json::array();
 
-    // system 放最前。内容必须逐字稳定 —— 它是 prompt cache 前缀的头部，
-    // 每次变动 = 整段历史重新计价。
     if (!req.systemPrompt.empty())
         wire.push_back({{"role", "system"}, {"content", req.systemPrompt}});
 
-    // 每轮对话只打一次时间：同一个输入缓冲区（同一轮）里的多条用户消息共享
-    // createdAt，只有本轮第一条带 [time:...]；新的一轮（前面是助手消息，或
-    // 时间戳变了）则重新打。
-    bool prevWasUser = false;
-    std::int64_t lastUserAt = 0;
-
     for (const auto& m : req.messages) {
         nlohmann::json j{{"role", nullptr}};
-        if (m.role != Role::User) prevWasUser = false;
         switch (m.role) {
         case Role::System:
             j["role"] = "system";
-            j["content"] = m.text; // 内部 history 不存 system，这里只是兜底
+            j["content"] = m.text;
             break;
 
         case Role::User: {
             j["role"] = "user";
-            const bool withTime = !prevWasUser || m.createdAt != lastUserAt;
-            const std::string tag = senderTag(m, withTime);
-            prevWasUser = true;
-            lastUserAt = m.createdAt;
             if (m.isTextOnly()) {
-                j["content"] = tag + m.text;
+                j["content"] = m.text;
             } else {
-                auto parts = nlohmann::json::array();
-                // 正文（含来源标签）先作为第一个 text 段：多模态消息仍然
-                // 以 m.text 为唯一文本来源，parts 只补充媒体内容
-                const std::string head = tag + m.text;
-                if (!head.empty()) {
-                    parts.push_back({{"type", "text"}, {"text", head}});
+                auto contentArr = nlohmann::json::array();
+                if (!m.text.empty()) {
+                    contentArr.push_back({{"type", "text"}, {"text", m.text}});
                 }
                 for (const auto& p : m.parts) {
-                    if (p.kind == Part::Kind::Image) {
-                        parts.push_back({
+                    if (p.data.empty()) continue;
+                    switch (p.kind) {
+                    case Part::Kind::Image:
+                        contentArr.push_back({
                             {"type", "image_url"},
-                            {"image_url", {{"url", p.text}}},
+                            {"image_url", {{"url", p.data}}},
                         });
-                    } else if (!p.text.empty()) {
-                        parts.push_back({{"type", "text"}, {"text", p.text}});
+                        break;
+                    case Part::Kind::Audio:
+                        contentArr.push_back({
+                            {"type", "input_audio"},
+                            {"input_audio", {
+                                {"data", p.data},
+                                {"format", p.mimeType.empty() ? "wav" : p.mimeType},
+                            }},
+                        });
+                        break;
+                    case Part::Kind::Video:
+                        contentArr.push_back({
+                            {"type", "video_url"},
+                            {"video_url", {{"url", p.data}}},
+                        });
+                        break;
+                    case Part::Kind::File:
+                        contentArr.push_back({
+                            {"type", "file"},
+                            {"file", {{"file_data", p.data}}},
+                        });
+                        break;
                     }
                 }
-                if (parts.empty()) {
-                    parts.push_back({{"type", "text"}, {"text", ""}});
+                if (contentArr.empty()) {
+                    contentArr.push_back({{"type", "text"}, {"text", ""}});
                 }
-                j["content"] = std::move(parts);
+                j["content"] = std::move(contentArr);
             }
             break;
         }
@@ -140,8 +122,6 @@ nlohmann::json toWireMessages(const ChatRequest& req) {
         case Role::Assistant: {
             j["role"] = "assistant";
             j["content"] = m.text.empty() ? nlohmann::json(nullptr) : nlohmann::json(m.text);
-            // DeepSeek / MiMo 等推理系要求带 tool_calls 的历史 assistant 消息
-            // 原样回传 reasoning_content；这里统一渲染，非空才带上。
             if (!m.reasoningContent.empty())
                 j["reasoning_content"] = m.reasoningContent;
             if (!m.toolCalls.empty()) {
@@ -159,7 +139,6 @@ nlohmann::json toWireMessages(const ChatRequest& req) {
         }
 
         case Role::Tool:
-            // 工具结果必须是纯字符串 content；tool_call_id 回指调用
             j["role"] = "tool";
             j["tool_call_id"] = m.toolCallId;
             j["content"] = m.text;
@@ -170,29 +149,20 @@ nlohmann::json toWireMessages(const ChatRequest& req) {
     return wire;
 }
 
-// --- 重试分类表 -------------------------------------------------------------
-// 可重试：网络层失败、408 超时、429 限流、所有 5xx。
-// 不可重试：其余 4xx —— payload/鉴权错误重试无意义。
 bool retryableHttp(long code) {
     return code == 408 || code == 429 || (code >= 500 && code <= 599);
 }
 
 bool hasImageParts(const ChatRequest& req) {
     for (const auto& m : req.messages)
-        for (const auto& p : m.parts)
-            if (p.kind == Part::Kind::Image) return true;
+        if (!m.parts.empty()) return true;
     return false;
 }
 
-// 去掉图片片段的副本：端点不支持多模态时的降级形态。
-// 只在真正降级时才调用，避免 happy path 白拷贝一次大消息体。
 ChatRequest withoutImageParts(const ChatRequest& req) {
     ChatRequest out = req;
     for (auto& m : out.messages) {
-        m.parts.erase(
-            std::remove_if(m.parts.begin(), m.parts.end(),
-                           [](const Part& p) { return p.kind == Part::Kind::Image; }),
-            m.parts.end());
+        m.parts.clear();
     }
     return out;
 }
