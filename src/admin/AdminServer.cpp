@@ -1,6 +1,7 @@
 #include "admin/AdminServer.h"
 #include "config/AppConfig.h"
 #include "log/Log.h"
+#include "plugin/PluginManager.h"
 #include "runtime/Runtime.h"
 
 #include <ixwebsocket/IXHttpServer.h>
@@ -92,6 +93,44 @@ bool AdminServer::start() {
                     {"message", ok ? "配置热重载成功并即时生效" : "配置重载失败，已保持原配置"}
                 };
                 return std::make_shared<ix::HttpResponse>(ok ? 200 : 500, ok ? "OK" : "Error", ix::HttpErrorCode::Ok, headers, resp.dump());
+            }
+
+            // GET /api/plugins: 返回所有已加载插件与注册工具状态
+            if (req->uri == "/api/plugins" && req->method == "GET") {
+                nlohmann::json resp;
+                resp["ok"] = true;
+                if (auto* pm = runtime_.pluginManager()) {
+                    resp["plugins"] = pm->listPluginsJson();
+                } else {
+                    resp["plugins"] = nlohmann::json::array();
+                }
+                return std::make_shared<ix::HttpResponse>(200, "OK", ix::HttpErrorCode::Ok,
+                                                          headers, resp.dump(2));
+            }
+
+            // POST /api/plugins/reload: 热重载指定或全部插件（特别是 Lua 插件）
+            if (req->uri == "/api/plugins/reload" && req->method == "POST") {
+                std::string targetId;
+                if (!req->body.empty()) {
+                    try {
+                        auto parsed = nlohmann::json::parse(req->body);
+                        if (parsed.is_object() && parsed.contains("id") && parsed["id"].is_string()) {
+                            targetId = parsed["id"].get<std::string>();
+                        }
+                    } catch (...) {
+                    }
+                }
+                bool ok = false;
+                if (auto* pm = runtime_.pluginManager()) {
+                    ok = pm->reloadPlugin(targetId);
+                }
+                nlohmann::json resp = {
+                    {"ok", ok},
+                    {"id", targetId.empty() ? "lua-host" : targetId},
+                    {"message", ok ? "插件热重载成功" : "插件热重载失败或未找到目标插件"}
+                };
+                return std::make_shared<ix::HttpResponse>(ok ? 200 : 400, ok ? "OK" : "Bad Request",
+                                                          ix::HttpErrorCode::Ok, headers, resp.dump());
             }
 
             nlohmann::json notFound = {{"ok", false}, {"error", "Not Found"}};

@@ -299,6 +299,31 @@ void Runtime::setOutboundSender(OutboundSender sender) {
     outboundSender_ = std::move(sender);
 }
 
+void Runtime::setEventFilter(EventFilter filter) {
+    std::lock_guard<std::mutex> lock(senderMtx_);
+    eventFilter_ = std::move(filter);
+}
+
+void Runtime::setBeforeLlmHook(BeforeLlmHook hook) {
+    std::lock_guard<std::mutex> lock(senderMtx_);
+    beforeLlmHook_ = std::move(hook);
+}
+
+void Runtime::setOutboundFilter(OutboundFilter filter) {
+    std::lock_guard<std::mutex> lock(senderMtx_);
+    outboundFilter_ = std::move(filter);
+}
+
+void Runtime::setPluginManager(PluginManager* pm) {
+    std::lock_guard<std::mutex> lock(senderMtx_);
+    pluginManager_ = pm;
+}
+
+PluginManager* Runtime::pluginManager() const {
+    std::lock_guard<std::mutex> lock(senderMtx_);
+    return pluginManager_;
+}
+
 bool Runtime::hasMessageSender() const {
     std::lock_guard<std::mutex> lock(senderMtx_);
     return outboundSender_ != nullptr;
@@ -312,21 +337,29 @@ bool Runtime::emit(const std::string& channelId, const std::string& source, cons
     return emit(out);
 }
 
-bool Runtime::emit(const Outbound& outbound) {
-    const auto& rawText = outbound.text;
-    if (rawText.empty() && outbound.parts.empty()) return false;
+bool Runtime::emit(const Outbound& rawOutbound) {
+    Outbound outbound = rawOutbound;
+    if (outbound.text.empty() && outbound.parts.empty()) return false;
     if (g_maintenanceMode) {
         log::warn("Runtime", "维护回合中禁止发送平台消息，已拒绝: " + outbound.channelId);
         return false;
     }
 
     OutboundSender sender;
+    OutboundFilter outFilter;
     MessageSplitterConfig splitter;
     {
         std::lock_guard<std::mutex> lock(senderMtx_);
         sender = outboundSender_;
+        outFilter = outboundFilter_;
         splitter = splitterConfig_;
     }
+    if (outFilter && !outFilter(outbound)) {
+        log::info("Runtime", "出站消息被 on_outbound Hook 拦截丢弃: " + outbound.channelId);
+        return true;
+    }
+    const auto& rawText = outbound.text;
+    if (rawText.empty() && outbound.parts.empty()) return false;
     if (!sender) {
         log::warn("Runtime", "未配置 OutboundSender，无法发送平台消息: " + rawText);
         return false;
@@ -832,6 +865,16 @@ void Runtime::noteEvent(const Event& ev) {
 }
 
 void Runtime::postEvent(Event event) {
+    EventFilter filter;
+    {
+        std::lock_guard<std::mutex> lock(senderMtx_);
+        filter = eventFilter_;
+    }
+    if (filter && !filter(event)) {
+        log::debug("Runtime", "入站事件被 on_event Hook 过滤丢弃");
+        return;
+    }
+
     const std::int64_t now = std::time(nullptr);
     if (event.category == EventCategory::ExternalMessage && !event.actorId.empty()) {
         const auto seen = graph_.onSeen(event.source, event.actorId, event.title, now);
@@ -986,6 +1029,15 @@ BotReply Runtime::processMindTurn() {
 
         ChatRequest req = result.request;
         req.tools = registry_.defs();
+
+        BeforeLlmHook beforeHook;
+        {
+            std::lock_guard<std::mutex> sLock(senderMtx_);
+            beforeHook = beforeLlmHook_;
+        }
+        if (beforeHook) {
+            beforeHook(req.messages);
+        }
 
         ToolLoopOptions loopOpt;
         loopOpt.shouldInterrupt = [this, myGen]() {

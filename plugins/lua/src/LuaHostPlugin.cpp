@@ -165,6 +165,39 @@ public:
     std::size_t usedMemoryBytes() const { return usedMemory_.load(); }
     const std::vector<std::string>& registeredTools() const { return registeredTools_; }
 
+    // 执行当前脚本注册的 on_event / on_outbound 钩子
+    std::optional<nlohmann::json> runHookRefs(bool isOutbound, const nlohmann::json& payload, bool& drop) {
+        std::lock_guard<std::mutex> lock(vmMtx_);
+        if (!L_) return std::nullopt;
+        const auto& refs = isOutbound ? onOutboundRefs_ : onEventRefs_;
+        if (refs.empty()) return std::nullopt;
+
+        nlohmann::json current = payload;
+        bool modified = false;
+        for (int ref : refs) {
+            resetInstructionHook(L_);
+            lua_rawgeti(L_, LUA_REGISTRYINDEX, ref);
+            pushJson(L_, current);
+            if (lua_pcall(L_, 1, 1, 0) != LUA_OK) {
+                const char* err = lua_tostring(L_, -1);
+                host_.warn(kTag, "Lua Hook 异常 [" + scriptId_ + "]: " + (err ? err : "unknown"));
+                lua_pop(L_, 1);
+                continue;
+            }
+            if (lua_isboolean(L_, -1) && !lua_toboolean(L_, -1)) {
+                drop = true;
+                lua_pop(L_, 1);
+                return std::nullopt;
+            }
+            if (lua_istable(L_, -1)) {
+                current = toJson(L_, -1);
+                modified = true;
+            }
+            lua_pop(L_, 1);
+        }
+        return modified ? std::optional<nlohmann::json>(std::move(current)) : std::nullopt;
+    }
+
     bool loadAndStart() {
         std::lock_guard<std::mutex> lock(vmMtx_);
         L_ = lua_newstate(&LuaScriptSandbox::customAlloc, this);
@@ -325,6 +358,11 @@ private:
         lua_pushcclosure(L, &LuaScriptSandbox::luaOnEvent, 1);
         lua_setfield(L, -2, "on_event");
 
+        // mio.on_outbound(fn)
+        lua_pushlightuserdata(L, this);
+        lua_pushcclosure(L, &LuaScriptSandbox::luaOnOutbound, 1);
+        lua_setfield(L, -2, "on_outbound");
+
         // mio.every(seconds, fn)
         lua_pushlightuserdata(L, this);
         lua_pushcclosure(L, &LuaScriptSandbox::luaEvery, 1);
@@ -361,6 +399,7 @@ private:
         if (toolName.empty()) {
             return luaL_error(L, "mio.register_tool: def.name is required");
         }
+        def["owner"] = "lua:" + self->scriptId_;
 
         lua_pushvalue(L, 2);
         const int fnRef = luaL_ref(L, LUA_REGISTRYINDEX);
@@ -406,6 +445,15 @@ private:
         lua_pushvalue(L, 1);
         const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
         self->onEventRefs_.push_back(ref);
+        return 0;
+    }
+
+    static int luaOnOutbound(lua_State* L) {
+        auto* self = static_cast<LuaScriptSandbox*>(lua_touserdata(L, lua_upvalueindex(1)));
+        luaL_checktype(L, 1, LUA_TFUNCTION);
+        lua_pushvalue(L, 1);
+        const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        self->onOutboundRefs_.push_back(ref);
         return 0;
     }
 
@@ -514,6 +562,7 @@ private:
     std::string metaVersion_;
     std::vector<std::string> registeredTools_;
     std::vector<int> onEventRefs_;
+    std::vector<int> onOutboundRefs_;
     std::vector<TimerEntry> timers_;
 
     std::atomic<bool> running_{false};
@@ -532,6 +581,15 @@ public:
         } else {
             scriptsDir_ = "plugins/lua";
         }
+
+        host_.registerHook("on_event", 100,
+                           [this](const nlohmann::json& payload, bool& drop) {
+                               return dispatchHooks(false, payload, drop);
+                           });
+        host_.registerHook("on_outbound", 100,
+                           [this](const nlohmann::json& payload, bool& drop) {
+                               return dispatchHooks(true, payload, drop);
+                           });
     }
 
     ~LuaHostPlugin() override {
@@ -557,6 +615,25 @@ public:
         if (cfg.is_object() && cfg.contains("dir") && cfg["dir"].is_string()) {
             scriptsDir_ = cfg["dir"].get<std::string>();
         }
+        if (cfg.is_object() && cfg.contains("reload_script") && cfg["reload_script"].is_string()) {
+            const std::string targetId = cfg["reload_script"].get<std::string>();
+            if (!targetId.empty()) {
+                auto it = scripts_.find(targetId);
+                if (it != scripts_.end() && it->second) {
+                    it->second->stop();
+                    scripts_.erase(it);
+                }
+                const auto file = scriptsDir_ / (targetId + ".lua");
+                if (std::filesystem::exists(file)) {
+                    auto sandbox = std::make_unique<LuaScriptSandbox>(targetId, file, host_);
+                    if (sandbox->loadAndStart()) {
+                        scripts_[targetId] = std::move(sandbox);
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
         for (auto& [_, sandbox] : scripts_) {
             if (sandbox) sandbox->stop();
         }
@@ -566,6 +643,23 @@ public:
     }
 
 private:
+    std::optional<nlohmann::json> dispatchHooks(bool isOutbound,
+                                                const nlohmann::json& payload,
+                                                bool& drop) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        nlohmann::json current = payload;
+        bool anyModified = false;
+        for (auto& [_, sandbox] : scripts_) {
+            if (!sandbox) continue;
+            auto res = sandbox->runHookRefs(isOutbound, current, drop);
+            if (drop) return std::nullopt;
+            if (res.has_value()) {
+                current = std::move(*res);
+                anyModified = true;
+            }
+        }
+        return anyModified ? std::optional<nlohmann::json>(std::move(current)) : std::nullopt;
+    }
     void loadScriptsInDirLocked() {
         std::error_code ec;
         if (!std::filesystem::exists(scriptsDir_, ec) ||

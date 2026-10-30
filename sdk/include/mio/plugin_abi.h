@@ -32,6 +32,13 @@ typedef void (*mio_write_fn)(void* sink, mio_str bytes);
 /* ---- 插件 → 宿主 能力表 ---------------------------------------------- */
 typedef int (*mio_tool_fn)(void* user, mio_str args_json, void* sink, mio_write_fn write);
 
+/* Hook 回调：
+ *   返回 0  = 放行（若向 sink 写入了非空 JSON，则用新 JSON 替换原载荷）
+ *   返回 1  = 拦截/丢弃（例如敏感词拦截、垃圾事件过滤）
+ *   返回 <0 = 异常（宿主记录日志并放行原载荷）
+ */
+typedef int (*mio_hook_fn)(void* user, mio_str payload_json, void* sink, mio_write_fn write);
+
 typedef struct mio_channel_vtbl {
     uint32_t struct_size; /* 前向兼容：新字段只追加 */
     /* outbound_json: {source, channelId, text, replyTo, mentions[], parts[]} */
@@ -70,6 +77,14 @@ typedef struct mio_host_api {
     void (*state_json)(void* ctx, void* sink, mio_write_fn write);
     void (*request_shutdown)(void* ctx);
     void (*flush_mind_loop)(void* ctx, void* sink, mio_write_fn write);
+
+    /* Hook 管线注册（hook_point: "on_event" | "on_before_llm" | "on_outbound"） */
+    int  (*register_hook)(void* ctx, mio_str hook_point, int priority,
+                          mio_hook_fn fn, void* user);
+
+    /* 插件查询与热重载（供 console / 管理工具调用） */
+    void (*plugins_json)(void* ctx, void* sink, mio_write_fn write);
+    int  (*reload_plugin)(void* ctx, mio_str plugin_id);
 } mio_host_api;
 
 /* ---- 宿主 → 插件 生命周期 ------------------------------------------- */

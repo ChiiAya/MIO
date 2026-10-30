@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 
@@ -72,6 +73,7 @@ int hostRegisterTool(void* rawCtx, mio_str def_json, mio_tool_fn fn, void* user)
         def.isTerminal = j.value("terminal", false);
         if (def.name.empty()) return -1;
 
+        std::string owner = j.value("owner", ctx->owner);
         ctx->runtime->toolRegistry().add(
             std::move(def),
             [fn, user](const nlohmann::json& args) -> std::string {
@@ -81,7 +83,7 @@ int hostRegisterTool(void* rawCtx, mio_str def_json, mio_tool_fn fn, void* user)
                 return out;
             },
             ToolLayer::Dynamic,
-            ctx->owner);
+            std::move(owner));
         return 0;
     } catch (const std::exception& e) {
         log::warn(ctx->pluginId, std::string("register_tool 失败: ") + e.what());
@@ -94,7 +96,7 @@ int hostUnregisterTool(void* rawCtx, mio_str name) {
     if (!ctx || !ctx->runtime) return -1;
     const std::string toolName = strFromMio(name);
     if (toolName.empty()) return -1;
-    return ctx->runtime->toolRegistry().remove(toolName, ctx->owner) ? 0 : -1;
+    return ctx->runtime->toolRegistry().remove(toolName) ? 0 : -1;
 }
 
 int hostRegisterChannel(void* rawCtx, mio_str source, const mio_channel_vtbl* vt, void* user) {
@@ -180,6 +182,28 @@ void hostFlushMindLoop(void* rawCtx, void* sink, mio_write_fn write) {
     }
 }
 
+int hostRegisterHook(void* rawCtx, mio_str hook_point, int priority, mio_hook_fn fn, void* user) {
+    auto* ctx = static_cast<PluginHostContext*>(rawCtx);
+    if (!ctx || !ctx->manager || !fn) return -1;
+    const std::string point = strFromMio(hook_point);
+    if (point.empty()) return -1;
+    return ctx->manager->registerHook(ctx->owner, point, priority, fn, user) ? 0 : -1;
+}
+
+void hostPluginsJson(void* rawCtx, void* sink, mio_write_fn write) {
+    auto* ctx = static_cast<PluginHostContext*>(rawCtx);
+    if (!ctx || !ctx->manager || !write) return;
+    const std::string dumped = ctx->manager->listPluginsJson().dump();
+    write(sink, strToMio(dumped));
+}
+
+int hostReloadPlugin(void* rawCtx, mio_str plugin_id) {
+    auto* ctx = static_cast<PluginHostContext*>(rawCtx);
+    if (!ctx || !ctx->manager) return -1;
+    const std::string id = strFromMio(plugin_id);
+    return ctx->manager->reloadPlugin(id) ? 0 : -1;
+}
+
 } // namespace
 
 void initHostApi(PluginHostContext& ctx) {
@@ -197,15 +221,29 @@ void initHostApi(PluginHostContext& ctx) {
     ctx.api.state_json = &hostStateJson;
     ctx.api.request_shutdown = &hostRequestShutdown;
     ctx.api.flush_mind_loop = &hostFlushMindLoop;
+    ctx.api.register_hook = &hostRegisterHook;
+    ctx.api.plugins_json = &hostPluginsJson;
+    ctx.api.reload_plugin = &hostReloadPlugin;
 }
 
 PluginManager::PluginManager(Runtime& runtime) : runtime_(runtime) {
+    runtime_.setPluginManager(this);
     runtime_.setOutboundSender([this](const Outbound& outbound) {
         return sendOutbound(outbound);
+    });
+    runtime_.setEventFilter([this](Event& ev) {
+        return runEventHooks(ev);
+    });
+    runtime_.setBeforeLlmHook([this](std::vector<Msg>& messages) {
+        runBeforeLlmHooks(messages);
+    });
+    runtime_.setOutboundFilter([this](Outbound& outbound) {
+        return runOutboundHooks(outbound);
     });
 }
 
 PluginManager::~PluginManager() {
+    runtime_.setPluginManager(nullptr);
     stopAll();
 }
 
@@ -277,6 +315,7 @@ void PluginManager::loadAll() {
         loaded.hostCtx = std::move(hostCtx);
         loaded.instance = instance;
         loaded.started = false;
+        loaded.config = std::move(pluginCfg);
         plugins_.push_back(std::move(loaded));
         log::info("PluginManager", "已加载插件: " + id + " v" + (desc->version ? desc->version : "0.0.0"));
     }
@@ -305,6 +344,7 @@ void PluginManager::stopAll() {
         }
         if (it->hostCtx) {
             unregisterChannelsByOwner(it->hostCtx->owner);
+            unregisterHooksByOwner(it->hostCtx->owner);
             runtime_.toolRegistry().removeByOwner(it->hostCtx->owner);
         }
         if (it->instance && it->desc && it->desc->destroy) {
@@ -313,6 +353,76 @@ void PluginManager::stopAll() {
         }
     }
     plugins_.clear();
+}
+
+nlohmann::json PluginManager::listPluginsJson() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& p : plugins_) {
+        if (!p.desc || !p.desc->id) continue;
+        const std::string id = p.desc->id;
+        const std::string owner = p.hostCtx ? p.hostCtx->owner : ("plugin:" + id);
+        arr.push_back({
+            {"id", id},
+            {"version", p.desc->version ? p.desc->version : "0.0.0"},
+            {"started", p.started},
+            {"owner", owner},
+            {"tools", runtime_.toolRegistry().namesByOwner(owner)}
+        });
+    }
+    return arr;
+}
+
+bool PluginManager::reloadPlugin(const std::string& pluginId) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    const std::string target = pluginId.empty() ? "lua-host" : pluginId;
+    bool anyReloaded = false;
+
+    for (auto& p : plugins_) {
+        if (!p.desc || !p.desc->id) continue;
+        const std::string id = p.desc->id;
+        if (target != "all" && target != id &&
+            !(id == "lua-host" && target.rfind("lua:", 0) == 0)) {
+            continue;
+        }
+
+        nlohmann::json cfgJson = p.config;
+        if (target.rfind("lua:", 0) == 0) {
+            cfgJson["reload_script"] = target.substr(4);
+        }
+        const std::string dumped = cfgJson.dump();
+
+        if (p.desc->reconfigure && p.desc->reconfigure(p.instance, strToMio(dumped)) == 0) {
+            log::info("PluginManager", "插件已热重载 (reconfigure): " + id);
+            anyReloaded = true;
+            continue;
+        }
+
+        // 若不支持 reconfigure，则执行 stop -> destroy -> create -> start
+        if (p.started && p.desc->stop) {
+            p.desc->stop(p.instance);
+            p.started = false;
+        }
+        if (p.hostCtx) {
+            unregisterChannelsByOwner(p.hostCtx->owner);
+            unregisterHooksByOwner(p.hostCtx->owner);
+            runtime_.toolRegistry().removeByOwner(p.hostCtx->owner);
+        }
+        if (p.instance && p.desc->destroy) {
+            p.desc->destroy(p.instance);
+            p.instance = nullptr;
+        }
+
+        p.instance = p.desc->create(&p.hostCtx->api, strToMio(dumped));
+        if (p.instance && p.desc->start && p.desc->start(p.instance) == 0) {
+            p.started = true;
+            log::info("PluginManager", "插件已重启热重载: " + id);
+            anyReloaded = true;
+        } else {
+            log::error("PluginManager", "插件热重载失败: " + id);
+        }
+    }
+    return anyReloaded;
 }
 
 void PluginManager::waitForShutdown() {
@@ -338,6 +448,138 @@ void PluginManager::unregisterChannelsByOwner(const std::string& owner) {
 
 bool PluginManager::sendOutbound(const Outbound& outbound) {
     return outboundRouter_.sendBubble(outbound);
+}
+
+bool PluginManager::registerHook(const std::string& owner,
+                                 const std::string& hookPoint,
+                                 int priority,
+                                 mio_hook_fn fn,
+                                 void* user) {
+    if (hookPoint.empty() || !fn) return false;
+    std::lock_guard<std::mutex> lock(hookMtx_);
+    auto& list = hooks_[hookPoint];
+    list.push_back(HookEntry{owner, hookPoint, priority, fn, user});
+    std::stable_sort(list.begin(), list.end(),
+                     [](const HookEntry& a, const HookEntry& b) {
+                         return a.priority < b.priority;
+                     });
+    log::info("PluginManager", "已注册 Hook: point=" + hookPoint +
+                                   " priority=" + std::to_string(priority) +
+                                   " (" + owner + ")");
+    return true;
+}
+
+void PluginManager::unregisterHooksByOwner(const std::string& owner) {
+    std::lock_guard<std::mutex> lock(hookMtx_);
+    for (auto& [_, list] : hooks_) {
+        list.erase(
+            std::remove_if(list.begin(), list.end(),
+                           [&](const HookEntry& e) { return e.owner == owner; }),
+            list.end());
+    }
+}
+
+bool PluginManager::runEventHooks(Event& ev) {
+    std::vector<HookEntry> chain;
+    {
+        std::lock_guard<std::mutex> lock(hookMtx_);
+        auto it = hooks_.find("on_event");
+        if (it == hooks_.end() || it->second.empty()) return true;
+        chain = it->second;
+    }
+
+    nlohmann::json payload = ev.toJson();
+    for (const auto& hook : chain) {
+        if (!hook.fn) continue;
+        const std::string inStr = payload.dump();
+        std::string outStr;
+        const int rc = hook.fn(hook.user, strToMio(inStr), &outStr, &sdk::detail::stringSinkWrite);
+        if (rc > 0) {
+            return false; // 被拦截丢弃
+        }
+        if (rc == 0 && !outStr.empty()) {
+            try {
+                payload = nlohmann::json::parse(outStr);
+            } catch (const std::exception& e) {
+                log::warn("PluginManager", "on_event Hook 返回非法 JSON (" + hook.owner + "): " + e.what());
+            }
+        }
+    }
+    ev = Event::fromJson(payload);
+    return true;
+}
+
+void PluginManager::runBeforeLlmHooks(std::vector<Msg>& messages) {
+    std::vector<HookEntry> chain;
+    {
+        std::lock_guard<std::mutex> lock(hookMtx_);
+        auto it = hooks_.find("on_before_llm");
+        if (it == hooks_.end() || it->second.empty()) return;
+        chain = it->second;
+    }
+
+    nlohmann::json payload = {{"messageCount", messages.size()}};
+    for (const auto& hook : chain) {
+        if (!hook.fn) continue;
+        const std::string inStr = payload.dump();
+        std::string outStr;
+        const int rc = hook.fn(hook.user, strToMio(inStr), &outStr, &sdk::detail::stringSinkWrite);
+        if (rc == 0 && !outStr.empty()) {
+            try {
+                auto j = nlohmann::json::parse(outStr);
+                if (j.is_object() && j.contains("extraSystemHint") && j["extraSystemHint"].is_string()) {
+                    const std::string hint = j["extraSystemHint"].get<std::string>();
+                    if (!hint.empty()) {
+                        Msg hintMsg{Role::System};
+                        hintMsg.text = hint;
+                        messages.push_back(std::move(hintMsg));
+                    }
+                }
+            } catch (...) {
+            }
+        }
+    }
+}
+
+bool PluginManager::runOutboundHooks(Outbound& outbound) {
+    std::vector<HookEntry> chain;
+    {
+        std::lock_guard<std::mutex> lock(hookMtx_);
+        auto it = hooks_.find("on_outbound");
+        if (it == hooks_.end() || it->second.empty()) return true;
+        chain = it->second;
+    }
+
+    nlohmann::json payload = {
+        {"source", outbound.source},
+        {"channelId", outbound.channelId},
+        {"text", outbound.text},
+        {"replyTo", outbound.replyTo},
+        {"mentions", outbound.mentions}
+    };
+
+    for (const auto& hook : chain) {
+        if (!hook.fn) continue;
+        const std::string inStr = payload.dump();
+        std::string outStr;
+        const int rc = hook.fn(hook.user, strToMio(inStr), &outStr, &sdk::detail::stringSinkWrite);
+        if (rc > 0) {
+            return false; // 拦截出站消息
+        }
+        if (rc == 0 && !outStr.empty()) {
+            try {
+                payload = nlohmann::json::parse(outStr);
+            } catch (const std::exception& e) {
+                log::warn("PluginManager", "on_outbound Hook 返回非法 JSON (" + hook.owner + "): " + e.what());
+            }
+        }
+    }
+
+    outbound.source = payload.value("source", outbound.source);
+    outbound.channelId = payload.value("channelId", outbound.channelId);
+    outbound.text = payload.value("text", outbound.text);
+    outbound.replyTo = payload.value("replyTo", outbound.replyTo);
+    return true;
 }
 
 } // namespace mio

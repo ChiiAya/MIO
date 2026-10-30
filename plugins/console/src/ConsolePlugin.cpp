@@ -55,10 +55,38 @@ private:
         std::cout << "Mio 控制台演示\n"
                   << "/msg <private|group> <conversation_id> <sender_id> <text>\n"
                   << "/chat <text>             简易私聊：固定发给用户 0d00\n"
+                  << "/plugin [list|reload]    查看已加载插件列表或热重载插件 (如 /plugin reload lua:dice)\n"
                   << "/reload [path]           热重载配置（默认读取 config.json）\n"
                   << "/state\n"
                   << "/help\n"
                   << "/quit\n\n";
+    }
+
+    void handlePluginCmd(const std::string& line) const {
+        std::istringstream stream(line);
+        std::string cmd;
+        std::string sub = "list";
+        std::string arg;
+        stream >> cmd;
+        stream >> sub;
+        stream >> arg;
+
+        if (sub == "reload") {
+            if (host_.reloadPlugin(arg)) {
+                std::cout << "[Plugin] 热重载成功 (" << (arg.empty() ? "lua-host" : arg) << ")\n";
+            } else {
+                std::cout << "[Plugin] 热重载失败 (" << (arg.empty() ? "lua-host" : arg) << ")\n";
+            }
+            return;
+        }
+
+        const auto arr = host_.pluginsJson();
+        std::cout << "--- Plugins (" << arr.size() << ") ---\n";
+        for (const auto& p : arr) {
+            std::cout << "- " << p.value("id", "") << " v" << p.value("version", "0.0.0")
+                      << " [" << (p.value("started", false) ? "running" : "stopped") << "]\n";
+        }
+        std::cout << "-------------------\n";
     }
 
     void printState() const {
@@ -145,6 +173,8 @@ private:
                 printHelp();
             } else if (line == "/state") {
                 printState();
+            } else if (line.rfind("/plugin", 0) == 0) {
+                handlePluginCmd(line);
             } else if (line.rfind("/reload", 0) == 0) {
                 std::istringstream stream(line);
                 std::string cmd;

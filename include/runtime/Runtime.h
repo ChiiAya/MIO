@@ -44,6 +44,7 @@
 namespace mio {
 
 class AdminServer;
+class PluginManager;
 namespace mcp {
 class McpManager;
 }
@@ -106,7 +107,17 @@ public:
 
     // 平台消息发送与分段调度
     using OutboundSender = std::function<bool(const Outbound&)>;
+    using EventFilter = std::function<bool(Event&)>;
+    using BeforeLlmHook = std::function<void(std::vector<Msg>&)>;
+    using OutboundFilter = std::function<bool(Outbound&)>;
+
     void setOutboundSender(OutboundSender sender);
+    void setEventFilter(EventFilter filter);
+    void setBeforeLlmHook(BeforeLlmHook hook);
+    void setOutboundFilter(OutboundFilter filter);
+    void setPluginManager(PluginManager* pm);
+    PluginManager* pluginManager() const;
+
     bool hasMessageSender() const;
     bool emit(const Outbound& outbound);
     bool emit(const std::string& channelId, const std::string& source, const std::string& rawText);
@@ -180,6 +191,10 @@ private:
 
     std::unique_ptr<AdminServer> adminServer_;
     OutboundSender outboundSender_;
+    EventFilter eventFilter_;
+    BeforeLlmHook beforeLlmHook_;
+    OutboundFilter outboundFilter_;
+    PluginManager* pluginManager_ = nullptr;
     mutable std::mutex senderMtx_;
     MessageSplitterConfig splitterConfig_;
     std::unique_ptr<mcp::McpManager> mcpManager_;

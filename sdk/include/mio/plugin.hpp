@@ -143,12 +143,73 @@ public:
         return nlohmann::json::object();
     }
 
+    // HookHandler:
+    //   drop 置为 true 表示拦截丢弃；
+    //   返回 std::nullopt 表示放行原载荷；返回非空 json 表示修改载荷后放行。
+    using HookHandler = std::function<std::optional<nlohmann::json>(const nlohmann::json& payload, bool& drop)>;
+
+    bool registerHook(std::string_view hookPoint, int priority, HookHandler fn) {
+        if (!raw_ || !raw_->register_hook || !fn) return false;
+        auto holder = std::make_unique<HookHolder>(HookHolder{std::move(fn)});
+        HookHolder* ptr = holder.get();
+        const int rc = raw_->register_hook(raw_->ctx, detail::toMioStr(hookPoint),
+                                           priority, &Host::hookThunk, ptr);
+        if (rc == 0) {
+            hooks_.push_back(std::move(holder));
+            return true;
+        }
+        return false;
+    }
+
+    nlohmann::json pluginsJson() const {
+        if (!raw_ || !raw_->plugins_json) return nlohmann::json::array();
+        std::string out;
+        raw_->plugins_json(raw_->ctx, &out, &detail::stringSinkWrite);
+        try {
+            if (!out.empty()) return nlohmann::json::parse(out);
+        } catch (...) {
+        }
+        return nlohmann::json::array();
+    }
+
+    bool reloadPlugin(std::string_view pluginId = "") const {
+        if (!raw_ || !raw_->reload_plugin) return false;
+        return raw_->reload_plugin(raw_->ctx, detail::toMioStr(pluginId)) == 0;
+    }
+
     const mio_host_api* raw() const { return raw_; }
 
 private:
     struct ToolHolder {
         ToolHandler fn;
     };
+
+    struct HookHolder {
+        HookHandler fn;
+    };
+
+    static int hookThunk(void* user, mio_str payload_json, void* sink, mio_write_fn write) noexcept {
+        if (!user) return -1;
+        try {
+            auto* holder = static_cast<HookHolder*>(user);
+            nlohmann::json payload = nlohmann::json::object();
+            if (payload_json.data && payload_json.size > 0) {
+                payload = nlohmann::json::parse(payload_json.data, payload_json.data + payload_json.size);
+            }
+            bool drop = false;
+            auto modified = holder->fn(payload, drop);
+            if (drop) {
+                return 1;
+            }
+            if (modified.has_value() && write) {
+                const std::string dumped = modified->dump();
+                write(sink, detail::toMioStr(dumped));
+            }
+            return 0;
+        } catch (...) {
+            return -1;
+        }
+    }
 
     static int toolThunk(void* user, mio_str args_json, void* sink, mio_write_fn write) noexcept {
         if (!user) return -1;
@@ -205,6 +266,7 @@ private:
 
     const mio_host_api* raw_ = nullptr;
     std::vector<std::unique_ptr<ToolHolder>> tools_;
+    std::vector<std::unique_ptr<HookHolder>> hooks_;
 };
 
 class Plugin {
