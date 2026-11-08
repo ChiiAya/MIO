@@ -23,7 +23,8 @@ std::string formatHeader(const Event& ev, const char* tag) {
     if (!ev.channelId.empty()) oss << " | channel:" << ev.channelId;
     if (!ev.title.empty() || !ev.actorId.empty()) {
         oss << " | from:" << (ev.title.empty() ? ev.actorId : ev.title);
-        if (!ev.title.empty() && !ev.actorId.empty() && ev.title != ev.actorId) {
+        if (!ev.title.empty() && !ev.actorId.empty() && ev.title != ev.actorId &&
+            ev.title.find(ev.actorId) == std::string::npos) {
             oss << "(" << ev.actorId << ")";
         }
     }

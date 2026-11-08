@@ -1,8 +1,10 @@
 #include "core/event/AttentionGate.h"
+#include "context/costEstimator/Tokens.h"
 #include "log/Log.h"
 
 #include <algorithm>
 #include <chrono>
+#include <sstream>
 
 namespace mio {
 
@@ -12,6 +14,17 @@ std::int64_t nowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+std::string previewContent(const std::string& content, std::size_t maxBytes = 60) {
+    std::string flat;
+    flat.reserve(std::min(content.size(), maxBytes + 16));
+    for (char c : content) {
+        if (c == '\r' || c == '\n') flat.push_back(' ');
+        else flat.push_back(c);
+        if (flat.size() >= maxBytes * 2) break;
+    }
+    return cutUtf8(flat, maxBytes);
 }
 
 // 规则匹配优先级：3=匹配 actorId, 2=匹配 channelId, 1=匹配 source, 0=不匹配
@@ -53,32 +66,78 @@ bool AttentionGate::enterQueue(Event inEvt) {
         achieve_->append(inEvt);
     }
 
+    std::string actionDesc;
+    bool shouldWake = false;
+    bool flushDigest = false;
+
     switch (inEvt.tier) {
     case AttentionTier::DirectFull:
     case AttentionTier::Preview:
+        actionDesc = (inEvt.tier == AttentionTier::DirectFull) ? "唤醒意识流" : "预览唤醒";
+        shouldWake = true;
+        break;
+
+    case AttentionTier::Digest: {
+        const std::size_t nextCount = DigestBuffer_.size() + 1;
+        if (nextCount >= kDefaultDigestBatchSize) {
+            actionDesc = "攒批达到阈值 " + std::to_string(nextCount) + "/" +
+                         std::to_string(kDefaultDigestBatchSize) + "，唤醒意识流";
+            shouldWake = true;
+            flushDigest = true;
+        } else {
+            actionDesc = "攒批中 " + std::to_string(nextCount) + "/" +
+                         std::to_string(kDefaultDigestBatchSize);
+            shouldWake = false;
+        }
+        break;
+    }
+
+    case AttentionTier::Silent:
+        actionDesc = "静默归档";
+        shouldWake = false;
+        break;
+
+    default:
+        log::error("AttentionGate", "invalid Attention Tier");
+        return false;
+    }
+
+    // 格式化输出入站事件日志
+    std::ostringstream oss;
+    oss << "入站事件 #" << inEvt.id << " [" << eventCategoryToString(inEvt.category) << "]";
+    if (!inEvt.source.empty()) oss << " [" << inEvt.source << "]";
+    if (!inEvt.channelId.empty()) oss << "[" << inEvt.channelId << "]";
+    if (!inEvt.title.empty() || !inEvt.actorId.empty()) {
+        oss << " 来自:" << (inEvt.title.empty() ? inEvt.actorId : inEvt.title);
+        if (!inEvt.title.empty() && !inEvt.actorId.empty() && inEvt.title != inEvt.actorId &&
+            inEvt.title.find(inEvt.actorId) == std::string::npos) {
+            oss << "(" << inEvt.actorId << ")";
+        }
+    }
+    oss << " tier=" << attentionTierToString(inEvt.tier) << " (" << actionDesc << ")";
+    if (!inEvt.content.empty()) {
+        oss << ": \"" << previewContent(inEvt.content, 60) << "\"";
+    } else if (!inEvt.parts.empty()) {
+        oss << " [" << inEvt.parts.size() << " 个多模态附件]";
+    }
+    log::info("AttentionGate", oss.str());
+
+    // 状态流转入队
+    if (inEvt.tier == AttentionTier::DirectFull || inEvt.tier == AttentionTier::Preview) {
         if (!DigestBuffer_.empty()) {
             readyMsgs_.push_back(DigestBuffer2Msg());
         }
         if (auto m = inEvt.toMsg()) {
             readyMsgs_.push_back(std::move(*m));
         }
-        return true;
-
-    case AttentionTier::Digest:
+    } else if (inEvt.tier == AttentionTier::Digest) {
         DigestBuffer_.push_back(std::move(inEvt));
-        if (DigestBuffer_.size() >= kDefaultDigestBatchSize) {
+        if (flushDigest) {
             readyMsgs_.push_back(DigestBuffer2Msg());
-            return true;
         }
-        return false;
-
-    case AttentionTier::Silent:
-        return false;
-
-    default:
-        log::error("AttentionGate", "invalid Attention Tier");
-        return false;
     }
+
+    return shouldWake;
 }
 
 bool AttentionGate::resolveAttention(Event& inEvt) {

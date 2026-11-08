@@ -36,10 +36,7 @@ bool platformMatches(const std::string& stored, const std::string& platform,
 }
 
 bool nameMatches(const PersonNode& node, const std::string& name) {
-    if (node.name == name) return true;
-    // 自动登记的旧称呼为 QQ(群名片)，让用户看到的名片也可用于查询。
-    const std::string qq = RelationshipGraph::extractQq(node);
-    return !qq.empty() && node.name == qq + "(" + name + ")";
+    return node.name == name;
 }
 } // namespace
 
@@ -133,7 +130,7 @@ SeenResult RelationshipGraph::onSeen(const std::string& platform,
         if (!platform.empty())
             for (auto& pid : n->platformIds)
                 if (pid == platformId) pid = tag;
-        if (n->name == platformId && !nameHint.empty() && nameHint != platformId) {
+        if ((n->name == platformId || n->name.empty()) && !nameHint.empty() && nameHint != platformId) {
             n->name = nameHint;
         }
         const std::int64_t prevLast = n->lastSeenAt;
@@ -493,12 +490,12 @@ void RelationshipGraph::load() {
             for (const auto& item : *it) {
                 auto n = std::make_unique<PersonNode>();
                 n->internalId = item.value("internalId", "");
-                n->name = item.value("name", "");
                 n->personal = item.value("personal", "");
                 n->loves = item.value("loves", "");
                 if (auto p = item.find("platformIds");
                     p != item.end() && p->is_array())
                     for (const auto& pid : *p) n->platformIds.push_back(pid);
+                n->name = item.value("name", "");
                 n->weight = item.value("weight", 0.0);
                 n->firstSeenAt = item.value("firstSeenAt", std::int64_t{0});
                 n->lastSeenAt = item.value("lastSeenAt", std::int64_t{0});

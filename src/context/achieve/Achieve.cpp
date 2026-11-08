@@ -167,7 +167,7 @@ std::string Achieve::formatEventsForTool(const std::vector<Event>& events) {
     return oss.str();
 }
 
-ColdRead Achieve::coldRead(const std::string& target, SummaryManager* summary,
+ColdRead Achieve::coldRead(const std::string& target,
                            int summaryCountOverride, int rawKeepOverride) {
     AchieveConfig cfgCopy;
     std::vector<Event> matched;
@@ -182,19 +182,8 @@ ColdRead Achieve::coldRead(const std::string& target, SummaryManager* summary,
     }
 
     ColdRead out;
-    if (!cfgCopy.enableColdSummary) {
-        return out;
-    }
-
-    const int sumCnt = summaryCountOverride >= 0 ? summaryCountOverride : cfgCopy.summaryCount;
     const int keepCnt = rawKeepOverride >= 0 ? rawKeepOverride : cfgCopy.rawKeep;
     const std::size_t rawKeep = static_cast<std::size_t>(std::max(keepCnt, 0));
-    const std::size_t summaryCount = static_cast<std::size_t>(std::max(sumCnt, 0));
-
-    const std::size_t windowSize = summaryCount + rawKeep;
-    if (windowSize > 0 && matched.size() > windowSize) {
-        matched.erase(matched.begin(), matched.end() - static_cast<std::ptrdiff_t>(windowSize));
-    }
 
     std::vector<Msg> fullMsgs;
     fullMsgs.reserve(matched.size());
@@ -204,29 +193,10 @@ ColdRead Achieve::coldRead(const std::string& target, SummaryManager* summary,
         }
     }
 
-    if (fullMsgs.size() <= rawKeep || summaryCount == 0 || summary == nullptr) {
+    if (rawKeep > 0 && fullMsgs.size() > rawKeep) {
+        out.msgs.assign(fullMsgs.end() - static_cast<std::ptrdiff_t>(rawKeep), fullMsgs.end());
+    } else {
         out.msgs = std::move(fullMsgs);
-        return out;
-    }
-
-    const std::size_t tailStart = fullMsgs.size() - rawKeep;
-    std::vector<Msg> toSummarize(fullMsgs.begin(), fullMsgs.begin() + static_cast<std::ptrdiff_t>(tailStart));
-
-    try {
-        SummaryOutcome outcome = summary->summarizeWithVerdict(toSummarize);
-        if (outcome.text.empty()) throw std::runtime_error("摘要为空");
-
-        Msg summaryMsg;
-        summaryMsg.role = Role::User;
-        summaryMsg.text = "[历史事件摘要] " + outcome.text;
-        out.msgs.push_back(std::move(summaryMsg));
-        out.msgs.insert(out.msgs.end(),
-                        fullMsgs.begin() + static_cast<std::ptrdiff_t>(tailStart),
-                        fullMsgs.end());
-        out.topic = outcome.topic;
-    } catch (const std::exception& e) {
-        log::warn("Achieve", std::string("冷读取摘要失败，退回原文尾部: ") + e.what());
-        out.msgs.assign(fullMsgs.begin() + static_cast<std::ptrdiff_t>(tailStart), fullMsgs.end());
     }
     return out;
 }

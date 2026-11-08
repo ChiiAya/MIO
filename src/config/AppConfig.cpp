@@ -173,13 +173,15 @@ void from_json(const nlohmann::json& j, AchieveConfig& c) {
 void to_json(nlohmann::json& j, const ContextBuilderConfig& c) {
     j = nlohmann::json{
         {"budgetTokens", c.budgetTokens},
-        {"watermark", c.watermark}
+        {"watermark", c.watermark},
+        {"rawKeep", c.rawKeep}
     };
 }
 
 void from_json(const nlohmann::json& j, ContextBuilderConfig& c) {
     readIfExists(j, "budgetTokens", c.budgetTokens);
     readIfExists(j, "watermark", c.watermark);
+    readIfExists(j, "rawKeep", c.rawKeep);
 }
 
 void to_json(nlohmann::json& j, const MessageSplitterConfig& c) {
@@ -235,8 +237,6 @@ void to_json(nlohmann::json& j, const AppConfig& c) {
         {"contextBuilder", c.contextBuilder},
         {"splitter", c.splitter},
         {"mcp", c.mcp},
-        {"maintenance", c.maintenance},
-        {"memoryBridge", c.memoryBridge},
         {"plugins", c.plugins}
     };
 }
@@ -269,12 +269,6 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     }
     if (j.contains("mcp") && j["mcp"].is_object()) {
         from_json(j["mcp"], c.mcp);
-    }
-    if (j.contains("maintenance") && j["maintenance"].is_object()) {
-        from_json(j["maintenance"], c.maintenance);
-    }
-    if (j.contains("memoryBridge") && j["memoryBridge"].is_object()) {
-        from_json(j["memoryBridge"], c.memoryBridge);
     }
     if (j.contains("plugins") && j["plugins"].is_array()) {
         c.plugins.clear();

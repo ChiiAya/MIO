@@ -190,11 +190,8 @@ private:
                 nlohmann::json ev;
                 if (parseEvent(line, ev)) {
                     const std::string cid = ev.value("channelId", "console");
-                    if (host_.postEvent(ev)) {
-                        const auto reply = host_.flushMindLoop();
-                        if (reply.value("text", "").empty() && !reply.value("interrupted", false)) {
-                            std::cout << "[" << cid << "] (保持沉默/已读不回)\n";
-                        }
+                    if (!host_.postEvent(ev)) {
+                        std::cout << "[" << cid << "] (事件投递失败)\n";
                     }
                 } else if (!line.empty()) {
                     std::cout << "无法识别的命令，请输入 /help。\n";

@@ -15,7 +15,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "context/summarizor/SummaryManager.h"
 #include "core/event/Event.h"
 
 namespace mio {
@@ -29,7 +28,6 @@ struct AchieveConfig {
 
 struct ColdRead {
     std::vector<Msg> msgs;
-    std::string topic;
 };
 
 class Achieve {
@@ -56,7 +54,7 @@ public:
 
     static std::string formatEventsForTool(const std::vector<Event>& events);
 
-    ColdRead coldRead(const std::string& target = "", SummaryManager* summary = nullptr,
+    ColdRead coldRead(const std::string& target = "",
                       int summaryCountOverride = -1, int rawKeepOverride = -1);
 
     std::uint64_t maxId() const;

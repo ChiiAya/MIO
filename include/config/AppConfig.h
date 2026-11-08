@@ -5,8 +5,6 @@
 #include "context/achieve/Achieve.h"
 #include "context/contextBuilder/ContextBuilder.h"
 #include "config/mcp/McpConfig.h"
-#include "runtime/SummaryBridge.h"
-#include "scheduler/Scheduler.h"
 
 #include <nlohmann/json.hpp>
 #include <string>
@@ -52,8 +50,6 @@ struct AppConfig {
     ContextBuilderConfig contextBuilder;
     MessageSplitterConfig splitter;
     mcp::McpConfig mcp;
-    MaintenanceConfig maintenance;   // 定时事项（日界刷新 Facts / 维护 prompt）
-    MemoryBridgeConfig memoryBridge; // 滚动摘要 → MCP 长期记忆（graphiti 等）
     std::vector<PluginSpec> plugins; // 启用的插件列表与各自配置
 
     static AppConfig fromEnvironment();

@@ -1,5 +1,6 @@
 #include "plugin/OutboundRouter.h"
 
+#include "context/costEstimator/Tokens.h"
 #include "log/Log.h"
 #include "mio/plugin.hpp"
 
@@ -13,6 +14,17 @@
 
 namespace mio {
 namespace {
+
+std::string previewContent(const std::string& content, std::size_t maxBytes = 60) {
+    std::string flat;
+    flat.reserve(std::min(content.size(), maxBytes + 16));
+    for (char c : content) {
+        if (c == '\r' || c == '\n') flat.push_back(' ');
+        else flat.push_back(c);
+        if (flat.size() >= maxBytes * 2) break;
+    }
+    return cutUtf8(flat, maxBytes);
+}
 
 std::vector<std::string> splitByDelimiter(const std::string& str, const std::string& delimiter) {
     std::vector<std::string> tokens;
@@ -139,8 +151,36 @@ bool OutboundRouter::sendBubble(const Outbound& bubble) const {
                                     &sdk::detail::stringSinkWrite);
     if (rc != 0 && !err.empty()) {
         log::warn("OutboundRouter", "通道 " + target.source + " 发送失败: " + err);
+    } else if (rc == 0) {
+        std::string preview;
+        if (!bubble.text.empty()) {
+            preview = ": \"" + previewContent(bubble.text, 60) + "\"";
+        } else if (!bubble.parts.empty()) {
+            preview = " [" + std::to_string(bubble.parts.size()) + " 个多模态附件]";
+        }
+        log::info("OutboundRouter", "出站消息 [" + target.source + "][" + bubble.channelId + "]" + preview);
     }
     return rc == 0;
+}
+
+bool OutboundRouter::hasDeliverableText(const std::string& text,
+                                        const MessageSplitterConfig& cfg) {
+    const auto visible = [](const std::string& token) {
+        return token.find_first_not_of(" \t\r\n") != std::string::npos;
+    };
+    if (cfg.enabled && !cfg.delimiter.empty()) {
+        std::size_t start = 0;
+        while (start <= text.size()) {
+            const auto pos = text.find(cfg.delimiter, start);
+            const auto token = text.substr(
+                start, pos == std::string::npos ? std::string::npos : pos - start);
+            if (visible(token)) return true;
+            if (pos == std::string::npos) break;
+            start = pos + cfg.delimiter.size();
+        }
+        return false;
+    }
+    return visible(text);
 }
 
 bool OutboundRouter::emit(const Outbound& outbound,

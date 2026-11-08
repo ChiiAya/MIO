@@ -167,17 +167,9 @@ void hostRequestShutdown(void* rawCtx) {
     ctx->manager->requestShutdown();
 }
 
-void hostFlushMindLoop(void* rawCtx, void* sink, mio_write_fn write) {
-    auto* ctx = static_cast<PluginHostContext*>(rawCtx);
-    if (!ctx || !ctx->runtime) return;
-    const BotReply reply = ctx->runtime->flushMindLoop();
+void hostFlushMindLoop(void* /*rawCtx*/, void* sink, mio_write_fn write) {
     if (write) {
-        nlohmann::json j = {
-            {"channelId", reply.channelId},
-            {"text", reply.text},
-            {"interrupted", reply.interrupted}
-        };
-        const std::string dumped = j.dump();
+        const std::string dumped = "{}";
         write(sink, strToMio(dumped));
     }
 }
@@ -236,9 +228,6 @@ PluginManager::PluginManager(Runtime& runtime) : runtime_(runtime) {
     });
     runtime_.setBeforeLlmHook([this](std::vector<Msg>& messages) {
         runBeforeLlmHooks(messages);
-    });
-    runtime_.setOutboundFilter([this](Outbound& outbound) {
-        return runOutboundHooks(outbound);
     });
 }
 
@@ -446,8 +435,17 @@ void PluginManager::unregisterChannelsByOwner(const std::string& owner) {
     outboundRouter_.unregisterByOwner(owner);
 }
 
-bool PluginManager::sendOutbound(const Outbound& outbound) {
-    return outboundRouter_.sendBubble(outbound);
+bool PluginManager::sendOutbound(const Outbound& rawOutbound) {
+    Outbound outbound = rawOutbound;
+    if (outbound.text.empty() && outbound.parts.empty()) return false;
+    if (!runOutboundHooks(outbound)) {
+        log::info("PluginManager", "出站消息被 on_outbound Hook 拦截丢弃: " + outbound.channelId);
+        return true;
+    }
+    if (outbound.text.empty() && outbound.parts.empty()) return false;
+    auto cfg = runtime_.config();
+    const MessageSplitterConfig splitter = cfg ? cfg->splitter : MessageSplitterConfig{};
+    return outboundRouter_.emit(outbound, splitter);
 }
 
 bool PluginManager::registerHook(const std::string& owner,
