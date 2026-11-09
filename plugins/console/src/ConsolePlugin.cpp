@@ -94,7 +94,6 @@ private:
         std::cout << "--- RuntimeState ---\n"
                   << "messageCount: " << st.value("messageCount", 0ull) << "\n"
                   << "botName: " << st.value("botName", "Mio") << "\n"
-                  << "version: " << st.value("version", 0ull) << "\n"
                   << "lastEventSeq: " << st.value("lastEventSeq", 0ull) << "\n"
                   << "activeChannel: " << st.value("activeChannel", "none") << "\n"
                   << "activeUsers: " << st.value("activeUsersCount", 0ull) << "\n"

@@ -7,16 +7,15 @@
 namespace mio {
 
 ConfigManager::ConfigManager(std::shared_ptr<const AppConfig> initialConfig) {
+    if (const char* envPath = std::getenv("MIO_CONFIG_PATH"); envPath && *envPath != '\0') {
+        configPath_ = envPath;
+    }
     if (initialConfig) {
         current_ = std::move(initialConfig);
     } else if (std::getenv("MIO_NO_CONFIG") != nullptr) {
         current_ = std::make_shared<const AppConfig>(AppConfig::fromEnvironment());
-    } else if (const char* envPath = std::getenv("MIO_CONFIG_PATH"); envPath && std::filesystem::exists(envPath)) {
-        if (!reloadFromFile(envPath)) {
-            current_ = std::make_shared<const AppConfig>(AppConfig::fromEnvironment());
-        }
-    } else if (std::filesystem::exists("config.json")) {
-        if (!reloadFromFile("config.json")) {
+    } else if (std::filesystem::exists(configPath_)) {
+        if (!reloadFromFile(configPath_)) {
             current_ = std::make_shared<const AppConfig>(AppConfig::fromEnvironment());
         }
     } else {
@@ -25,8 +24,11 @@ ConfigManager::ConfigManager(std::shared_ptr<const AppConfig> initialConfig) {
 }
 
 ConfigManager::ConfigManager(const std::filesystem::path& configPath) {
-    if (!configPath.empty() && std::filesystem::exists(configPath)) {
-        if (!reloadFromFile(configPath)) {
+    if (!configPath.empty()) {
+        configPath_ = configPath;
+    }
+    if (std::filesystem::exists(configPath_)) {
+        if (!reloadFromFile(configPath_)) {
             current_ = std::make_shared<const AppConfig>(AppConfig::fromEnvironment());
         }
     } else {

@@ -1,4 +1,5 @@
 #include "context/achieve/Achieve.h"
+#include "core/message/History.h"
 #include "log/Log.h"
 
 #include <algorithm>
@@ -65,6 +66,26 @@ void Achieve::offloadInlineMedia(Event& ev) const {
                 p.data = "file://" + mediaPath.string();
             }
         }
+    }
+}
+
+void Achieve::restoreOffloadedMedia(Event& ev) const {
+    for (auto& p : ev.parts) {
+        if (p.data.rfind("file://", 0) != 0) continue;
+        const std::filesystem::path mediaPath(p.data.substr(7));
+        std::ifstream in(mediaPath, std::ios::binary);
+        if (!in) {
+            log::warn("Achieve", "外置媒体文件缺失，保留原引用: " + mediaPath.string());
+            continue;
+        }
+        std::ostringstream buf;
+        buf << in.rdbuf();
+        std::string content = buf.str();
+        if (content.empty()) {
+            log::warn("Achieve", "外置媒体文件为空，保留原引用: " + mediaPath.string());
+            continue;
+        }
+        p.data = std::move(content);
     }
 }
 
@@ -145,30 +166,40 @@ std::vector<Event> Achieve::queryRecentSeconds(const std::string& target,
 }
 
 std::optional<Event> Achieve::getById(std::uint64_t id) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    auto it = idIndex_.find(id);
-    if (it == idIndex_.end() || it->second >= events_.size()) {
-        return std::nullopt;
+    Event ev;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = idIndex_.find(id);
+        if (it == idIndex_.end() || it->second >= events_.size()) {
+            return std::nullopt;
+        }
+        ev = events_[it->second];
     }
-    return events_[it->second];
+    restoreOffloadedMedia(ev);
+    return ev;
 }
 
 std::string Achieve::formatEventsForTool(const std::vector<Event>& events) {
-    if (events.empty()) {
-        return "[无匹配事件记录]";
+    std::vector<Event> full;
+    full.reserve(events.size());
+    for (const auto& ev : events) {
+        if (ev.tier == AttentionTier::Silent) continue;
+        Event copy = ev;
+        copy.tier = AttentionTier::DirectFull;
+        full.push_back(std::move(copy));
     }
-    std::ostringstream oss;
-    for (std::size_t i = 0; i < events.size(); ++i) {
-        if (auto m = events[i].toMsg(AttentionTier::DirectFull)) {
-            if (i > 0) oss << "\n";
-            oss << m->text;
-        }
+    if (full.empty()) return "[无匹配事件记录]";
+
+    const auto msgs = Event::toBatchMsgs(full);
+    std::string out;
+    for (const auto& m : msgs) {
+        if (!out.empty()) out += "\n";
+        out += m.text;
     }
-    return oss.str();
+    return out.empty() ? "[无匹配事件记录]" : out;
 }
 
-ColdRead Achieve::coldRead(const std::string& target,
-                           int summaryCountOverride, int rawKeepOverride) {
+ColdRead Achieve::coldRead(const std::string& target, int rawKeepOverride) {
     AchieveConfig cfgCopy;
     std::vector<Event> matched;
     {
@@ -185,18 +216,23 @@ ColdRead Achieve::coldRead(const std::string& target,
     const int keepCnt = rawKeepOverride >= 0 ? rawKeepOverride : cfgCopy.rawKeep;
     const std::size_t rawKeep = static_cast<std::size_t>(std::max(keepCnt, 0));
 
-    std::vector<Msg> fullMsgs;
-    fullMsgs.reserve(matched.size());
+    std::vector<Event> kept;
+    kept.reserve(matched.size());
     for (const auto& ev : matched) {
-        if (auto m = ev.toMsg(AttentionTier::DirectFull)) {
-            fullMsgs.push_back(std::move(*m));
-        }
+        if (ev.tier == AttentionTier::Silent) continue;
+        Event copy = ev;
+        copy.tier = AttentionTier::DirectFull;
+        kept.push_back(std::move(copy));
     }
 
-    if (rawKeep > 0 && fullMsgs.size() > rawKeep) {
-        out.msgs.assign(fullMsgs.end() - static_cast<std::ptrdiff_t>(rawKeep), fullMsgs.end());
-    } else {
-        out.msgs = std::move(fullMsgs);
+    if (rawKeep > 0 && kept.size() > rawKeep) {
+        kept.erase(kept.begin(), kept.end() - static_cast<std::ptrdiff_t>(rawKeep));
+    }
+
+    if (!kept.empty()) {
+        restoreOffloadedMedia(kept.back());
+        out.msgs = Event::toBatchMsgs(kept);
+        history::stripCompletedMedia(out.msgs);
     }
     return out;
 }

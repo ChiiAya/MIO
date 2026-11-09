@@ -132,40 +132,14 @@ void from_json(const nlohmann::json& j, OpenAiConfig& c) {
     }
 }
 
-void to_json(nlohmann::json& j, const EmbeddingConfig& c) {
-    j = nlohmann::json{
-        {"baseUrl", c.baseUrl},
-        {"apiKey", c.apiKey},
-        {"model", c.model},
-        {"maxRetries", c.maxRetries},
-        {"retryInitialDelayMs", c.retryInitialDelayMs},
-        {"retryBackoffFactor", c.retryBackoffFactor},
-        {"httpTimeoutMs", c.httpTimeoutMs}
-    };
-}
-
-void from_json(const nlohmann::json& j, EmbeddingConfig& c) {
-    readIfExists(j, "baseUrl", c.baseUrl);
-    readIfExists(j, "apiKey", c.apiKey);
-    readIfExists(j, "model", c.model);
-    readIfExists(j, "maxRetries", c.maxRetries);
-    readIfExists(j, "retryInitialDelayMs", c.retryInitialDelayMs);
-    readIfExists(j, "retryBackoffFactor", c.retryBackoffFactor);
-    readIfExists(j, "httpTimeoutMs", c.httpTimeoutMs);
-}
-
 void to_json(nlohmann::json& j, const AchieveConfig& c) {
     j = nlohmann::json{
-        {"enableColdSummary", c.enableColdSummary},
-        {"summaryCount", c.summaryCount},
         {"rawKeep", c.rawKeep},
         {"inlineMediaMaxBytes", c.inlineMediaMaxBytes}
     };
 }
 
 void from_json(const nlohmann::json& j, AchieveConfig& c) {
-    readIfExists(j, "enableColdSummary", c.enableColdSummary);
-    readIfExists(j, "summaryCount", c.summaryCount);
     readIfExists(j, "rawKeep", c.rawKeep);
     readIfExists(j, "inlineMediaMaxBytes", c.inlineMediaMaxBytes);
 }
@@ -206,7 +180,6 @@ void to_json(nlohmann::json& j, const PluginSpec& c) {
     j = nlohmann::json{
         {"id", c.id},
         {"enabled", c.enabled},
-        {"path", c.path},
         {"config", c.config}
     };
 }
@@ -214,7 +187,6 @@ void to_json(nlohmann::json& j, const PluginSpec& c) {
 void from_json(const nlohmann::json& j, PluginSpec& c) {
     readIfExists(j, "id", c.id);
     readIfExists(j, "enabled", c.enabled);
-    readIfExists(j, "path", c.path);
     if (j.contains("config") && j["config"].is_object()) {
         c.config = j["config"];
     }
@@ -231,8 +203,8 @@ void to_json(nlohmann::json& j, const AppConfig& c) {
         {"systemPromptNotice", c.systemPromptNotice},
         {"adminPort", c.adminPort},
         {"mindDebounceMs", c.mindDebounceMs},
+        {"autoEmitTextReply", c.autoEmitTextReply},
         {"openai", c.openai},
-        {"embedding", c.embedding},
         {"achieve", c.achieve},
         {"contextBuilder", c.contextBuilder},
         {"splitter", c.splitter},
@@ -251,12 +223,10 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
     readIfExists(j, "systemPromptNotice", c.systemPromptNotice);
     readIfExists(j, "adminPort", c.adminPort);
     readIfExists(j, "mindDebounceMs", c.mindDebounceMs);
+    readIfExists(j, "autoEmitTextReply", c.autoEmitTextReply);
 
     if (j.contains("openai") && j["openai"].is_object()) {
         from_json(j["openai"], c.openai);
-    }
-    if (j.contains("embedding") && j["embedding"].is_object()) {
-        from_json(j["embedding"], c.embedding);
     }
     if (j.contains("achieve") && j["achieve"].is_object()) {
         from_json(j["achieve"], c.achieve);
@@ -297,7 +267,6 @@ void from_json(const nlohmann::json& j, AppConfig& c) {
             c.plugins.push_back(PluginSpec{
                 "napcat",
                 c.platform == "napcat" || c.platform == "all" || c.platform == "both",
-                "",
                 j["napcat"]
             });
         }
@@ -321,7 +290,6 @@ AppConfig AppConfig::fromEnvironment() {
     cfg.llmBackend = llmBackendFromEnvironment();
 
     cfg.openai = OpenAiConfig::fromEnvironment();
-    cfg.embedding = EmbeddingConfig::fromEnvironment();
     cfg.achieve = AchieveConfig{};
     cfg.contextBuilder = ContextBuilderConfig{};
     cfg.splitter = MessageSplitterConfig{};
@@ -329,9 +297,9 @@ AppConfig AppConfig::fromEnvironment() {
     const bool enableConsole = (cfg.platform == "console" || cfg.platform == "all" || cfg.platform == "both");
     const bool enableNapcat  = (cfg.platform == "napcat"  || cfg.platform == "all" || cfg.platform == "both");
     cfg.plugins = {
-        PluginSpec{"console", enableConsole, "", nlohmann::json::object()},
-        PluginSpec{"napcat", enableNapcat, "", nlohmann::json::object()},
-        PluginSpec{"lua-host", true, "", nlohmann::json{{"dir", "plugins/lua"}}}
+        PluginSpec{"console", enableConsole, nlohmann::json::object()},
+        PluginSpec{"napcat", enableNapcat, nlohmann::json::object()},
+        PluginSpec{"lua-host", true, nlohmann::json{{"dir", "plugins/lua"}}}
     };
 
     return cfg;

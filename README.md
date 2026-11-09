@@ -40,6 +40,8 @@
   - [1. 控制台交互模式（Console REPL）](#1-控制台交互模式console-repl)
   - [2. NapCatQQ (OneBot 11) 接入运行](#2-napcatqq-onebot-11-接入运行)
 - [⚙️ 配置与环境变量参考](#️-配置与环境变量参考)
+- [🔌 插件开发指南（Lua / Native）](docs/plugin-guide.md)
+- [🔎 DeepSeek 网页搜索插件（`web_search` / `web_fetch`）](docs/deepseek-search.md)
 - [📂 源码目录结构（src/）](#-源码目录结构src)
 
 ---
@@ -66,7 +68,7 @@
   - 滚动摘要经后台 `SummaryBridge` 写入 MCP 长期记忆工具（如 `graphiti_add_memory`），不阻塞会话线程；仓库不再内置 SQLite 向量记忆。
 - 📥 **输入缓冲与可靠回复**：
   - 对用户连续发送的多条消息做防抖聚合，同一轮只触发一次回复；支持代际打断，避免旧回合覆盖新回合。
-  - 模型可通过 `send_message` 主动发送消息、用 `[SEP]` 拆分多气泡、按节奏调用 `wait`，或用 `keepsilent` 已读不回。
+  - 模型可通过 `send_message` 主动发送消息、用 `[SEP]` 拆分多气泡、按节奏调用 `wait`，或用 `keepsilent` 标记暂不回复、`end_turn` 静默结束回合。
 - 👥 **动态人际关系图谱（RelationshipGraph）**：
   - 节点包含用户和 MIO 自身，边记录亲密熟悉度（`intimacy`）与有向信任度（`trust`）。
   - 引入简单的时间衰减机制（$e^{-\Delta t/\tau}$），长时间未互动的对象在提示词注入名单中的排序自然回落。
@@ -81,6 +83,11 @@
   - 基于抽象 LLM 语义契约，兼容各类 OpenAI 兼容端点（如 DeepSeek、Qwen、小米 MiMo、SiliconFlow、Ollama、vLLM 等）。
   - 支持推理模型思维链（`reasoning_content`）透传与持久化。
   - 支持 OneBot 11 反向 WebSocket 协议（NapCatQQ），包含图片、语音、视频、文件处理与可选 ASR；同时保留本地控制台 REPL 交互。
+- 🧰 **插件体系（Lua / Native）**：
+  - **Lua 轻量插件**：把 `.lua` 文件放进 `plugins/lua/`，即可注册 LLM 工具、入站/出站 Hook 与定时器，无需编译，支持 `/plugin reload lua:<id>` 热重载。
+  - **Native C++ 插件**：`plugins/<id>/src` 自动编译进主程序，可注册出站平台通道、使用完整 `mio_host_api` 并自建线程，适合平台适配与外部服务集成。
+  - 内置 `deepseek-search` 原生插件：接入 DeepSeek 官方 Search / Fetch API，为模型注册 `web_search` / `web_fetch` 两个联网工具（默认关闭，需 DeepSeek API Key；Lua 脚本也可用 `mio.invoke_tool` 调用）。见 **[DeepSeek 网页搜索插件](docs/deepseek-search.md)**。
+  - 开发文档见 **[插件开发指南（Lua / Native）](docs/plugin-guide.md)**。
 
 ---
 
@@ -137,7 +144,8 @@ MIO 遵循 **“组合根（Runtime）统一协调，底层接口只暴露语义
   - 不在 System Prompt 中直接硬编码实时时间（避免每次请求都破坏前缀缓存）；模型需要精确时间时可调用内置工具 `get_current_time`。
   - 不在 System 中渲染实时变化的消息计数或频繁波动的分数，仅渲染阶段性冻结的列表。
 - **重构时机天然重合**：
-  - 仅在会话**冷启动（Cold Start）** 或 **上下文超出 85% 水位触发滚动摘要** 时，才重新拉取人物权重并消费日记归档。此时由于截断前缀本身即发生改变，同步更新 System Prompt 不会带来额外的缓存惩罚。
+  - 仅在会话**冷启动（Cold Start）**、**上下文超出水位触发压缩**，或**任何使前缀缓存失效的重建**（System Prompt / 工具集 / 模型端点变化）时，才重新拉取人物权重。
+  - 前缀失效的同时会把历史压缩到近端 `contextBuilder.rawKeep` 条原文（`MindLoop` Worker 侧执行），避免重建后的首次请求把整段旧历史按未命中缓存的高价重算一遍。
 
 ### 2. 会话融合（Conversation Fusion）与跨平台身份归一
 
@@ -223,7 +231,10 @@ MIO 提供基础的 Agent 执行闭环与保护护栏：
 | `set_notes` | `{"person": string, "notes": string}` | 更新某人的特点、喜好或印象备注 |
 | `send_message` | `{"text": string, "target"?: string, "mention_user_ids"?: string[], "reply_to_message_id"?: string}` | 主动发送消息，`text` 中可用 `[SEP]` 拆成多气泡，支持 QQ 群聊 @ 与引用 |
 | `wait` / `sleep` | `{"seconds": number, "reason"?: string}` | 等待指定秒数后继续思考，用于模拟真人节奏 |
-| `keepsilent` / `keep_silent` / `stay_silent` | `{"reason": string}` | 保持沉默、已读不回 |
+| `keepsilent` / `keep_silent` / `stay_silent` | `{"reason": string}` | 本轮暂不回复（非终结，仍可继续思考/调用工具） |
+| `end_turn` | `{"reason": string?}` | 停止思考、结束本回合（不发送任何消息） |
+| `web_search` | `{"query": string, "count"?: integer, "need_content"?: bool, "ori_question"?: string, "localization"?: string}` | 联网搜索网页（标题/链接/摘要/可选正文），支持 `site:` / `lang:` / `after:` 等语法。由内置 `deepseek-search` 原生插件注册，默认关闭且需要 DeepSeek API Key |
+| `web_fetch` | `{"url": string}` | 抓取单个网页并返回 Markdown 正文（同上，需 `deepseek-search` 插件） |
 
 > `set_nickname` 已停用：模型自行改称呼会造成跨轮次身份漂移；底层能力保留在注释中，后续可评估恢复。
 

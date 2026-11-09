@@ -1,5 +1,6 @@
 #include "admin/AdminServer.h"
 #include "config/AppConfig.h"
+#include "config/ConfigManager.h"
 #include "log/Log.h"
 #include "plugin/PluginManager.h"
 #include "runtime/Runtime.h"
@@ -7,6 +8,7 @@
 #include <ixwebsocket/IXHttpServer.h>
 #include <nlohmann/json.hpp>
 
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -71,12 +73,16 @@ bool AdminServer::start() {
             // POST /api/config: 写入新配置并触发热重载
             // POST /api/reload: 触发热重载
             if ((req->uri == "/api/config" || req->uri == "/api/reload") && req->method == "POST") {
+                const std::filesystem::path configPath =
+                    runtime_.configManager() ? runtime_.configManager()->configPath()
+                                             : std::filesystem::path("config.json");
                 if (req->uri == "/api/config" && !req->body.empty()) {
                     try {
                         auto parsed = nlohmann::json::parse(req->body, nullptr, true, true);
-                        std::ofstream f("config.json");
+                        std::ofstream f(configPath);
                         if (!f.is_open()) {
-                            nlohmann::json err = {{"ok", false}, {"error", "无法写入 config.json"}};
+                            nlohmann::json err = {{"ok", false},
+                                                  {"error", "无法写入配置文件: " + configPath.string()}};
                             return std::make_shared<ix::HttpResponse>(500, "Error", ix::HttpErrorCode::Ok, headers, err.dump());
                         }
                         f << parsed.dump(2) << "\n";
@@ -87,7 +93,7 @@ bool AdminServer::start() {
                     }
                 }
 
-                bool ok = runtime_.reloadConfig("config.json");
+                bool ok = runtime_.reloadConfig(configPath);
                 nlohmann::json resp = {
                     {"ok", ok},
                     {"message", ok ? "配置热重载成功并即时生效" : "配置重载失败，已保持原配置"}

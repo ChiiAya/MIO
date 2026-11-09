@@ -4,10 +4,10 @@
 //
 // 职责：
 //   1. 组装并持有核心基础设施：Achieve、AttentionGate、RelationshipGraph、
-//      ToolRegistry、McpManager、SummaryBridge、Scheduler、AdminServer、MindLoop；
+//      ToolRegistry、McpManager、AdminServer、MindLoop；
 //   2. 接收插件投递的入站事件（postEvent）：过 Hook → 更新人物图谱 → 入注意力门 → 唤醒 MindLoop；
-//   3. 转发平台出站请求（emit），在维护回合自动拦截外发消息；
-//   4. 统一处理启动装配与在线配置热重载（reloadConfig）。
+//   3. 转发平台出站请求（emit），并在发送成功后把自身回复归档回 Achieve；
+//   4. 配置热重载分发：重建 LLM/ContextBuilder/Persona 并统一刷新 MindLoop 服务快照。
 // ============================================================================
 
 #include "config/AppConfig.h"
@@ -42,7 +42,6 @@ class McpManager;
 }
 
 struct RuntimeState {
-    std::uint64_t version = 0;
     std::uint64_t messageCount = 0;
     std::string botName;
     std::optional<std::string> activeChannel;
@@ -119,6 +118,7 @@ private:
     std::shared_ptr<Llm> llm_;
     std::shared_ptr<ContextBuilder> builder_;
     std::string systemPrompt_;
+    std::string activeLlmKey_; // 当前模型+端点标识（缓存命名空间），由 servicesMtx_ 保护
     bool factsDirty_ = false;
     mutable std::shared_mutex servicesMtx_;
 

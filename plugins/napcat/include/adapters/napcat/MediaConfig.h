@@ -34,7 +34,6 @@ struct MediaConfig {
     bool audio = true;
     bool video = false;
     bool files = false;
-    bool persistImages = false;
 
     std::size_t maxFileBytes = 8u * 1024u * 1024u;
     int downloadTimeoutMs = 15'000;

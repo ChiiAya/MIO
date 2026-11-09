@@ -168,6 +168,15 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
             throw std::runtime_error("模型连续返回空输出（无文本也无工具调用）");
         last = resp;
 
+        // 计费观测：inputCached 命中成本远低于 inputOther；前缀缓存被破坏时 cached 会掉到 0
+        {
+            const auto& u = resp.usage;
+            log::info("ToolLoop", "LLM usage: input=" + std::to_string(u.inputOther) +
+                                      " cached=" + std::to_string(u.inputCached) +
+                                      " output=" + std::to_string(u.output) +
+                                      " msgs=" + std::to_string(req.messages.size()));
+        }
+
         // LLM 调用返回后：若无有效文本且无工具调用，且检测到中断信号，才丢弃
         if (resp.text.empty() && resp.toolCalls.empty() &&
             opt.shouldInterrupt && opt.shouldInterrupt()) {
@@ -227,10 +236,9 @@ ChatResponse runToolLoop(Llm& llm, ToolRegistry& reg, ChatRequest req,
         }
 
         if (shouldTerminate) {
-            log::info("ToolLoop", "检测到终结性工具调用，提前结束工具循环");
-            Msg silent{Role::Assistant};
-            silent.text = "(本轮已读并选择保持沉默，未发送回复)";
-            if (sink) sink(silent);
+            // 不伪造 assistant 消息：历史停在 assistant(tool_calls) + tool(result) 是合法状态，
+            // 伪造一句“(本轮已读并选择保持沉默…)”会污染后续所有回合的上下文。
+            log::info("ToolLoop", "检测到终结性工具调用，结束工具循环");
             last.text.clear();
             return last;
         }

@@ -2,11 +2,15 @@
 
 #include <lua.hpp>
 
+#include "core/time/LocalTime.h"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -138,6 +142,72 @@ nlohmann::json toJson(lua_State* L, int idx, int depth = 0) {
     }
 }
 
+// ---- 延迟入站事件投递器 ----------------------------------------------------
+// Lua 回调本身就持有沙箱 VM 锁；若在回调里直接 host.postEvent，宿主派发 on_event
+// 钩子时会再次进入同一沙箱（抢 VM 锁）而自死锁。这里改为入队，由独立线程在
+// 沙箱锁之外投递，既避免重入，也保证同一个插件的事件顺序。
+class DeferredEventPoster {
+public:
+    explicit DeferredEventPoster(sdk::Host& host) : host_(host) {}
+    ~DeferredEventPoster() { stop(); }
+
+    void start() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (running_) return;
+        running_ = true;
+        worker_ = std::thread(&DeferredEventPoster::loop, this);
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (!running_) return;
+            running_ = false;
+            queue_.clear();
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    bool enqueue(nlohmann::json ev) {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (!running_) return false;
+            if (queue_.size() >= kMaxQueuedEvents) {
+                host_.warn(kTag, "post_event 队列已满，丢弃事件");
+                return false;
+            }
+            queue_.push_back(std::move(ev));
+        }
+        cv_.notify_one();
+        return true;
+    }
+
+private:
+    static constexpr std::size_t kMaxQueuedEvents = 256;
+
+    void loop() {
+        while (true) {
+            nlohmann::json ev;
+            {
+                std::unique_lock<std::mutex> lock(mtx_);
+                cv_.wait(lock, [this] { return !running_ || !queue_.empty(); });
+                if (!running_) return;
+                ev = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            host_.postEvent(ev);
+        }
+    }
+
+    sdk::Host& host_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::deque<nlohmann::json> queue_;
+    bool running_ = false;
+    std::thread worker_;
+};
+
 // ---- 单脚本沙箱实例 --------------------------------------------------------
 class LuaScriptSandbox {
 public:
@@ -150,10 +220,12 @@ public:
     LuaScriptSandbox(std::string scriptId,
                      std::filesystem::path path,
                      sdk::Host& host,
+                     DeferredEventPoster& poster,
                      std::size_t maxMemoryBytes = kDefaultMaxMemoryBytes)
         : scriptId_(std::move(scriptId)),
           path_(std::move(path)),
           host_(host),
+          poster_(poster),
           maxMemoryBytes_(maxMemoryBytes) {}
 
     ~LuaScriptSandbox() {
@@ -257,11 +329,13 @@ public:
                 timerThread_.join();
             }
         }
-        std::lock_guard<std::mutex> lock(vmMtx_);
+        // 必须在锁外注销工具：unregisterTool 会等待在途 invokeLuaTool 归零，
+        // 而 invokeLuaTool 需要 vmMtx_；持锁注销会 AB-BA 死锁。
         for (const auto& toolName : registeredTools_) {
             host_.unregisterTool(toolName);
         }
         registeredTools_.clear();
+        std::lock_guard<std::mutex> lock(vmMtx_);
         if (L_) {
             lua_close(L_);
             L_ = nullptr;
@@ -348,6 +422,11 @@ private:
         lua_pushcclosure(L, &LuaScriptSandbox::luaPostEvent, 1);
         lua_setfield(L, -2, "post_event");
 
+        // mio.refresh_facts()
+        lua_pushlightuserdata(L, this);
+        lua_pushcclosure(L, &LuaScriptSandbox::luaRefreshFacts, 1);
+        lua_setfield(L, -2, "refresh_facts");
+
         // mio.invoke_tool(name, args)
         lua_pushlightuserdata(L, this);
         lua_pushcclosure(L, &LuaScriptSandbox::luaInvokeTool, 1);
@@ -367,6 +446,12 @@ private:
         lua_pushlightuserdata(L, this);
         lua_pushcclosure(L, &LuaScriptSandbox::luaEvery, 1);
         lua_setfield(L, -2, "every");
+
+        // mio.local_time() -> "YYYY-MM-DD HH:MM:SS"；mio.now_ms() -> epoch 毫秒
+        lua_pushcfunction(L, &LuaScriptSandbox::luaLocalTime);
+        lua_setfield(L, -2, "local_time");
+        lua_pushcfunction(L, &LuaScriptSandbox::luaNowMs);
+        lua_setfield(L, -2, "now_ms");
 
         // mio.json.{encode, decode}
         lua_newtable(L);
@@ -425,9 +510,17 @@ private:
         if (!ev.contains("source") || !ev["source"].is_string() || ev["source"].get<std::string>().empty()) {
             ev["source"] = "lua:" + self->scriptId_;
         }
-        const bool ok = self->host_.postEvent(ev);
-        lua_pushboolean(L, ok ? 1 : 0);
+        // 不在当前 Lua 调用栈里直接投递：入队后由独立线程在沙箱锁之外 postEvent，
+        // 否则宿主派发 on_event 钩子时会再次进入本沙箱而自死锁。
+        const bool queued = self->poster_.enqueue(std::move(ev));
+        lua_pushboolean(L, queued ? 1 : 0);
         return 1;
+    }
+
+    static int luaRefreshFacts(lua_State* L) {
+        auto* self = static_cast<LuaScriptSandbox*>(lua_touserdata(L, lua_upvalueindex(1)));
+        if (self) self->host_.refreshFacts();
+        return 0;
     }
 
     static int luaInvokeTool(lua_State* L) {
@@ -469,6 +562,21 @@ private:
         t.nextRun = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
         self->timers_.push_back(t);
         return 0;
+    }
+
+    static int luaLocalTime(lua_State* L) {
+        const std::string s = formatLocalTime(
+            static_cast<std::int64_t>(std::time(nullptr)), "%Y-%m-%d %H:%M:%S");
+        lua_pushlstring(L, s.data(), s.size());
+        return 1;
+    }
+
+    static int luaNowMs(lua_State* L) {
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        lua_pushinteger(L, static_cast<lua_Integer>(nowMs));
+        return 1;
     }
 
     static int luaJsonEncode(lua_State* L) {
@@ -553,6 +661,7 @@ private:
     std::string scriptId_;
     std::filesystem::path path_;
     sdk::Host& host_;
+    DeferredEventPoster& poster_;
     std::size_t maxMemoryBytes_;
     std::atomic<std::size_t> usedMemory_{0};
 
@@ -575,7 +684,7 @@ private:
 class LuaHostPlugin final : public sdk::Plugin {
 public:
     LuaHostPlugin(sdk::Host& host, const nlohmann::json& cfg)
-        : host_(host) {
+        : host_(host), poster_(host) {
         if (cfg.is_object() && cfg.contains("dir") && cfg["dir"].is_string()) {
             scriptsDir_ = cfg["dir"].get<std::string>();
         } else {
@@ -597,12 +706,16 @@ public:
     }
 
     bool start() override {
+        // 先启动延迟投递线程：脚本加载期间就可能调用 mio.post_event
+        poster_.start();
         std::lock_guard<std::mutex> lock(mtx_);
         loadScriptsInDirLocked();
         return true;
     }
 
     void stop() override {
+        // 必须先停投递线程再拿 mtx_：投递线程可能正卡在 dispatchHooks 等 mtx_
+        poster_.stop();
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto& [_, sandbox] : scripts_) {
             if (sandbox) sandbox->stop();
@@ -625,7 +738,7 @@ public:
                 }
                 const auto file = scriptsDir_ / (targetId + ".lua");
                 if (std::filesystem::exists(file)) {
-                    auto sandbox = std::make_unique<LuaScriptSandbox>(targetId, file, host_);
+                    auto sandbox = std::make_unique<LuaScriptSandbox>(targetId, file, host_, poster_);
                     if (sandbox->loadAndStart()) {
                         scripts_[targetId] = std::move(sandbox);
                         return true;
@@ -678,7 +791,7 @@ private:
 
         for (const auto& file : files) {
             const std::string id = file.stem().string();
-            auto sandbox = std::make_unique<LuaScriptSandbox>(id, file, host_);
+            auto sandbox = std::make_unique<LuaScriptSandbox>(id, file, host_, poster_);
             if (sandbox->loadAndStart()) {
                 scripts_[id] = std::move(sandbox);
             }
@@ -686,6 +799,7 @@ private:
     }
 
     sdk::Host& host_;
+    DeferredEventPoster poster_;
     std::filesystem::path scriptsDir_;
     std::map<std::string, std::unique_ptr<LuaScriptSandbox>> scripts_;
     std::mutex mtx_;

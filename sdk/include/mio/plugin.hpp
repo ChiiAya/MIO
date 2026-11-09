@@ -7,10 +7,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <exception>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -68,7 +70,7 @@ public:
 
     bool registerTool(const nlohmann::json& def, ToolHandler fn) {
         if (!raw_ || !raw_->register_tool || !fn) return false;
-        auto holder = std::make_unique<ToolHolder>( ToolHolder{std::move(fn)} );
+        auto holder = std::make_unique<ToolHolder>(ToolHolder{def.value("name", ""), std::move(fn)});
         ToolHolder* ptr = holder.get();
         const std::string dumped = def.dump();
         const int rc = raw_->register_tool(raw_->ctx, detail::toMioStr(dumped), &Host::toolThunk, ptr);
@@ -81,7 +83,13 @@ public:
 
     bool unregisterTool(std::string_view name) {
         if (!raw_ || !raw_->unregister_tool) return false;
-        return raw_->unregister_tool(raw_->ctx, detail::toMioStr(name)) == 0;
+        if (raw_->unregister_tool(raw_->ctx, detail::toMioStr(name)) != 0) return false;
+        tools_.erase(std::remove_if(tools_.begin(), tools_.end(),
+                                    [name](const std::unique_ptr<ToolHolder>& holder) {
+                                        return holder->name == name;
+                                    }),
+                     tools_.end());
+        return true;
     }
 
     bool registerChannel(std::string_view source, Channel* ch) {
@@ -132,15 +140,8 @@ public:
         }
     }
 
-    nlohmann::json flushMindLoop() const {
-        if (!raw_ || !raw_->flush_mind_loop) return nlohmann::json::object();
-        std::string out;
-        raw_->flush_mind_loop(raw_->ctx, &out, &detail::stringSinkWrite);
-        try {
-            if (!out.empty()) return nlohmann::json::parse(out);
-        } catch (...) {
-        }
-        return nlohmann::json::object();
+    void refreshFacts() const {
+        if (raw_ && raw_->refresh_facts) raw_->refresh_facts(raw_->ctx);
     }
 
     // HookHandler:
@@ -181,6 +182,7 @@ public:
 
 private:
     struct ToolHolder {
+        std::string name;
         ToolHandler fn;
     };
 

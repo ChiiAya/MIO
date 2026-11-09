@@ -141,7 +141,10 @@ int hostReloadConfig(void* rawCtx, mio_str config_path) {
     auto* ctx = static_cast<PluginHostContext*>(rawCtx);
     if (!ctx || !ctx->runtime) return -1;
     std::string path = strFromMio(config_path);
-    if (path.empty()) path = "config.json";
+    if (path.empty()) {
+        const auto mgr = ctx->runtime->configManager();
+        path = mgr ? mgr->configPath().string() : "config.json";
+    }
     return ctx->runtime->reloadConfig(path) ? 0 : -1;
 }
 
@@ -150,7 +153,6 @@ void hostStateJson(void* rawCtx, void* sink, mio_write_fn write) {
     if (!ctx || !ctx->runtime || !write) return;
     const auto st = ctx->runtime->state();
     nlohmann::json j = {
-        {"version", st.version},
         {"messageCount", st.messageCount},
         {"botName", st.botName},
         {"lastEventSeq", st.lastEventSeq},
@@ -167,11 +169,10 @@ void hostRequestShutdown(void* rawCtx) {
     ctx->manager->requestShutdown();
 }
 
-void hostFlushMindLoop(void* /*rawCtx*/, void* sink, mio_write_fn write) {
-    if (write) {
-        const std::string dumped = "{}";
-        write(sink, strToMio(dumped));
-    }
+void hostRefreshFacts(void* rawCtx) {
+    auto* ctx = static_cast<PluginHostContext*>(rawCtx);
+    if (!ctx || !ctx->runtime) return;
+    ctx->runtime->refreshFactsNow("plugin:" + ctx->pluginId);
 }
 
 int hostRegisterHook(void* rawCtx, mio_str hook_point, int priority, mio_hook_fn fn, void* user) {
@@ -212,7 +213,7 @@ void initHostApi(PluginHostContext& ctx) {
     ctx.api.reload_config = &hostReloadConfig;
     ctx.api.state_json = &hostStateJson;
     ctx.api.request_shutdown = &hostRequestShutdown;
-    ctx.api.flush_mind_loop = &hostFlushMindLoop;
+    ctx.api.refresh_facts = &hostRefreshFacts;
     ctx.api.register_hook = &hostRegisterHook;
     ctx.api.plugins_json = &hostPluginsJson;
     ctx.api.reload_plugin = &hostReloadPlugin;
@@ -373,6 +374,16 @@ bool PluginManager::reloadPlugin(const std::string& pluginId) {
         if (target != "all" && target != id &&
             !(id == "lua-host" && target.rfind("lua:", 0) == 0)) {
             continue;
+        }
+
+        // 热重载前同步最新磁盘配置：runtime_.config() 可能已被 /api/reload 刷新
+        if (auto latest = runtime_.config()) {
+            for (const auto& spec : latest->plugins) {
+                if (spec.id == id) {
+                    p.config = spec.config;
+                    break;
+                }
+            }
         }
 
         nlohmann::json cfgJson = p.config;

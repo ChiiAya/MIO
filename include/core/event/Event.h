@@ -34,7 +34,6 @@ struct AttentionRule {
     AttentionTier targetTier;
     std::int64_t expiresAt = 0;
     std::string reason;
-    bool byModel = true;
 };
 
 struct Event {
@@ -57,6 +56,12 @@ struct Event {
 
     std::optional<Msg> toMsg(std::optional<AttentionTier> overrideTier = std::nullopt) const;
     static std::optional<Msg> toDigestMsg(const std::vector<Event>& events);
+
+    // 批量事件 → 上下文 Msg 列表（统一供 AttentionGate::drainBatch、Achieve 冷读与工具查询使用）：
+    //   - Silent 跳过；assistant 事件按分组键合并为 assistant Msg（无 header）；
+    //   - 连续且分组键相同的 DirectFull 事件合并为一条 User Msg（共享一行 header）；
+    //   - 其它层级逐条 toMsg。
+    static std::vector<Msg> toBatchMsgs(const std::vector<Event>& events);
 
     nlohmann::json toJson() const;
     static Event fromJson(const nlohmann::json& j);

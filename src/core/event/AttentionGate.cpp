@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iterator>
 #include <sstream>
 
 namespace mio {
@@ -68,13 +69,17 @@ bool AttentionGate::enterQueue(Event inEvt) {
 
     std::string actionDesc;
     bool shouldWake = false;
-    bool flushDigest = false;
 
     switch (inEvt.tier) {
     case AttentionTier::DirectFull:
     case AttentionTier::Preview:
         actionDesc = (inEvt.tier == AttentionTier::DirectFull) ? "唤醒意识流" : "预览唤醒";
         shouldWake = true;
+        // 唤醒源元信息只由直接唤醒类事件覆盖；Digest 攒批触发不得把跨群汇总绑定到某个频道
+        if (!inEvt.channelId.empty()) {
+            lastWakeSource_ = inEvt.source;
+            lastWakeChannelId_ = inEvt.channelId;
+        }
         break;
 
     case AttentionTier::Digest: {
@@ -83,18 +88,15 @@ bool AttentionGate::enterQueue(Event inEvt) {
             actionDesc = "攒批达到阈值 " + std::to_string(nextCount) + "/" +
                          std::to_string(kDefaultDigestBatchSize) + "，唤醒意识流";
             shouldWake = true;
-            flushDigest = true;
         } else {
             actionDesc = "攒批中 " + std::to_string(nextCount) + "/" +
                          std::to_string(kDefaultDigestBatchSize);
-            shouldWake = false;
         }
         break;
     }
 
     case AttentionTier::Silent:
         actionDesc = "静默归档";
-        shouldWake = false;
         break;
 
     default:
@@ -122,19 +124,11 @@ bool AttentionGate::enterQueue(Event inEvt) {
     }
     log::info("AttentionGate", oss.str());
 
-    // 状态流转入队
+    // 状态流转入队：DirectFull/Preview 直接进就绪队列，Digest 继续攒批，Silent 已落盘不入队
     if (inEvt.tier == AttentionTier::DirectFull || inEvt.tier == AttentionTier::Preview) {
-        if (!DigestBuffer_.empty()) {
-            readyMsgs_.push_back(DigestBuffer2Msg());
-        }
-        if (auto m = inEvt.toMsg()) {
-            readyMsgs_.push_back(std::move(*m));
-        }
+        readyEvents_.push_back(std::move(inEvt));
     } else if (inEvt.tier == AttentionTier::Digest) {
         DigestBuffer_.push_back(std::move(inEvt));
-        if (flushDigest) {
-            readyMsgs_.push_back(DigestBuffer2Msg());
-        }
     }
 
     return shouldWake;
@@ -182,13 +176,20 @@ Msg AttentionGate::DigestBuffer2Msg() {
     return empty;
 }
 
-std::vector<Msg> AttentionGate::drainMsgs(bool flushDigest) {
+GateBatch AttentionGate::drainBatch(bool flushDigest) {
     std::lock_guard<std::mutex> lock(mu_);
+    GateBatch out;
     if (flushDigest && !DigestBuffer_.empty()) {
-        readyMsgs_.push_back(DigestBuffer2Msg());
+        out.msgs.push_back(DigestBuffer2Msg());
     }
-    std::vector<Msg> out;
-    out.swap(readyMsgs_);
+    auto msgs = Event::toBatchMsgs(readyEvents_);
+    out.msgs.insert(out.msgs.end(), std::make_move_iterator(msgs.begin()),
+                    std::make_move_iterator(msgs.end()));
+    readyEvents_.clear();
+    out.source = std::move(lastWakeSource_);
+    out.channelId = std::move(lastWakeChannelId_);
+    lastWakeSource_.clear();
+    lastWakeChannelId_.clear();
     return out;
 }
 

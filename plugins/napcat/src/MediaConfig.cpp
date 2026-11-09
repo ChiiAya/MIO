@@ -52,7 +52,6 @@ void to_json(nlohmann::json& j, const MediaConfig& c) {
         {"audio", c.audio},
         {"video", c.video},
         {"files", c.files},
-        {"persistImages", c.persistImages},
         {"maxFileBytes", c.maxFileBytes},
         {"downloadTimeoutMs", c.downloadTimeoutMs},
         {"cacheDir", c.cacheDir},
@@ -66,7 +65,6 @@ void from_json(const nlohmann::json& j, MediaConfig& c) {
     readIfExists(j, "audio", c.audio);
     readIfExists(j, "video", c.video);
     readIfExists(j, "files", c.files);
-    readIfExists(j, "persistImages", c.persistImages);
     readIfExists(j, "maxFileBytes", c.maxFileBytes);
     readIfExists(j, "downloadTimeoutMs", c.downloadTimeoutMs);
     readIfExists(j, "cacheDir", c.cacheDir);

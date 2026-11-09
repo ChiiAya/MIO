@@ -76,7 +76,8 @@ typedef struct mio_host_api {
     int  (*reload_config)(void* ctx, mio_str config_path);
     void (*state_json)(void* ctx, void* sink, mio_write_fn write);
     void (*request_shutdown)(void* ctx);
-    void (*flush_mind_loop)(void* ctx, void* sink, mio_write_fn write);
+    /* 事实刷新边界：立即重建稳定 System Prompt（消费 Facts/通讯录脏标记） */
+    void (*refresh_facts)(void* ctx);
 
     /* Hook 管线注册（hook_point: "on_event" | "on_before_llm" | "on_outbound"） */
     int  (*register_hook)(void* ctx, mio_str hook_point, int priority,

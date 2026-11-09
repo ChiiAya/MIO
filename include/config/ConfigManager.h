@@ -29,7 +29,11 @@ public:
     // 手动发布新配置快照
     void set(std::shared_ptr<const AppConfig> newConfig);
 
+    // 当前配置文件路径（含 MIO_CONFIG_PATH 记忆；文件不存在也保留）
+    const std::filesystem::path& configPath() const { return configPath_; }
+
 private:
+    std::filesystem::path configPath_ = "config.json";
     std::shared_ptr<const AppConfig> current_;
     mutable std::shared_mutex mtx_;
 };

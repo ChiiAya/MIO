@@ -59,34 +59,55 @@ void registerMindTools(ToolRegistry& registry, MindToolsDeps deps) {
                  },
                  ToolLayer::Builtin);
 
-    // 2. keepsilent (+ keep_silent / stay_silent 别名)
+    // 2. keepsilent / keep_silent / stay_silent —— 非终结：本轮暂不回复，但思考与工具循环继续
     const nlohmann::json silentSchema = {
         {"type", "object"},
         {"properties",
          {{"reason",
            {{"type", "string"},
-            {"description", "决定保持沉默的内心理由（如：被惹毛了不想说话/觉得对方很无聊）"}}}}},
+            {"description", "决定暂不回复的内心理由（如：被惹毛了不想说话/觉得对方很无聊）"}}}}},
         {"required", nlohmann::json::array({"reason"})}};
 
+    auto markSilent = deps.markSilent;
     for (const char* name : {"keepsilent", "keep_silent", "stay_silent"}) {
         ToolDef def;
         def.name = name;
         def.description = (std::string(name) == "keepsilent")
-            ? "当你阅读了用户的话后，内心感到被冒犯不想回复、想要已读不回、或者认为此时保持沉默更符合你的心情时，调用此工具保持沉默。调用后你不会向用户发送任何消息。"
-            : "同 keepsilent，在不想回答或决定已读不回时调用。";
+            ? "本轮不想接话时调用：标记本轮不自动发送回复。你仍然可以继续思考、调用工具（如 query_events、wait）观察后续；改变主意后仍可用 send_message 主动发言；若想彻底停止思考并结束本回合，请调用 end_turn。"
+            : "同 keepsilent：暂时不回复但可以继续思考与调用工具；要在沉默中结束本回合请用 end_turn。";
         def.parametersJsonSchema = silentSchema;
-        def.isTerminal = true;
+        def.isTerminal = false;
 
-        auto markSilent = deps.markKeepSilent;
         registry.add(
             std::move(def),
-            [markSilent = std::move(markSilent), toolName = std::string(name)](const nlohmann::json& args) -> std::string {
+            [toolName = std::string(name), markSilent](const nlohmann::json& args) -> std::string {
+                log::info(kTag, "模型调用 " + toolName + " 暂不回复: " + args.value("reason", ""));
                 if (markSilent) markSilent();
-                log::info(kTag, "模型调用 " + toolName + " 保持沉默: " + args.value("reason", ""));
-                return "已选择保持沉默。本轮不会向用户发送任何回复。";
+                return "已标记本轮静默：最终文本不会自动发送。你可以继续思考或调用工具；想发言仍可调用 send_message，想结束本回合请调用 end_turn。";
             },
             ToolLayer::Builtin);
     }
+
+    // 2b. end_turn —— 终结：停止思考、结束本回合，不发送任何消息
+    ToolDef endTurnDef;
+    endTurnDef.name = "end_turn";
+    endTurnDef.description =
+        "停止思考并结束本回合，且不向任何人发送任何消息。适用于：已通过 send_message 说完了、"
+        "只想安静围观/潜水、或决定不再处理当前事件。调用后本回合立即结束，不会再有一次思考。";
+    endTurnDef.parametersJsonSchema = {
+        {"type", "object"},
+        {"properties",
+         {{"reason",
+           {{"type", "string"},
+            {"description", "结束本回合的原因（可选，仅用于日志）"}}}}}};
+    endTurnDef.isTerminal = true;
+    registry.add(
+        std::move(endTurnDef),
+        [](const nlohmann::json& args) -> std::string {
+            log::info(kTag, "模型调用 end_turn 结束本回合: " + args.value("reason", ""));
+            return "已结束本回合，不会发送任何消息。";
+        },
+        ToolLayer::Builtin);
 
     // 3. wait (+ sleep 别名)
     const nlohmann::json waitSchema = {

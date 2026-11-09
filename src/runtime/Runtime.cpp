@@ -33,23 +33,38 @@ Runtime::Runtime(std::string botName,
     log::initFromEnvironment();
 
     const auto cfg = configMgr_->get();
-    mindLoop_ = std::make_unique<MindLoop>(
-        MindLoop::MindLoopDeps{
-            gate_,
-            registry_,
-            nullptr,
-            nullptr,
-            "",
-            cfg ? cfg->splitter : MessageSplitterConfig{},
-            [this](const Outbound& outbound) { return emit(outbound); },
-            [this](std::vector<Msg>& messages) {
-                BeforeLlmHook hook;
-                {
-                    std::lock_guard<std::mutex> lock(hooksMtx_);
-                    hook = beforeLlmHook_;
-                }
-                if (hook) hook(messages);
-            }});
+
+    // 先完成 LLM / ContextBuilder / Persona / systemPrompt 装配（此时 mindLoop_ 尚不存在，
+    // refreshFactsNow 内部会跳过 updateServices）
+    applyConfig(cfg ? *cfg : AppConfig{}, std::move(llm), "startup");
+
+    // 冷读取历史事件作为初始意识流上下文，必须在 MindLoop 构造前移交给它
+    std::vector<Msg> initialHistory = achieve_.coldRead("").msgs;
+
+    mindLoop_ = std::make_unique<MindLoop>(MindLoop::MindLoopDeps{
+        gate_,
+        registry_,
+        llm_,
+        builder_,
+        systemPrompt_,
+        cfg ? cfg->splitter : MessageSplitterConfig{},
+        std::move(initialHistory),
+        cfg ? cfg->mindDebounceMs : 300,
+        cfg ? cfg->autoEmitTextReply : false,
+        cfg ? cfg->contextBuilder.rawKeep : 8,
+        [this] {
+            refreshFactsNow("reColdStart");
+            return systemPrompt();
+        },
+        [this](const Outbound& outbound) { return emit(outbound); },
+        [this](std::vector<Msg>& messages) {
+            BeforeLlmHook hook;
+            {
+                std::lock_guard<std::mutex> lock(hooksMtx_);
+                hook = beforeLlmHook_;
+            }
+            if (hook) hook(messages);
+        }});
 
     registerBuiltinTools();
 
@@ -59,11 +74,7 @@ Runtime::Runtime(std::string botName,
         mcpManager_->syncTools(registry_);
     }
 
-    applyConfig(cfg ? *cfg : AppConfig{}, std::move(llm), "startup");
     graph_.ensureMio(persona_.botName);
-
-    // 冷读取历史事件进入单意识流上下文
-    mindLoop_->setHistory(achieve_.coldRead("").msgs);
     state_.lastEventSeq = achieve_.maxId();
 
     const int adminPort = cfg ? cfg->adminPort : 6188;
@@ -97,15 +108,19 @@ void Runtime::registerBuiltinTools() {
     registerMessageTools(
         registry_,
         [this] { return mindLoop_->activeMessageContext(); },
-        [this](const Outbound& outbound) { return emit(outbound); });
+        [this](const Outbound& outbound) -> bool {
+            if (!emit(outbound)) return false;
+            if (mindLoop_) mindLoop_->markMessageSentInTurn();
+            return true;
+        });
 
     registerMindTools(
         registry_,
         MindToolsDeps{
             achieve_,
             gate_,
-            [] {},
-            [this] { return mindLoop_ ? mindLoop_->generation() : 0; }});
+            [this] { return mindLoop_ ? mindLoop_->generation() : 0; },
+            [this] { if (mindLoop_) mindLoop_->markSilentInTurn(); }});
 }
 
 void Runtime::applyConfig(const AppConfig& cfg,
@@ -114,6 +129,10 @@ void Runtime::applyConfig(const AppConfig& cfg,
     auto nextLlm = customLlm ? std::move(customLlm) : std::make_shared<OpenAiCompat>(cfg.openai);
     auto nextBuilder = std::make_shared<ContextBuilder>(cfg.contextBuilder);
 
+    std::string botName;
+    // 模型/端点决定上游缓存命名空间：切换后旧前缀缓存必然全部失效，需要压缩历史
+    const std::string llmKey = cfg.openai.baseUrl + "\n" + cfg.openai.model;
+    bool llmChanged = false;
     {
         std::unique_lock<std::shared_mutex> lock(servicesMtx_);
         llm_ = std::move(nextLlm);
@@ -123,18 +142,19 @@ void Runtime::applyConfig(const AppConfig& cfg,
         if (!cfg.character.empty()) persona_.character = cfg.character;
         if (!cfg.systemPromptPrefix.empty()) persona_.systemPromptPrefix = cfg.systemPromptPrefix;
         if (!cfg.systemPromptNotice.empty()) persona_.systemPromptNotice = cfg.systemPromptNotice;
+        botName = persona_.botName;
+
+        llmChanged = !activeLlmKey_.empty() && llmKey != activeLlmKey_;
+        activeLlmKey_ = llmKey;
     }
 
     achieve_.setConfig(cfg.achieve);
     refreshFactsNow(reason);
-
-    if (mindLoop_) {
-        mindLoop_->updateServices(llm_, builder_, systemPrompt_, cfg.splitter);
-    }
+    if (mindLoop_ && llmChanged) mindLoop_->requestCompact("模型/端点变更");
 
     {
         std::lock_guard<std::mutex> lock(stateMtx_);
-        state_.botName = persona_.botName;
+        state_.botName = botName;
     }
 }
 
@@ -172,15 +192,28 @@ std::string Runtime::systemPrompt() const {
 }
 
 void Runtime::refreshFactsNow(const std::string& reason) {
-    std::unique_lock<std::shared_mutex> lock(servicesMtx_);
-    const bool wasDirty = factsDirty_;
-    systemPrompt_ = buildSystemPrompt(persona_, graph_, kMaxPeopleTokens);
-    factsDirty_ = false;
-    log::info(kTag, "systemPrompt 重建: reason=" + reason +
-                        " dirty=" + (wasDirty ? "true" : "false") +
-                        " bytes=" + std::to_string(systemPrompt_.size()));
+    std::shared_ptr<Llm> llm;
+    std::shared_ptr<ContextBuilder> builder;
+    std::string prompt;
+    {
+        std::unique_lock<std::shared_mutex> lock(servicesMtx_);
+        const bool wasDirty = factsDirty_;
+        systemPrompt_ = buildSystemPrompt(persona_, graph_, kMaxPeopleTokens);
+        factsDirty_ = false;
+        log::info(kTag, "systemPrompt 重建: reason=" + reason +
+                            " dirty=" + (wasDirty ? "true" : "false") +
+                            " bytes=" + std::to_string(systemPrompt_.size()));
+        llm = llm_;
+        builder = builder_;
+        prompt = systemPrompt_;
+    }
     if (mindLoop_) {
-        mindLoop_->updateServices(llm_, builder_, systemPrompt_, config() ? config()->splitter : MessageSplitterConfig{});
+        const auto cfg = config();
+        mindLoop_->updateServices(std::move(llm), std::move(builder), std::move(prompt),
+                                  cfg ? cfg->splitter : MessageSplitterConfig{},
+                                  cfg ? cfg->mindDebounceMs : 300,
+                                  cfg ? cfg->autoEmitTextReply : false,
+                                  cfg ? cfg->contextBuilder.rawKeep : 8);
     }
 }
 
@@ -198,7 +231,6 @@ void Runtime::postEvent(Event event) {
     const std::int64_t now = std::time(nullptr);
     if (event.category == EventCategory::ExternalMessage && !event.actorId.empty()) {
         const auto seen = graph_.onSeen(event.source, event.actorId, event.title, now);
-        graph_.bumpIntimacy(graph_.mioId(), seen.internalId, 0.02, now);
         const std::string knownName = graph_.nameOf(seen.internalId);
         if (!knownName.empty() && knownName != seen.internalId) {
             event.title = knownName;
@@ -215,11 +247,8 @@ void Runtime::postEvent(Event event) {
         if (!event.channelId.empty()) state_.activeChannel = event.channelId;
         state_.lastEventSeq = achieve_.maxId();
     }
-    if (shouldWake) {
-        auto msgs = gate_.drainMsgs(true);
-        if (!msgs.empty() && mindLoop_) {
-            mindLoop_->postTurn(TurnInput{std::move(msgs), event.source, event.channelId});
-        }
+    if (shouldWake && mindLoop_) {
+        mindLoop_->notifyWake();
     }
 }
 
@@ -281,7 +310,20 @@ bool Runtime::emit(const Outbound& outbound) {
         log::warn(kTag, "未配置 OutboundSender，无法发送平台消息: " + outbound.text);
         return false;
     }
-    return sender(outbound);
+    if (!sender(outbound)) return false;
+
+    // 发送成功后归档自身回复（仅 text），供重启后冷读恢复为 assistant 历史
+    Event ev;
+    ev.category = EventCategory::InternalPulse;
+    ev.tier = AttentionTier::DirectFull;
+    ev.source = outbound.source;
+    ev.channelId = outbound.channelId;
+    ev.actorId = "self";
+    ev.content = outbound.text;
+    ev.timestamp = static_cast<std::int64_t>(std::time(nullptr)) * 1000;
+    ev.data = {{"role", "assistant"}};
+    achieve_.append(std::move(ev));
+    return true;
 }
 
 } // namespace mio
