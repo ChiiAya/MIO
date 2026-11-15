@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <nlohmann/json.hpp>
 
@@ -34,6 +35,14 @@ struct Part {
 
 const char* partKindToString(Part::Kind k);
 Part::Kind partKindFromString(const std::string& s);
+
+// OpenAI wire 只接受 data-uri 或 http(s) URL 作为多媒体地址；
+// "file://..." 是 Achieve 的外置存储引用，必须先还原成 data-uri 才能发出去。
+// 未还原的引用一旦进入 wire，端点会直接 400（还会被误判成"模型不支持多模态"）。
+inline bool isWireMediaData(std::string_view data) {
+    return data.rfind("data:", 0) == 0 || data.rfind("http://", 0) == 0 ||
+           data.rfind("https://", 0) == 0;
+}
 
 // Msg 仅作为送往 Context / LLM 的标准消息结构
 struct Msg {

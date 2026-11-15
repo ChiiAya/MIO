@@ -70,6 +70,11 @@ inline void stripCompletedMedia(std::vector<Msg>& messages) {
     for (std::size_t i = 0; i < end; ++i) {
         messages[i].parts.clear();
     }
+    for (auto& m : messages) {
+        m.parts.erase(std::remove_if(m.parts.begin(), m.parts.end(),
+                                     [](const Part& p) { return !isWireMediaData(p.data); }),
+                      m.parts.end());
+    }
 }
 
 } // namespace mio::history

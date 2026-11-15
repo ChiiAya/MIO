@@ -70,23 +70,31 @@ void Achieve::offloadInlineMedia(Event& ev) const {
 }
 
 void Achieve::restoreOffloadedMedia(Event& ev) const {
+    std::vector<Part> restored;
+    restored.reserve(ev.parts.size());
     for (auto& p : ev.parts) {
-        if (p.data.rfind("file://", 0) != 0) continue;
+        if (p.data.rfind("file://", 0) != 0) {
+            restored.push_back(std::move(p));
+            continue;
+        }
         const std::filesystem::path mediaPath(p.data.substr(7));
         std::ifstream in(mediaPath, std::ios::binary);
         if (!in) {
-            log::warn("Achieve", "外置媒体文件缺失，保留原引用: " + mediaPath.string());
+            // 还原失败就丢弃该分片：绝不把 file:// 引用带进 Msg/wire（端点会 400）
+            log::warn("Achieve", "外置媒体文件缺失，已丢弃该分片: " + mediaPath.string());
             continue;
         }
         std::ostringstream buf;
         buf << in.rdbuf();
         std::string content = buf.str();
         if (content.empty()) {
-            log::warn("Achieve", "外置媒体文件为空，保留原引用: " + mediaPath.string());
+            log::warn("Achieve", "外置媒体文件为空，已丢弃该分片: " + mediaPath.string());
             continue;
         }
         p.data = std::move(content);
+        restored.push_back(std::move(p));
     }
+    ev.parts = std::move(restored);
 }
 
 void Achieve::loadFromDisk() {
@@ -230,6 +238,10 @@ ColdRead Achieve::coldRead(const std::string& target, int rawKeepOverride) {
     }
 
     if (!kept.empty()) {
+        // 冷读只为"最近一条事件"还原多媒体（可能是重启前刚收到的图，尚未处理）；
+        // 更早事件里的 file:// 外置引用绝不能跟着进 Msg.parts：它们会被当成
+        // image_url 发给模型 → 端点 400，然后被误判成"模型不支持多模态"。
+        for (std::size_t i = 0; i + 1 < kept.size(); ++i) kept[i].parts.clear();
         restoreOffloadedMedia(kept.back());
         out.msgs = Event::toBatchMsgs(kept);
         history::stripCompletedMedia(out.msgs);

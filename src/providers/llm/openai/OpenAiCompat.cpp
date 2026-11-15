@@ -80,7 +80,8 @@ nlohmann::json toWireMessages(const ChatRequest& req) {
                     contentArr.push_back({{"type", "text"}, {"text", m.text}});
                 }
                 for (const auto& p : m.parts) {
-                    if (p.data.empty()) continue;
+                    // 防御：未还原的 file:// 引用、空数据等不能进 wire（端点 400）
+                    if (p.data.empty() || !isWireMediaData(p.data)) continue;
                     switch (p.kind) {
                     case Part::Kind::Image:
                         contentArr.push_back({
@@ -153,10 +154,49 @@ bool retryableHttp(long code) {
     return code == 408 || code == 429 || (code >= 500 && code <= 599);
 }
 
+// 只有能直接发到 wire 的分片才算多模态。file://（Achieve 外置引用）等不可发送
+// 分片不算，否则会把"归档引用未还原"误判为"端点不支持多模态"，触发无意义的降级重试。
 bool hasImageParts(const ChatRequest& req) {
     for (const auto& m : req.messages)
-        if (!m.parts.empty()) return true;
+        for (const auto& p : m.parts)
+            if (isWireMediaData(p.data)) return true;
     return false;
+}
+
+struct PartSummary {
+    std::size_t image = 0;
+    std::size_t audio = 0;
+    std::size_t video = 0;
+    std::size_t file = 0;
+    std::size_t unsendable = 0;
+
+    std::string toText() const {
+        std::string out = "image=" + std::to_string(image) +
+                          " audio=" + std::to_string(audio) +
+                          " video=" + std::to_string(video) +
+                          " file=" + std::to_string(file);
+        if (unsendable > 0) out += " unsendable=" + std::to_string(unsendable);
+        return out;
+    }
+};
+
+PartSummary summarizeParts(const ChatRequest& req) {
+    PartSummary s;
+    for (const auto& m : req.messages) {
+        for (const auto& p : m.parts) {
+            if (!isWireMediaData(p.data)) {
+                ++s.unsendable;
+                continue;
+            }
+            switch (p.kind) {
+            case Part::Kind::Image: ++s.image; break;
+            case Part::Kind::Audio: ++s.audio; break;
+            case Part::Kind::Video: ++s.video; break;
+            case Part::Kind::File:  ++s.file;  break;
+            }
+        }
+    }
+    return s;
 }
 
 ChatRequest withoutImageParts(const ChatRequest& req) {
@@ -282,7 +322,8 @@ ChatResponse OpenAiCompat::chat(const ChatRequest& req) {
             payload = buildPayload(*activeReq);
             log::warn("OpenAiCompat",
                       "多模态请求被端点拒绝(HTTP " + std::to_string(r.status_code) +
-                          ")，降级为纯文本重试（图片退化为 [图片] 文本标记）");
+                          ")，降级为纯文本重试（原请求 " + summarizeParts(req).toText() +
+                          "）；响应=" + bodySnippet(r.text, 300));
             continue;
         }
         break; // 4xx 业务错误：立刻失败，把服务端的话带给调用者

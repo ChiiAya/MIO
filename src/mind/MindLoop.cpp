@@ -271,6 +271,12 @@ void MindLoop::processTurn(GateBatch& batch, const TurnServices& snap, std::uint
     // 自动外发（默认关闭）：本轮已通过 send_message 主动发送、或模型已标记静默时不再重复
     if (!resp.text.empty() && silentInTurn_.load(std::memory_order_relaxed))
         log::info(kTag, "本轮已标记静默，跳过最终文本自动外发");
+    if (!resp.text.empty() && !silentInTurn_.load(std::memory_order_relaxed) &&
+        !sentInTurn_.load(std::memory_order_relaxed) && !snap.autoEmitTextReply) {
+        log::warn(kTag,
+                  "本轮最终文本未外发：autoEmitTextReply=false 且模型未调用 send_message（" +
+                      cutUtf8(resp.text, 80) + "）");
+    }
     if (!resp.text.empty() && snap.autoEmitTextReply &&
         !sentInTurn_.load(std::memory_order_relaxed) &&
         !silentInTurn_.load(std::memory_order_relaxed) && deps_.emitOutbound) {
